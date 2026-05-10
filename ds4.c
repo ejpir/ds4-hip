@@ -10657,6 +10657,14 @@ static bool metal_graph_indexer_stage_profile_boundary(
  * command buffer and waits, so the printed number includes encoding plus GPU
  * execution for the stage just emitted. This is disabled by default because it
  * adds synchronization points and changes scheduling. */
+static bool ds4_profile_env_u32_matches(const char *name, uint32_t value) {
+    const char *s = getenv(name);
+    if (!s || !s[0]) return true;
+    char *end = NULL;
+    unsigned long v = strtoul(s, &end, 10);
+    return end != s && v == (unsigned long)value;
+}
+
 static bool metal_graph_layer_stage_profile_boundary(
         const char *part,
         const char *stage,
@@ -10664,6 +10672,10 @@ static bool metal_graph_layer_stage_profile_boundary(
         uint32_t    pos0,
         uint32_t    n_tokens,
         double     *stage_t0) {
+    if (!ds4_profile_env_u32_matches("DS4_METAL_LAYER_STAGE_PROFILE_POS", pos0) ||
+        !ds4_profile_env_u32_matches("DS4_METAL_LAYER_STAGE_PROFILE_LAYER", il)) {
+        return true;
+    }
     if (ds4_metal_end_commands() == 0) return false;
     const double now = now_sec();
     fprintf(stderr,
@@ -10684,6 +10696,10 @@ static bool metal_graph_q_stage_profile_boundary(
         uint32_t    pos0,
         uint32_t    n_tokens,
         double     *stage_t0) {
+    if (!ds4_profile_env_u32_matches("DS4_METAL_Q_STAGE_PROFILE_POS", pos0) ||
+        !ds4_profile_env_u32_matches("DS4_METAL_Q_STAGE_PROFILE_LAYER", il)) {
+        return true;
+    }
     if (ds4_metal_end_commands() == 0) return false;
     const double now = now_sec();
     fprintf(stderr,
@@ -12809,7 +12825,9 @@ static bool metal_graph_prefill_chunked_range(
     }
     if (progress && !progress(progress_ud, "prefill_warmup_done", (int)first_chunk, prompt->len)) return false;
 
-    const bool profile = getenv("DS4_METAL_GRAPH_PREFILL_PROFILE") != NULL;
+    const bool chunk_profile = getenv("DS4_METAL_GRAPH_PREFILL_CHUNK_PROFILE") != NULL ||
+                               getenv("DS4_HIP_PREFILL_CHUNK_PROFILE") != NULL;
+    const bool profile = getenv("DS4_METAL_GRAPH_PREFILL_PROFILE") != NULL || chunk_profile;
     const double t0 = profile ? now_sec() : 0.0;
     double encode_s = 0.0;
     double execute_s = 0.0;
@@ -12832,6 +12850,8 @@ static bool metal_graph_prefill_chunked_range(
         last_chunk_tokens = chunk;
         if (progress && !progress(progress_ud, "prefill_chunk_begin", (int)(pos0 + chunk), prompt->len)) return false;
 
+        const double t_chunk0 = chunk_profile ? now_sec() : 0.0;
+        const double t_upload0 = chunk_profile ? now_sec() : 0.0;
         bool ok = metal_graph_upload_prompt_tokens(g->prefill_tokens, prompt, pos0, chunk);
         if (ok) ok = metal_graph_upload_prompt_embeddings_hc(g->batch_cur_hc,
                                                              g->prefill_tokens,
@@ -12840,8 +12860,14 @@ static bool metal_graph_prefill_chunked_range(
                                                              prompt,
                                                              pos0,
                                                              chunk);
+        const double t_upload1 = chunk_profile ? now_sec() : 0.0;
         if (!ok) return false;
 
+        double chunk_layer_s = 0.0;
+        double chunk_encode_s = 0.0;
+        double chunk_execute_s = 0.0;
+        double slow_layer_s = 0.0;
+        uint32_t slow_layer = 0;
         for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
             const double t_layer0 = profile ? now_sec() : 0.0;
             ok = ds4_metal_begin_commands() != 0;
@@ -12855,15 +12881,27 @@ static bool metal_graph_prefill_chunked_range(
             if (ok) ok = ds4_metal_end_commands() != 0;
             const double t_done = profile ? now_sec() : 0.0;
             if (profile) {
-                encode_s += t_encoded - t_layer0;
-                execute_s += t_done - t_encoded;
-                fprintf(stderr,
-                        "ds4: metal chunked prefill pos=%u tokens=%u layer %u encode=%.3f ms execute=%.3f ms\n",
-                        pos0,
-                        chunk,
-                        il,
-                        (t_encoded - t_layer0) * 1000.0,
-                        (t_done - t_encoded) * 1000.0);
+                const double layer_encode = t_encoded - t_layer0;
+                const double layer_execute = t_done - t_encoded;
+                const double layer_total = t_done - t_layer0;
+                encode_s += layer_encode;
+                execute_s += layer_execute;
+                chunk_encode_s += layer_encode;
+                chunk_execute_s += layer_execute;
+                chunk_layer_s += layer_total;
+                if (layer_total > slow_layer_s) {
+                    slow_layer_s = layer_total;
+                    slow_layer = il;
+                }
+                if (!chunk_profile) {
+                    fprintf(stderr,
+                            "ds4: metal chunked prefill pos=%u tokens=%u layer %u encode=%.3f ms execute=%.3f ms\n",
+                            pos0,
+                            chunk,
+                            il,
+                            layer_encode * 1000.0,
+                            layer_execute * 1000.0);
+                }
             }
             if (show_progress) {
                 fprintf(stderr,
@@ -12882,13 +12920,34 @@ static bool metal_graph_prefill_chunked_range(
             }
             return false;
         }
+        const double t_logits0 = chunk_profile ? now_sec() : 0.0;
         if (progress && !metal_graph_prefill_batch_row_logits(g, model, weights,
                                                               chunk - 1u,
                                                               logits))
         {
             return false;
         }
+        const double t_logits1 = chunk_profile ? now_sec() : 0.0;
         if (progress && !progress(progress_ud, "prefill_chunk", (int)(pos0 + chunk), prompt->len)) return false;
+        if (chunk_profile) {
+            const double t_chunk1 = now_sec();
+            const double chunk_s = t_chunk1 - t_chunk0;
+            fprintf(stderr,
+                    "ds4: %s chunked prefill chunk start=%u end=%u tokens=%u upload=%.3f ms layers=%.3f ms encode=%.3f ms execute=%.3f ms slow_layer=%u %.3f ms logits=%.3f ms total=%.3f ms %.2f t/s\n",
+                    DS4_GPU_BACKEND_LABEL,
+                    pos0,
+                    pos0 + chunk,
+                    chunk,
+                    (t_upload1 - t_upload0) * 1000.0,
+                    chunk_layer_s * 1000.0,
+                    chunk_encode_s * 1000.0,
+                    chunk_execute_s * 1000.0,
+                    slow_layer,
+                    slow_layer_s * 1000.0,
+                    (t_logits1 - t_logits0) * 1000.0,
+                    chunk_s * 1000.0,
+                    chunk_s > 0.0 ? (double)chunk / chunk_s : 0.0);
+        }
         pos0 += chunk;
     }
     if (show_progress) fputc('\n', stderr);
@@ -12922,6 +12981,14 @@ static bool metal_graph_prefill_chunked_range(
         const double t_read = now_sec();
         encode_s += t_head_encoded - t_head0;
         execute_s += t_head_done - t_head_encoded;
+        if (chunk_profile) {
+            fprintf(stderr,
+                    "ds4: %s chunked prefill head encode=%.3f ms execute=%.3f ms read=%.3f ms\n",
+                    DS4_GPU_BACKEND_LABEL,
+                    (t_head_encoded - t_head0) * 1000.0,
+                    (t_head_done - t_head_encoded) * 1000.0,
+                    (t_read - t_before_read) * 1000.0);
+        }
         fprintf(stderr,
                 "ds4: metal chunked prefill start=%u tokens=%u chunk=%u encode=%.3f ms execute=%.3f ms read=%.3f ms total=%.3f ms\n",
                 start,

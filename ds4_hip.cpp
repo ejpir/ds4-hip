@@ -3504,6 +3504,55 @@ __global__ static void ds4_hip_indexer_topk_kernel(int *selected, const float *s
     }
 }
 
+__global__ static void ds4_hip_indexer_topk_iter_parallel_kernel(int *__restrict__ selected,
+                                                                 const float *__restrict__ scores,
+                                                                 uint32_t n_comp,
+                                                                 uint32_t n_tokens,
+                                                                 uint32_t top_k) {
+    extern __shared__ unsigned char smem[];
+    float *vals = reinterpret_cast<float *>(smem);
+    float *best_vals = vals + n_comp;
+    int *best_idx = reinterpret_cast<int *>(best_vals + blockDim.x);
+    const uint32_t t = blockIdx.x;
+    const uint32_t tid = threadIdx.x;
+    if (t >= n_tokens) return;
+    const float *row = scores + (uint64_t)t * n_comp;
+    for (uint32_t c = tid; c < n_comp; c += blockDim.x) vals[c] = row[c];
+    __syncthreads();
+
+    for (uint32_t k = 0; k < top_k; k++) {
+        float best = -3.4e38f;
+        int best_i = 0;
+        for (uint32_t c = tid; c < n_comp; c += blockDim.x) {
+            const float s = vals[c];
+            if (s > best || (s == best && (int)c < best_i)) {
+                best = s;
+                best_i = (int)c;
+            }
+        }
+        best_vals[tid] = best;
+        best_idx[tid] = best_i;
+        __syncthreads();
+        for (uint32_t stride = blockDim.x >> 1; stride != 0; stride >>= 1) {
+            if (tid < stride) {
+                const float ov = best_vals[tid + stride];
+                const int oi = best_idx[tid + stride];
+                if (ov > best_vals[tid] || (ov == best_vals[tid] && oi < best_idx[tid])) {
+                    best_vals[tid] = ov;
+                    best_idx[tid] = oi;
+                }
+            }
+            __syncthreads();
+        }
+        if (tid == 0) {
+            const int bi = best_idx[0];
+            selected[(uint64_t)t * top_k + k] = bi;
+            if (bi >= 0 && (uint32_t)bi < n_comp) vals[(uint32_t)bi] = -3.4e38f;
+        }
+        __syncthreads();
+    }
+}
+
 __global__ static void ds4_hip_topk_mask_kernel(float *mask, const int *topk,
                                                 uint32_t n_comp, uint32_t n_tokens,
                                                 uint32_t top_k) {
@@ -5525,6 +5574,11 @@ extern "C" int ds4_metal_indexer_topk_tensor(
     } else if (top_k == 1u && n_comp >= 1024u) {
         ds4_hip_indexer_top1_parallel_kernel<<<n_tokens, 256, 0, g_stream>>>(
                 (int *)selected->ptr, (const float *)scores->ptr, n_comp, n_tokens);
+    } else if (n_comp <= 2048u && top_k <= 1024u) {
+        const unsigned threads = 256u;
+        const size_t shmem = (size_t)n_comp * sizeof(float) + threads * (sizeof(float) + sizeof(int));
+        ds4_hip_indexer_topk_iter_parallel_kernel<<<n_tokens, threads, shmem, g_stream>>>(
+                (int *)selected->ptr, (const float *)scores->ptr, n_comp, n_tokens, top_k);
     } else {
         ds4_hip_indexer_topk_kernel<<<n_tokens, 1, 0, g_stream>>>((int *)selected->ptr, (const float *)scores->ptr,
                                                                   n_comp, n_tokens, top_k);

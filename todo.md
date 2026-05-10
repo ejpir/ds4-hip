@@ -326,7 +326,15 @@ Immediate targets:
 - [x] Replace slow host repack with GPU repack kernel:
   - zero-copy Q8 WMMA repack now builds 193 tensors / 8.73 GiB in about 1.8-2.4 s
   - full-copy + decode repacks + Q8 WMMA repack builds q_b/split16/wmma in about 4.8-9.0 s.
+- [x] Add chunk-level prefill instrumentation:
+  - `DS4_HIP_PREFILL_CHUNK_PROFILE=1` / `DS4_METAL_GRAPH_PREFILL_CHUNK_PROFILE=1`
+  - optional stage filters: `DS4_METAL_LAYER_STAGE_PROFILE_POS`, `DS4_METAL_LAYER_STAGE_PROFILE_LAYER`, `DS4_METAL_Q_STAGE_PROFILE_POS`, `DS4_METAL_Q_STAGE_PROFILE_LAYER`.
+- [x] Fix long-prompt chunk slowdown unrelated to Q8 WMMA:
+  - old indexer top-k path used one thread per token and took ~5.1 s per ratio-4 layer at `pos=2048`, `n_comp=768`, `top_k=512`
+  - new parallel iterative top-k path reduces this to ~4-5 ms per layer for `n_comp<=2048`, `top_k<=1024`
+  - 4180-token prefill recovered from ~8 t/s to ~29 t/s without WMMA and ~31 t/s with WMMA.
 - [ ] Next dense Q8 step:
+  - Q8 WMMA remains experimental opt-in, not part of `DS4_SERVER_FAST_FULL`, because a 4180-token greedy spot check swapped the first token between two close logits (`It` vs `This`)
   - graph/profile per-stage savings with `DS4_HIP_Q8_MATMUL_PROFILE=1`
   - tune packed multi-N tile count/VGPR occupancy if profiling shows headroom
   - validate longer generations and server stability.
