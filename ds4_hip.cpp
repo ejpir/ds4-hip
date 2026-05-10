@@ -5574,7 +5574,7 @@ extern "C" int ds4_metal_indexer_topk_tensor(
     } else if (top_k == 1u && n_comp >= 1024u) {
         ds4_hip_indexer_top1_parallel_kernel<<<n_tokens, 256, 0, g_stream>>>(
                 (int *)selected->ptr, (const float *)scores->ptr, n_comp, n_tokens);
-    } else if (n_comp <= 2048u && top_k <= 1024u) {
+    } else if (n_comp <= 8192u && top_k <= 1024u) {
         const unsigned threads = 256u;
         const size_t shmem = (size_t)n_comp * sizeof(float) + threads * (sizeof(float) + sizeof(int));
         ds4_hip_indexer_topk_iter_parallel_kernel<<<n_tokens, threads, shmem, g_stream>>>(

@@ -331,7 +331,7 @@ Immediate targets:
   - optional stage filters: `DS4_METAL_LAYER_STAGE_PROFILE_POS`, `DS4_METAL_LAYER_STAGE_PROFILE_LAYER`, `DS4_METAL_Q_STAGE_PROFILE_POS`, `DS4_METAL_Q_STAGE_PROFILE_LAYER`.
 - [x] Fix long-prompt chunk slowdown unrelated to Q8 WMMA:
   - old indexer top-k path used one thread per token and took ~5.1 s per ratio-4 layer at `pos=2048`, `n_comp=768`, `top_k=512`
-  - new parallel iterative top-k path reduces this to ~4-5 ms per layer for `n_comp<=2048`, `top_k<=1024`
+  - new parallel iterative top-k path reduces this to ~4-5 ms per layer and now covers `n_comp<=8192`, `top_k<=1024` so 32k contexts do not fall back to the serial path
   - 4180-token prefill recovered from ~8 t/s to ~29 t/s without WMMA and ~31 t/s with WMMA.
 - [ ] Next dense Q8 step:
   - Q8 WMMA remains experimental opt-in, not part of `DS4_SERVER_FAST_FULL`, because a 4180-token greedy spot check swapped the first token between two close logits (`It` vs `This`)
