@@ -29,7 +29,7 @@ That said, a few important things about this project:
 * This software is developed with **strong assistance from GPT 5.5** and with humans leading the ideas, testing, and debugging. We say this openly because it shaped how the project was built. If you are not happy with AI-developed code, this software is not for you. The acknowledgement below is equally important: this would not exist without `llama.cpp` and GGML, largely written by hand.
 * This implementation is based on the idea that compressed KV caches like the one of DeepSeek v4 and the fast SSD disks of modern MacBooks should change our idea that KV cache belongs to RAM. **The KV cache is actually a first-class disk citizen**.
 * Our vision is that local inference should be a set of three things working well together, out of the box: A) inference engine with HTTP API + B) GGUF specially crafted to run well under a given engine and given assumptions + C) testing and validation with coding agents implementations. This inference engine only runs with the GGUF files provided. It gets tested against officially obtained logits at different context sizes. This project exists because we wanted to make one local model feel finished end to end, not just runnable. However this is just alpha quality code, so probably we are not still there.
-* This is **Metal-only**, may implement CUDA support in the future? Perhaps, but nothing more. The CPU path is only for correctness check, but **warning: current macOS versions have a bug in the virtual memory implementation that will crash the kernel** if you try to run the CPU code. Remember? Software sucks. It was not possible to fix the CPU inference to avoid crashing, since each time you have to restart the computer, which is not funny. Help us, if you have the guts.
+* The original fast path is **Metal** on Apple Silicon. This fork also includes a **Linux ROCm/HIP backend** for AMD GPUs. CUDA is not implemented. The CPU path is only for correctness check, but **warning: current macOS versions have a bug in the virtual memory implementation that will crash the kernel** if you try to run the CPU code. Remember? Software sucks. It was not possible to fix the CPU inference to avoid crashing, since each time you have to restart the computer, which is not funny. Help us, if you have the guts.
 
 ## Acknowledgements to llama.cpp and GGML
 
@@ -81,6 +81,9 @@ Then build:
 make
 ```
 
+On Linux, if `hipcc` is available, the build automatically enables the ROCm/HIP
+backend and compiles `ds4_hip.cpp`. On macOS it builds the Metal backend.
+
 `./ds4flash.gguf` is the default model path used by both binaries. Pass `-m` to
 select another supported GGUF from `./gguf/`. Run `./ds4 --help` and
 `./ds4-server --help` for the full flag list.
@@ -102,6 +105,76 @@ Q4 requires the larger-memory machine class, so M3 Max Q4 numbers are `N/A`.
 | Mac Studio M3 Ultra, 512 GB | q2 | 11709 tokens | 468.03 t/s | 27.39 t/s |
 | Mac Studio M3 Ultra, 512 GB | q4 | short | 78.95 t/s | 35.50 t/s |
 | Mac Studio M3 Ultra, 512 GB | q4 | 12018 tokens | 448.82 t/s | 26.62 t/s |
+
+### ROCm/HIP performance
+
+The HIP backend is optimized for the CyberNeurova DeepSeek V4 Flash Q2_K GGUF
+on AMD ROCm. The current tested GPU is an AMD Radeon 8060S (`gfx1151`, wave32,
+124 GiB unified/global memory). Numbers below use the max-performance/full-copy
+profile: device tensors, staged full model copy, fast prefill attention, Q8
+shared-X batched prefill, Q2_K expert-batched MoE with LDS reuse, Q8 decode
+repack, and split16 Q8 decode repack.
+
+| Machine | Backend | Quant | Prompt | Prefill | Generation |
+| --- | --- | ---: | ---: | ---: | ---: |
+| AMD Radeon 8060S / ROCm HIP | HIP full-copy | Q2_K | 1003 tokens | 33.72 t/s | 9.37 t/s |
+| AMD Radeon 8060S / ROCm HIP | HIP full-copy | Q2_K | 1905 tokens | 33.46 t/s | 9.20 t/s |
+
+The HIP full-copy profile copies about 92 GiB of GGUF tensor payload into GPU
+memory at startup and eagerly builds about 4.6 GiB of Q8 decode repacks. It is
+therefore opt-in. Conservative HIP server mode keeps zero-copy mapped GGUF
+weights and avoids the full copy.
+
+## ROCm/HIP quick start and max performance
+
+Build on a ROCm machine:
+
+```sh
+make ds4 ds4-server
+```
+
+Run the conservative HIP server:
+
+```sh
+DS4_MODEL=/path/to/cyberneurova-DeepSeek-V4-Flash-abliterated-Q2_K.gguf \
+  scripts/start_ds4_server.sh
+```
+
+Run the current max-performance HIP profile:
+
+```sh
+DS4_MODEL=/path/to/cyberneurova-DeepSeek-V4-Flash-abliterated-Q2_K.gguf \
+DS4_SERVER_FAST_FULL=1 \
+  scripts/start_ds4_server.sh
+```
+
+`DS4_SERVER_FAST_FULL=1` expands to the currently measured best HIP settings:
+
+```sh
+DS4_SERVER_DEVICE_TENSORS=1
+DS4_SERVER_COPY_MODEL=1
+DS4_SERVER_COPY_MODEL_CHUNK_MB=1024
+
+DS4_SERVER_PREFILL_RAW_FAST=1
+DS4_SERVER_PREFILL_MIXED_FAST=1
+DS4_SERVER_Q8_BATCH_FAST=1
+DS4_SERVER_Q8_BATCH_SHARED_X=1
+DS4_SERVER_Q8_BATCH_RPB=32
+DS4_SERVER_Q8_BATCH_SHARED_X_BLOCKS=16
+DS4_SERVER_MOE_EXPERT_BATCH=1
+DS4_SERVER_MOE_GATE_RPB=16
+DS4_SERVER_MOE_DOWN_RPB=16
+DS4_SERVER_MOE_EXPERT_SHARED_X=1
+DS4_SERVER_MOE_EXPERT_SHARED_MID=1
+
+DS4_SERVER_Q8_REPACK=1
+DS4_SERVER_Q8_REPACK_SPLIT16=1
+```
+
+For one-shot CLI benchmarking with the same core settings, use the server preset
+above or set the corresponding `DS4_HIP_*` variables directly. The server script
+is recommended because it also handles model path, KV cache, pid/log files, and
+safe restart behavior.
 
 ## CLI
 
@@ -138,8 +211,9 @@ Start a local OpenAI/Anthropic-compatible server:
 ./ds4-server --ctx 100000 --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 8192
 ```
 
-The server is Metal-only. It keeps one mutable graph/KV checkpoint in memory,
-so stateless clients that resend a longer version of the same prompt can reuse
+The server uses Metal on macOS and ROCm/HIP on Linux when built with `hipcc`.
+It keeps one mutable graph/KV checkpoint in memory, so stateless clients that
+resend a longer version of the same prompt can reuse
 the shared prefix instead of pre-filling from token zero.
 
 Request parsing and sockets run in client threads, but inference itself is
@@ -543,10 +617,18 @@ the kv cache files include the verbatim prompt cached.
 
 ## Backends
 
-The default backend is Metal:
+On macOS, the production backend is Metal:
 
 ```sh
 ./ds4 -p "Hello" --metal
+```
+
+On Linux/ROCm, this fork builds and uses the HIP backend automatically when
+`hipcc` is present:
+
+```sh
+make ds4 ds4-server
+./ds4 -p "Hello"
 ```
 
 There is also a CPU reference/debug path:
@@ -555,9 +637,9 @@ There is also a CPU reference/debug path:
 ./ds4 -p "Hello" --cpu
 ```
 
-Do not treat the CPU path as the production target. The server is Metal-only,
-and the optimized implementation lives in the Metal graph path. This may
-change in the future.
+Do not treat the CPU path as the production target. The optimized
+implementations live in the Metal graph path on macOS and the HIP graph path on
+ROCm/Linux.
 
 ## Test Vectors
 
