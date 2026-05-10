@@ -268,7 +268,14 @@ The GGUF uses MLA-style factorized attention:
 - `attn_output_a`: `[4096, 8192]` Q8_0, ~34 MiB/layer
 - `attn_output_b`: `[8192, 4096]` Q8_0, ~34 MiB/layer
 
-These dense Q8_0 matrices are touched every decode token and are the largest decode target after correcting the bandwidth model. For prefill, the measured split is more balanced: routed Q2_K MoE is currently the largest stage (~48%), while dense/shared Q8 projection work is ~41%. Single-stream decode should prioritize Q8 layout/repack first, then dense MLA/projection fusion/WMMA; prefill needs Q8 repack plus Q2_K MoE repack/WMMA/grouped kernels.
+These dense Q8_0 matrices are touched every decode token and are the largest decode target after correcting the bandwidth model. For prefill, the measured split is more balanced: routed Q2_K MoE is currently the largest stage (~48%), while dense/shared Q8 projection work is ~41%. The first Q2_K down-projection WMMA microbench changed the priority: direct Q2_K dequant-to-LDS WMMA is slower, while pre-repacked half `KxN` is only about a 1.25x microbench win. Dense Q8 WMMA on output projection and q-path is now Phase 1 because it is simpler, validates WMMA on cleaner kernels, has a higher expected speedup, and should save more absolute time in prefill.
+
+Realistic prefill trajectory:
+
+- current HIP fast path: ~32 tok/s
+- dense Q8 WMMA on output projection and q-path: ~36-40 tok/s
+- Q2_K MoE WMMA after a validated repack design: ~38-42 tok/s
+- further polish, fusion, and attention work: ~42-50 tok/s
 
 ### Phase 0: rocWMMA capability/smoke
 
@@ -288,20 +295,33 @@ These dense Q8_0 matrices are touched every decode token and are the largest dec
   - `1024x1024x1024`: rocWMMA ~0.44 ms / ~4.9 TFLOP/s, max abs vs HIP naive ~2.1e-4
   - This is only a one-wave-per-16x16-tile smoke kernel, not a tuned GEMM.
 
-### Phase 1: profile current decode and prefill
+### Phase 1: dense Q8 WMMA first target
 
-- [ ] Profile one decode step with current kernels:
+Priority revision after the Q2_K down microbench: dense Q8 WMMA on output projection should happen before Q2_K MoE integration.
+
+Reasons:
+
+- higher expected first-step speedup: about 1.5-2x on the targeted dense kernels vs about 1.25x for the pre-repacked Q2_K down microbench
+- simpler integration: no expert dispatch, no bucket thresholds, simpler Q8_0 dequant/repack
+- cleanest validation target for WMMA infrastructure
+- larger expected absolute prefill saving: roughly 4.5s vs 1.7s on a 31s prefill
+- lets Q2_K get another microbench/repack pass before engine integration
+
+Immediate targets:
+
+- [ ] Build dense Q8 WMMA microbench for output projection first:
+  - `attn_output_a`: `4096 -> 8192`
+  - `attn_output_b`: `8192 -> 4096`
+  - prefill token tiles: 16, 32, 64, 128, 512
+  - compare against current Q8 shared-X batched prefill path.
+- [ ] Then test q-path:
+  - `attn_q_a`: `4096 -> 1024`
+  - `attn_q_b`: `1024 -> 32768`
+- [ ] Keep one small profile loop around current decode/prefill to measure real graph savings:
   - dense MLA/projection Q8_0 matmuls
-  - attention/cache kernels
   - routed Q2_K MoE kernels
-  - router
-  - output/lm_head
-  - launch/synchronization overhead.
-- [ ] Profile one representative prefill chunk:
-  - current Q8 batch baseline
-  - current MoE expert-batch baseline
-  - raw/mixed attention fast paths.
-- [ ] Use the profile to verify whether dense Q8 MLA is time-dominant, bandwidth-dominant, or launch/activation-traffic-dominant.
+  - raw/mixed attention fast paths
+  - output/lm_head and launch overhead.
 
 ### Phase 2: Q8_0 WMMA microbench before integration
 
@@ -447,16 +467,16 @@ Harder and still important, but lower priority for single-stream decode than den
 The backend now has a stable fast path and the known non-winning experiments
 have been removed. The next roadmap is:
 
-1. rocWMMA on Q2_K routed experts.
+1. rocWMMA on dense Q8_0 projections.
+   - Phase 1 target is output projection: `attn_output_a` and `attn_output_b`.
+   - Then q-path: `attn_q_a` and `attn_q_b`.
+   - Use tile-major/repacked layouts instead of raw GGUF rows.
+   - Expected prefill move: ~32 tok/s -> ~36-40 tok/s if the dense kernels land.
+2. rocWMMA on Q2_K routed experts.
    - First down-projection microbench is in place.
    - Direct dequant-to-LDS WMMA is slower; pre-repacked half `KxN` WMMA is faster.
-   - Next: design a load-time/tile-major Q2_K expert repack path and integrate only for sufficiently large expert buckets.
-   - Use FP32 accumulation and keep scalar fallbacks for small expert buckets.
-2. rocWMMA on dense Q8_0 projections.
-   - Start with hot DS4 shapes: `attn_q_b`, `attn_output_a`, `attn_output_b`,
-     then `attn_q_a`, `attn_kv`, shared Q8 experts, and output/lm_head if
-     profiling justifies it.
-   - Use tile-major/repacked layouts instead of raw GGUF rows.
+   - Next: refine a load-time/tile-major Q2_K expert repack path before engine integration.
+   - Expected after dense Q8: ~38-42 tok/s if Q2_K repack/WMMA lands.
 3. hipBLASLt-quality custom kernels.
    - Focus on occupancy, LDS/coalescing, register pressure, tile scheduling,
      and real graph performance rather than just adding WMMA instructions.

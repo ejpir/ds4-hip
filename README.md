@@ -186,21 +186,23 @@ The HIP backend is now at the first stable fast path: zero-copy and full-copy
 loading both work, the non-winning experiments have been removed, and the
 current best prefill/decode flags are exposed through `DS4_SERVER_FAST_FULL=1`.
 The next work is kernel quality, then decode/inference behavior, then KV/cache
-work:
+work. After the first Q2_K WMMA microbench, dense Q8 is the Phase 1 target:
 
-1. **rocWMMA on Q2_K routed experts**
-   - Target the Q2_K MoE expert-batched path first, because routed MoE is the
-     largest remaining prefill stage.
-   - Dequantize Q2_K tiles into LDS/FP16, use rocWMMA FP16 fragments with FP32
-     accumulation, and keep the existing scalar path for small expert buckets
-     and correctness fallback.
-
-2. **rocWMMA on dense Q8 projections**
-   - Target DS4's hot dense Q8_0 shapes: `attn_q_b`, `attn_output_a`,
-     `attn_output_b`, `attn_q_a`, `attn_kv`, shared Q8 experts, and eventually
-     the output head where profiling proves value.
+1. **rocWMMA on dense Q8 projections**
+   - Start with the cleanest high-impact targets: output projection
+     (`attn_output_a`/`attn_output_b`) and the q-path (`attn_q_a`/`attn_q_b`).
+   - This should validate the WMMA infrastructure with simpler dispatch and
+     dequantization than routed experts, and has a higher expected first-step
+     speedup than the current Q2_K MoE WMMA prototype.
    - Use tile-major/repacked layouts suitable for WMMA rather than the raw GGUF
      row layout.
+
+2. **rocWMMA on Q2_K routed experts**
+   - The first down-projection microbench shows direct dequant-to-LDS WMMA is
+     slower, while pre-repacked half `KxN` WMMA can win. Do not integrate the
+     direct path.
+   - Revisit Q2_K after dense Q8 WMMA with refined repack assumptions, and keep
+     scalar fallbacks for small expert buckets and correctness.
 
 3. **hipBLASLt-quality custom kernels**
    - The goal is not merely “use WMMA”, but kernels with hipBLASLt-like quality:
@@ -219,6 +221,11 @@ work:
    - Last in this sequence: improve KV behavior after the compute kernels are
      better understood. This includes live KV memory layout, disk KV reuse,
      long-context cache movement, and cache/server ergonomics.
+
+Realistic prefill trajectory for the HIP fast path is roughly: current ~32 tok/s;
+dense Q8 WMMA on output projection/q-path ~36-40 tok/s; Q2_K MoE WMMA after a
+validated repack design ~38-42 tok/s; then fusion, attention work, and polish
+for a possible ~42-50 tok/s.
 
 ## CLI
 
