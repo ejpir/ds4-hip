@@ -150,6 +150,18 @@ __global__ void q8_repack_half_kn_kernel(half* __restrict__ bhalf,
     bhalf[idx] = __float2half(q8_0_value(w + (uint64_t)row * row_bytes, k));
 }
 
+__global__ void x_repack_half_split_kernel(half* __restrict__ xhalf_hi,
+                                           half* __restrict__ xhalf_lo,
+                                           const float* __restrict__ x,
+                                           uint64_t total) {
+    const uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    const float xv = x[idx];
+    const half hi = __float2half(xv);
+    xhalf_hi[idx] = hi;
+    xhalf_lo[idx] = __float2half(xv - __half2float(hi));
+}
+
 template <int BM=16, int BN=16, int BK=16>
 __global__ void q8_wmma_direct_kernel(float* __restrict__ out,
                                       const unsigned char* __restrict__ w,
@@ -340,6 +352,175 @@ __global__ void q8_wmma_packed_multin_xsplit_kernel(float* __restrict__ out,
     if (wave < TILES_N) rocwmma::store_matrix_sync(out + (uint64_t)m0 * N + n_wave, acc, N, rocwmma::mem_row_major);
 }
 
+template <int TILES_N, int BM=16, int BN=16, int BK=16>
+__global__ void q8_wmma_packed_multin_xsplit_shc_kernel(float* __restrict__ out,
+                                                        const half* __restrict__ bhalf,
+                                                        const float* __restrict__ x,
+                                                        unsigned M, unsigned K, unsigned N) {
+    extern __shared__ half sh[];
+    half* shA = sh;
+    half* shB = sh + BM * BK;
+    float* shC = (float*)(shB + TILES_N * BK * BN);
+    const unsigned wave = threadIdx.x >> 5;
+    const unsigned tid = threadIdx.x;
+    const unsigned m0 = blockIdx.y * BM;
+    const unsigned n0 = blockIdx.x * (TILES_N * BN);
+
+    using frag_a = rocwmma::fragment<rocwmma::matrix_a, BM, BN, BK, half, rocwmma::row_major>;
+    using frag_b = rocwmma::fragment<rocwmma::matrix_b, BM, BN, BK, half, rocwmma::row_major>;
+    using frag_c = rocwmma::fragment<rocwmma::accumulator, BM, BN, BK, float>;
+    frag_a a;
+    frag_b b;
+    frag_c acc;
+    if (wave < TILES_N) rocwmma::fill_fragment(acc, 0.0f);
+    for (unsigned k0 = 0; k0 < K; k0 += BK) {
+        for (unsigned j = tid; j < BM * BK; j += blockDim.x) {
+            const unsigned mm = j / BK;
+            const unsigned kk = j - mm * BK;
+            const float xv = x[(uint64_t)(m0 + mm) * K + k0 + kk];
+            shA[j] = __float2half(xv);
+        }
+        for (unsigned j = tid; j < TILES_N * BK * BN; j += blockDim.x) {
+            const unsigned tile = j / (BK * BN);
+            const unsigned r = j - tile * (BK * BN);
+            const unsigned kk = r / BN;
+            const unsigned nn = r - kk * BN;
+            shB[j] = bhalf[(uint64_t)(k0 + kk) * N + n0 + tile * BN + nn];
+        }
+        __syncthreads();
+        if (wave < TILES_N) {
+            rocwmma::load_matrix_sync(a, shA, BK);
+            rocwmma::load_matrix_sync(b, shB + wave * BK * BN, BN);
+            rocwmma::mma_sync(acc, a, b, acc);
+        }
+        __syncthreads();
+        for (unsigned j = tid; j < BM * BK; j += blockDim.x) {
+            const unsigned mm = j / BK;
+            const unsigned kk = j - mm * BK;
+            const float xv = x[(uint64_t)(m0 + mm) * K + k0 + kk];
+            const half xh = __float2half(xv);
+            shA[j] = __float2half(xv - __half2float(xh));
+        }
+        __syncthreads();
+        if (wave < TILES_N) {
+            rocwmma::load_matrix_sync(a, shA, BK);
+            rocwmma::mma_sync(acc, a, b, acc);
+        }
+        __syncthreads();
+    }
+    if (wave < TILES_N) rocwmma::store_matrix_sync(shC + wave * BM * BN, acc, BN, rocwmma::mem_row_major);
+    __syncthreads();
+    for (unsigned j = tid; j < TILES_N * BM * BN; j += blockDim.x) {
+        const unsigned tile = j / (BM * BN);
+        const unsigned r = j - tile * (BM * BN);
+        const unsigned mm = r / BN;
+        const unsigned nn = r - mm * BN;
+        out[(uint64_t)(m0 + mm) * N + n0 + tile * BN + nn] = shC[j];
+    }
+}
+
+template <int TILES_N, int BM=16, int BN=16, int BK=16>
+__global__ void q8_wmma_packed_multin_ahalf_kernel(float* __restrict__ out,
+                                                   const half* __restrict__ bhalf,
+                                                   const half* __restrict__ xhalf,
+                                                   unsigned M, unsigned K, unsigned N) {
+    extern __shared__ half sh[];
+    half* shA = sh;
+    half* shB = sh + BM * BK;
+    const unsigned wave = threadIdx.x >> 5;
+    const unsigned tid = threadIdx.x;
+    const unsigned m0 = blockIdx.y * BM;
+    const unsigned n0 = blockIdx.x * (TILES_N * BN);
+    const unsigned n_wave = n0 + wave * BN;
+
+    using frag_a = rocwmma::fragment<rocwmma::matrix_a, BM, BN, BK, half, rocwmma::row_major>;
+    using frag_b = rocwmma::fragment<rocwmma::matrix_b, BM, BN, BK, half, rocwmma::row_major>;
+    using frag_c = rocwmma::fragment<rocwmma::accumulator, BM, BN, BK, float>;
+    frag_a a;
+    frag_b b;
+    frag_c acc;
+    if (wave < TILES_N) rocwmma::fill_fragment(acc, 0.0f);
+    for (unsigned k0 = 0; k0 < K; k0 += BK) {
+        for (unsigned j = tid; j < BM * BK; j += blockDim.x) {
+            const unsigned mm = j / BK;
+            const unsigned kk = j - mm * BK;
+            shA[j] = xhalf[(uint64_t)(m0 + mm) * K + k0 + kk];
+        }
+        for (unsigned j = tid; j < TILES_N * BK * BN; j += blockDim.x) {
+            const unsigned tile = j / (BK * BN);
+            const unsigned r = j - tile * (BK * BN);
+            const unsigned kk = r / BN;
+            const unsigned nn = r - kk * BN;
+            shB[j] = bhalf[(uint64_t)(k0 + kk) * N + n0 + tile * BN + nn];
+        }
+        __syncthreads();
+        if (wave < TILES_N) {
+            rocwmma::load_matrix_sync(a, shA, BK);
+            rocwmma::load_matrix_sync(b, shB + wave * BK * BN, BN);
+            rocwmma::mma_sync(acc, a, b, acc);
+        }
+        __syncthreads();
+    }
+    if (wave < TILES_N) rocwmma::store_matrix_sync(out + (uint64_t)m0 * N + n_wave, acc, N, rocwmma::mem_row_major);
+}
+
+template <int TILES_N, int BM=16, int BN=16, int BK=16>
+__global__ void q8_wmma_packed_multin_ahalf_xsplit_kernel(float* __restrict__ out,
+                                                          const half* __restrict__ bhalf,
+                                                          const half* __restrict__ xhalf_hi,
+                                                          const half* __restrict__ xhalf_lo,
+                                                          unsigned M, unsigned K, unsigned N) {
+    extern __shared__ half sh[];
+    half* shA = sh;
+    half* shB = sh + BM * BK;
+    const unsigned wave = threadIdx.x >> 5;
+    const unsigned tid = threadIdx.x;
+    const unsigned m0 = blockIdx.y * BM;
+    const unsigned n0 = blockIdx.x * (TILES_N * BN);
+    const unsigned n_wave = n0 + wave * BN;
+
+    using frag_a = rocwmma::fragment<rocwmma::matrix_a, BM, BN, BK, half, rocwmma::row_major>;
+    using frag_b = rocwmma::fragment<rocwmma::matrix_b, BM, BN, BK, half, rocwmma::row_major>;
+    using frag_c = rocwmma::fragment<rocwmma::accumulator, BM, BN, BK, float>;
+    frag_a a;
+    frag_b b;
+    frag_c acc;
+    if (wave < TILES_N) rocwmma::fill_fragment(acc, 0.0f);
+    for (unsigned k0 = 0; k0 < K; k0 += BK) {
+        for (unsigned j = tid; j < BM * BK; j += blockDim.x) {
+            const unsigned mm = j / BK;
+            const unsigned kk = j - mm * BK;
+            shA[j] = xhalf_hi[(uint64_t)(m0 + mm) * K + k0 + kk];
+        }
+        for (unsigned j = tid; j < TILES_N * BK * BN; j += blockDim.x) {
+            const unsigned tile = j / (BK * BN);
+            const unsigned r = j - tile * (BK * BN);
+            const unsigned kk = r / BN;
+            const unsigned nn = r - kk * BN;
+            shB[j] = bhalf[(uint64_t)(k0 + kk) * N + n0 + tile * BN + nn];
+        }
+        __syncthreads();
+        if (wave < TILES_N) {
+            rocwmma::load_matrix_sync(a, shA, BK);
+            rocwmma::load_matrix_sync(b, shB + wave * BK * BN, BN);
+            rocwmma::mma_sync(acc, a, b, acc);
+        }
+        __syncthreads();
+        for (unsigned j = tid; j < BM * BK; j += blockDim.x) {
+            const unsigned mm = j / BK;
+            const unsigned kk = j - mm * BK;
+            shA[j] = xhalf_lo[(uint64_t)(m0 + mm) * K + k0 + kk];
+        }
+        __syncthreads();
+        if (wave < TILES_N) {
+            rocwmma::load_matrix_sync(a, shA, BK);
+            rocwmma::mma_sync(acc, a, b, acc);
+        }
+        __syncthreads();
+    }
+    if (wave < TILES_N) rocwmma::store_matrix_sync(out + (uint64_t)m0 * N + n_wave, acc, N, rocwmma::mem_row_major);
+}
+
 static void fill_q8_weights(std::vector<unsigned char>& w, unsigned K, unsigned N) {
     const unsigned n_blocks = K / Q8_BLOCK;
     const unsigned row_bytes = n_blocks * Q8_BYTES;
@@ -417,29 +598,49 @@ int main(int argc, char** argv) {
 
     unsigned char* dW = nullptr;
     half* dBhalf = nullptr;
+    half *dXhalfHi = nullptr, *dXhalfLo = nullptr;
     float *dX = nullptr, *dCur = nullptr, *dDirect = nullptr, *dPacked = nullptr, *dPackedMulti = nullptr;
-    float *dPackedMultiXSplit = nullptr;
+    float *dPackedMultiXSplit4 = nullptr, *dPackedMultiXSplit = nullptr, *dPackedMultiXSplit16 = nullptr;
+    float *dPackedMultiXSplitShc = nullptr, *dPackedMultiAhalfXSplit = nullptr, *dPackedMultiAhalfXSplit16 = nullptr;
     HIP_CHECK(hipMalloc(&dW, hW.size()));
     HIP_CHECK(hipMalloc(&dBhalf, (uint64_t)K * N * sizeof(half)));
+    HIP_CHECK(hipMalloc(&dXhalfHi, hX.size() * sizeof(half)));
+    HIP_CHECK(hipMalloc(&dXhalfLo, hX.size() * sizeof(half)));
     HIP_CHECK(hipMalloc(&dX, hX.size() * sizeof(float)));
     HIP_CHECK(hipMalloc(&dCur, (uint64_t)M * N * sizeof(float)));
     HIP_CHECK(hipMalloc(&dDirect, (uint64_t)M * N * sizeof(float)));
     HIP_CHECK(hipMalloc(&dPacked, (uint64_t)M * N * sizeof(float)));
     HIP_CHECK(hipMalloc(&dPackedMulti, (uint64_t)M * N * sizeof(float)));
+    HIP_CHECK(hipMalloc(&dPackedMultiXSplit4, (uint64_t)M * N * sizeof(float)));
     HIP_CHECK(hipMalloc(&dPackedMultiXSplit, (uint64_t)M * N * sizeof(float)));
+    HIP_CHECK(hipMalloc(&dPackedMultiXSplit16, (uint64_t)M * N * sizeof(float)));
+    HIP_CHECK(hipMalloc(&dPackedMultiXSplitShc, (uint64_t)M * N * sizeof(float)));
+    HIP_CHECK(hipMalloc(&dPackedMultiAhalfXSplit, (uint64_t)M * N * sizeof(float)));
+    HIP_CHECK(hipMalloc(&dPackedMultiAhalfXSplit16, (uint64_t)M * N * sizeof(float)));
     HIP_CHECK(hipMemcpy(dW, hW.data(), hW.size(), hipMemcpyHostToDevice));
     HIP_CHECK(hipMemcpy(dX, hX.data(), hX.size() * sizeof(float), hipMemcpyHostToDevice));
     HIP_CHECK(hipMemset(dCur, 0, (uint64_t)M * N * sizeof(float)));
     HIP_CHECK(hipMemset(dDirect, 0, (uint64_t)M * N * sizeof(float)));
     HIP_CHECK(hipMemset(dPacked, 0, (uint64_t)M * N * sizeof(float)));
     HIP_CHECK(hipMemset(dPackedMulti, 0, (uint64_t)M * N * sizeof(float)));
+    HIP_CHECK(hipMemset(dPackedMultiXSplit4, 0, (uint64_t)M * N * sizeof(float)));
     HIP_CHECK(hipMemset(dPackedMultiXSplit, 0, (uint64_t)M * N * sizeof(float)));
+    HIP_CHECK(hipMemset(dPackedMultiXSplit16, 0, (uint64_t)M * N * sizeof(float)));
+    HIP_CHECK(hipMemset(dPackedMultiXSplitShc, 0, (uint64_t)M * N * sizeof(float)));
+    HIP_CHECK(hipMemset(dPackedMultiAhalfXSplit, 0, (uint64_t)M * N * sizeof(float)));
+    HIP_CHECK(hipMemset(dPackedMultiAhalfXSplit16, 0, (uint64_t)M * N * sizeof(float)));
 
     auto launch_repack = [&]() {
         hipLaunchKernelGGL(q8_repack_half_kn_kernel, dim3((unsigned)(((uint64_t)K * N + 255u) / 256u)), dim3(256), 0, 0,
                            dBhalf, dW, K, N, row_bytes);
     };
+    auto launch_x_repack = [&]() {
+        hipLaunchKernelGGL(x_repack_half_split_kernel, dim3((unsigned)((hX.size() + 255u) / 256u)), dim3(256), 0, 0,
+                           dXhalfHi, dXhalfLo, dX, (uint64_t)hX.size());
+    };
     launch_repack();
+    HIP_CHECK(hipGetLastError());
+    launch_x_repack();
     HIP_CHECK(hipGetLastError());
     HIP_CHECK(hipDeviceSynchronize());
 
@@ -476,21 +677,59 @@ int main(int argc, char** argv) {
         hipLaunchKernelGGL((q8_wmma_packed_multin_xsplit_kernel<MULTI_N,16,16,16>), wmma_multi_grid, wmma_block, wmma_multi_shmem, 0,
                            dPackedMultiXSplit, dBhalf, dX, M, K, N);
     };
+    size_t wmma_multi_shc_shmem = wmma_multi_shmem + MULTI_N * 16 * 16 * sizeof(float);
+    auto launch_packed_multi_xsplit_shc = [&]() {
+        hipLaunchKernelGGL((q8_wmma_packed_multin_xsplit_shc_kernel<MULTI_N,16,16,16>), wmma_multi_grid, wmma_block, wmma_multi_shc_shmem, 0,
+                           dPackedMultiXSplitShc, dBhalf, dX, M, K, N);
+    };
+    dim3 wmma_multi4_block(4 * 32, 1, 1);
+    dim3 wmma_multi4_grid(N / (16 * 4), M / 16, 1);
+    size_t wmma_multi4_shmem = (16 * 16 + 4 * 16 * 16) * sizeof(half);
+    auto launch_packed_multi_xsplit4 = [&]() {
+        hipLaunchKernelGGL((q8_wmma_packed_multin_xsplit_kernel<4,16,16,16>), wmma_multi4_grid, wmma_multi4_block, wmma_multi4_shmem, 0,
+                           dPackedMultiXSplit4, dBhalf, dX, M, K, N);
+    };
+    dim3 wmma_multi16_block(16 * 32, 1, 1);
+    dim3 wmma_multi16_grid(N / (16 * 16), M / 16, 1);
+    size_t wmma_multi16_shmem = (16 * 16 + 16 * 16 * 16) * sizeof(half);
+    auto launch_packed_multi_xsplit16 = [&]() {
+        hipLaunchKernelGGL((q8_wmma_packed_multin_xsplit_kernel<16,16,16,16>), wmma_multi16_grid, wmma_multi16_block, wmma_multi16_shmem, 0,
+                           dPackedMultiXSplit16, dBhalf, dX, M, K, N);
+    };
+    auto launch_packed_multi_ahalf_xsplit = [&]() {
+        hipLaunchKernelGGL((q8_wmma_packed_multin_ahalf_xsplit_kernel<MULTI_N,16,16,16>), wmma_multi_grid, wmma_block, wmma_multi_shmem, 0,
+                           dPackedMultiAhalfXSplit, dBhalf, dXhalfHi, dXhalfLo, M, K, N);
+    };
+    auto launch_packed_multi_ahalf_xsplit16 = [&]() {
+        hipLaunchKernelGGL((q8_wmma_packed_multin_ahalf_xsplit_kernel<16,16,16,16>), wmma_multi16_grid, wmma_multi16_block, wmma_multi16_shmem, 0,
+                           dPackedMultiAhalfXSplit16, dBhalf, dXhalfHi, dXhalfLo, M, K, N);
+    };
 
     launch_cur(); HIP_CHECK(hipGetLastError());
     launch_direct(); HIP_CHECK(hipGetLastError());
     launch_packed(); HIP_CHECK(hipGetLastError());
     launch_packed_multi(); HIP_CHECK(hipGetLastError());
+    launch_packed_multi_xsplit4(); HIP_CHECK(hipGetLastError());
     launch_packed_multi_xsplit(); HIP_CHECK(hipGetLastError());
+    launch_packed_multi_xsplit_shc(); HIP_CHECK(hipGetLastError());
+    launch_packed_multi_xsplit16(); HIP_CHECK(hipGetLastError());
+    launch_packed_multi_ahalf_xsplit(); HIP_CHECK(hipGetLastError());
+    launch_packed_multi_ahalf_xsplit16(); HIP_CHECK(hipGetLastError());
     HIP_CHECK(hipDeviceSynchronize());
 
     std::vector<float> hCur((uint64_t)M * N), hDirect((uint64_t)M * N), hPacked((uint64_t)M * N), hPackedMulti((uint64_t)M * N);
-    std::vector<float> hPackedMultiXSplit((uint64_t)M * N);
+    std::vector<float> hPackedMultiXSplit4((uint64_t)M * N), hPackedMultiXSplit((uint64_t)M * N), hPackedMultiXSplit16((uint64_t)M * N);
+    std::vector<float> hPackedMultiXSplitShc((uint64_t)M * N), hPackedMultiAhalfXSplit((uint64_t)M * N), hPackedMultiAhalfXSplit16((uint64_t)M * N);
     HIP_CHECK(hipMemcpy(hCur.data(), dCur, hCur.size() * sizeof(float), hipMemcpyDeviceToHost));
     HIP_CHECK(hipMemcpy(hDirect.data(), dDirect, hDirect.size() * sizeof(float), hipMemcpyDeviceToHost));
     HIP_CHECK(hipMemcpy(hPacked.data(), dPacked, hPacked.size() * sizeof(float), hipMemcpyDeviceToHost));
     HIP_CHECK(hipMemcpy(hPackedMulti.data(), dPackedMulti, hPackedMulti.size() * sizeof(float), hipMemcpyDeviceToHost));
+    HIP_CHECK(hipMemcpy(hPackedMultiXSplit4.data(), dPackedMultiXSplit4, hPackedMultiXSplit4.size() * sizeof(float), hipMemcpyDeviceToHost));
     HIP_CHECK(hipMemcpy(hPackedMultiXSplit.data(), dPackedMultiXSplit, hPackedMultiXSplit.size() * sizeof(float), hipMemcpyDeviceToHost));
+    HIP_CHECK(hipMemcpy(hPackedMultiXSplit16.data(), dPackedMultiXSplit16, hPackedMultiXSplit16.size() * sizeof(float), hipMemcpyDeviceToHost));
+    HIP_CHECK(hipMemcpy(hPackedMultiXSplitShc.data(), dPackedMultiXSplitShc, hPackedMultiXSplitShc.size() * sizeof(float), hipMemcpyDeviceToHost));
+    HIP_CHECK(hipMemcpy(hPackedMultiAhalfXSplit.data(), dPackedMultiAhalfXSplit, hPackedMultiAhalfXSplit.size() * sizeof(float), hipMemcpyDeviceToHost));
+    HIP_CHECK(hipMemcpy(hPackedMultiAhalfXSplit16.data(), dPackedMultiAhalfXSplit16, hPackedMultiAhalfXSplit16.size() * sizeof(float), hipMemcpyDeviceToHost));
     auto compare = [&](const char* name, const std::vector<float>& got) {
         double max_abs = 0.0, rms = 0.0, denom = 0.0;
         for (size_t i = 0; i < hCur.size(); ++i) {
@@ -506,30 +745,61 @@ int main(int argc, char** argv) {
     compare("wmma_direct", hDirect);
     compare("wmma_packed", hPacked);
     compare("wmma_packed_multin", hPackedMulti);
-    compare("wmma_packed_multin_xsplit", hPackedMultiXSplit);
+    compare("wmma_packed_multin_xsplit4", hPackedMultiXSplit4);
+    compare("wmma_packed_multin_xsplit8", hPackedMultiXSplit);
+    compare("wmma_packed_multin_xsplit16", hPackedMultiXSplit16);
+    compare("wmma_packed_multin_xsplit8_shc", hPackedMultiXSplitShc);
+    compare("wmma_packed_multin_ahalf_xsplit8", hPackedMultiAhalfXSplit);
+    compare("wmma_packed_multin_ahalf_xsplit16", hPackedMultiAhalfXSplit16);
 
     float repack_ms = time_kernel(launch_repack, std::max(1, std::min(iters, 20)));
+    float x_repack_ms = time_kernel(launch_x_repack, iters);
     float cur_ms = time_kernel(launch_cur, iters);
     float direct_ms = time_kernel(launch_direct, iters);
     float packed_ms = time_kernel(launch_packed, iters);
     float packed_multi_ms = time_kernel(launch_packed_multi, iters);
+    float packed_multi_xsplit4_ms = time_kernel(launch_packed_multi_xsplit4, iters);
     float packed_multi_xsplit_ms = time_kernel(launch_packed_multi_xsplit, iters);
+    float packed_multi_xsplit_shc_ms = time_kernel(launch_packed_multi_xsplit_shc, iters);
+    float packed_multi_xsplit16_ms = time_kernel(launch_packed_multi_xsplit16, iters);
+    float packed_multi_ahalf_xsplit_ms = time_kernel(launch_packed_multi_ahalf_xsplit, iters);
+    float packed_multi_ahalf_xsplit16_ms = time_kernel(launch_packed_multi_ahalf_xsplit16, iters);
     double flops = 2.0 * (double)M * (double)N * (double)K;
     std::printf("repack Q8_0->KxN half: %.4f ms  %.2f GiB/s output\n", repack_ms,
                 ((double)K * N * sizeof(half) / 1073741824.0) / (repack_ms * 1.0e-3));
-    std::printf("current shared-X:   %.4f ms  %.2f TFLOP/s\n", cur_ms, flops / (cur_ms * 1.0e-3) / 1.0e12);
-    std::printf("wmma direct proto:  %.4f ms  %.2f TFLOP/s  speedup %.3fx\n", direct_ms, flops / (direct_ms * 1.0e-3) / 1.0e12, cur_ms / direct_ms);
-    std::printf("wmma packed proto:  %.4f ms  %.2f TFLOP/s  speedup %.3fx\n", packed_ms, flops / (packed_ms * 1.0e-3) / 1.0e12, cur_ms / packed_ms);
-    std::printf("wmma packed multiN: %.4f ms  %.2f TFLOP/s  speedup %.3fx\n", packed_multi_ms, flops / (packed_multi_ms * 1.0e-3) / 1.0e12, cur_ms / packed_multi_ms);
-    std::printf("wmma multiN xsplit: %.4f ms  %.2f effective TFLOP/s  speedup %.3fx\n", packed_multi_xsplit_ms, flops / (packed_multi_xsplit_ms * 1.0e-3) / 1.0e12, cur_ms / packed_multi_xsplit_ms);
+    std::printf("repack X->half split: %.4f ms  %.2f GiB/s output\n", x_repack_ms,
+                ((double)M * K * 2.0 * sizeof(half) / 1073741824.0) / (x_repack_ms * 1.0e-3));
+    std::printf("current shared-X:       %.4f ms  %.2f TFLOP/s\n", cur_ms, flops / (cur_ms * 1.0e-3) / 1.0e12);
+    std::printf("wmma direct proto:      %.4f ms  %.2f TFLOP/s  speedup %.3fx\n", direct_ms, flops / (direct_ms * 1.0e-3) / 1.0e12, cur_ms / direct_ms);
+    std::printf("wmma packed proto:      %.4f ms  %.2f TFLOP/s  speedup %.3fx\n", packed_ms, flops / (packed_ms * 1.0e-3) / 1.0e12, cur_ms / packed_ms);
+    std::printf("wmma packed multiN8:    %.4f ms  %.2f TFLOP/s  speedup %.3fx\n", packed_multi_ms, flops / (packed_multi_ms * 1.0e-3) / 1.0e12, cur_ms / packed_multi_ms);
+    std::printf("wmma xsplit multiN4:    %.4f ms  %.2f effective TFLOP/s  speedup %.3fx\n", packed_multi_xsplit4_ms, flops / (packed_multi_xsplit4_ms * 1.0e-3) / 1.0e12, cur_ms / packed_multi_xsplit4_ms);
+    std::printf("wmma xsplit multiN8:    %.4f ms  %.2f effective TFLOP/s  speedup %.3fx\n", packed_multi_xsplit_ms, flops / (packed_multi_xsplit_ms * 1.0e-3) / 1.0e12, cur_ms / packed_multi_xsplit_ms);
+    std::printf("wmma xsplit N8 shC:     %.4f ms  %.2f effective TFLOP/s  speedup %.3fx  direct_store %.3fx\n",
+                packed_multi_xsplit_shc_ms, flops / (packed_multi_xsplit_shc_ms * 1.0e-3) / 1.0e12,
+                cur_ms / packed_multi_xsplit_shc_ms, packed_multi_xsplit_shc_ms / packed_multi_xsplit_ms);
+    std::printf("wmma xsplit multiN16:   %.4f ms  %.2f effective TFLOP/s  speedup %.3fx\n", packed_multi_xsplit16_ms, flops / (packed_multi_xsplit16_ms * 1.0e-3) / 1.0e12, cur_ms / packed_multi_xsplit16_ms);
+    std::printf("wmma ahalf xsplit N8:   %.4f ms  %.2f effective TFLOP/s  speedup %.3fx  incl_xrepack %.4f ms\n",
+                packed_multi_ahalf_xsplit_ms, flops / (packed_multi_ahalf_xsplit_ms * 1.0e-3) / 1.0e12,
+                cur_ms / packed_multi_ahalf_xsplit_ms, packed_multi_ahalf_xsplit_ms + x_repack_ms);
+    std::printf("wmma ahalf xsplit N16:  %.4f ms  %.2f effective TFLOP/s  speedup %.3fx  incl_xrepack %.4f ms\n",
+                packed_multi_ahalf_xsplit16_ms, flops / (packed_multi_ahalf_xsplit16_ms * 1.0e-3) / 1.0e12,
+                cur_ms / packed_multi_ahalf_xsplit16_ms, packed_multi_ahalf_xsplit16_ms + x_repack_ms);
 
     HIP_CHECK(hipFree(dW));
     HIP_CHECK(hipFree(dBhalf));
+    HIP_CHECK(hipFree(dXhalfHi));
+    HIP_CHECK(hipFree(dXhalfLo));
     HIP_CHECK(hipFree(dX));
     HIP_CHECK(hipFree(dCur));
     HIP_CHECK(hipFree(dDirect));
     HIP_CHECK(hipFree(dPacked));
     HIP_CHECK(hipFree(dPackedMulti));
+    HIP_CHECK(hipFree(dPackedMultiXSplit4));
     HIP_CHECK(hipFree(dPackedMultiXSplit));
+    HIP_CHECK(hipFree(dPackedMultiXSplit16));
+    HIP_CHECK(hipFree(dPackedMultiXSplitShc));
+    HIP_CHECK(hipFree(dPackedMultiAhalfXSplit));
+    HIP_CHECK(hipFree(dPackedMultiAhalfXSplit16));
     return 0;
 }
