@@ -272,16 +272,21 @@ These dense Q8_0 matrices are touched every decode token and are the largest dec
 
 ### Phase 0: rocWMMA capability/smoke
 
-- [ ] Add a tiny standalone rocWMMA smoke source, initially outside the main engine:
-  - include `<rocwmma/rocwmma.hpp>` and `<rocwmma/rocwmma-version.hpp>`
-  - compile with `hipcc --offload-arch=gfx1151 -std=c++17`
-  - verify wavefront size 32 and rocWMMA version; installed version is 2.1.0.
-- [ ] Build one FP16 GEMM kernel using rocWMMA fragments:
-  - start with 16x16x16 fragments, FP16 inputs, FP32 accumulation
-  - compare against CPU reference and a simple HIP reference.
-- [ ] Confirm generated ISA contains WMMA instructions if tooling permits:
-  - `v_wmma_*` in disassembly/temps
-  - if unavailable, rely on rocprof timings and performance counters.
+- [x] Add a tiny standalone rocWMMA smoke source, initially outside the main engine:
+  - source: `tools/hip_rocwmma_smoke.cpp`
+  - build: `make hip-rocwmma-smoke`
+  - includes `<rocwmma/rocwmma.hpp>` and `<rocwmma/rocwmma-version.hpp>`
+  - verified on AMD Radeon 8060S: `gfx1151`, wavefront size 32, rocWMMA 2.1.0.
+- [x] Build one FP16 GEMM kernel using rocWMMA fragments:
+  - 16x16x16 fragments, FP16 inputs, FP32 accumulation
+  - compared against CPU reference on small shape and simple HIP reference on large shape.
+- [x] Confirm generated ISA contains WMMA instructions:
+  - extracted code object with `llvm-objdump --offloading hip-rocwmma-smoke`
+  - confirmed `v_wmma_f32_16x16x16_f16` in gfx1151 disassembly.
+- [x] Baseline smoke timings:
+  - `128x128x128`: rocWMMA ~0.013 ms / ~0.32 TFLOP/s, max abs vs CPU ~1.1e-5
+  - `1024x1024x1024`: rocWMMA ~0.44 ms / ~4.9 TFLOP/s, max abs vs HIP naive ~2.1e-4
+  - This is only a one-wave-per-16x16-tile smoke kernel, not a tuned GEMM.
 
 ### Phase 1: profile current decode and prefill
 

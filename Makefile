@@ -93,6 +93,15 @@ ds4_metal.o: ds4_metal.m ds4_metal.h $(METAL_SRCS)
 ds4_hip.o: ds4_hip.cpp ds4_metal.h
 	$(HIPCC) $(HIPCXXFLAGS) -c -o $@ ds4_hip.cpp
 
+ifneq ($(HIPCC),)
+hip-rocwmma-smoke: tools/hip_rocwmma_smoke.cpp
+	$(HIPCC) $(HIPCXXFLAGS) -o $@ $<
+else
+hip-rocwmma-smoke:
+	@echo "hipcc not found; cannot build hip-rocwmma-smoke" >&2
+	@exit 1
+endif
+
 ds4_test: ds4_test.o rax.o $(TEST_CORE_OBJS)
 	$(TEST_LINK) -o $@ ds4_test.o rax.o $(TEST_CORE_OBJS) $(LDLIBS)
 
@@ -100,4 +109,4 @@ test: ds4_test
 	./ds4_test
 
 clean:
-	rm -f ds4 ds4-server ds4_native ds4_server_test ds4_test *.o
+	rm -f ds4 ds4-server ds4_native ds4_server_test ds4_test hip-rocwmma-smoke *.o
