@@ -122,16 +122,16 @@ because it is still an experimental opt-in correctness/perf path.
 | AMD Radeon 8060S / ROCm HIP | HIP zero-copy fast | Q2_K | 1905 tokens | 32.61 t/s | 8.88 t/s |
 | AMD Radeon 8060S / ROCm HIP | HIP full-copy | Q2_K | 1003 tokens | 33.72 t/s | 9.37 t/s |
 | AMD Radeon 8060S / ROCm HIP | HIP full-copy | Q2_K | 1905 tokens | 33.46 t/s | 9.20 t/s |
-| AMD Radeon 8060S / ROCm HIP | HIP zero-copy Q8-WMMA experimental | Q2_K | 1003 tokens | 37.48 t/s | 8.33 t/s |
-| AMD Radeon 8060S / ROCm HIP | HIP zero-copy Q8-WMMA experimental | Q2_K | 1905 tokens | 36.62 t/s | 8.52 t/s |
 
 The HIP zero-copy fast profile keeps the 92 GiB GGUF tensor payload mapped from
 host memory and avoids the full model copy, while still using the fast prefill
-kernels and Q8 decode repacks. Q8-WMMA additionally builds about 8.7 GiB of
-FP16 Q8 WMMA prefill weights and is still experimental. Full-copy copies the
-GGUF tensor payload into GPU memory at startup and eagerly builds about 4.6 GiB
-of Q8 decode repacks. Full-copy is therefore opt-in. Conservative HIP server
-mode keeps zero-copy mapped GGUF weights and avoids the full copy.
+kernels and Q8 decode repacks. Q8-WMMA remains experimental and opt-in: the
+current guarded path only applies WMMA to attention/indexer Q-side projections,
+uses FP32 WMMA accumulation, skips small batches by default, and builds about
+3.35 GiB of FP16 Q8 WMMA prefill weights. Full-copy copies the GGUF tensor
+payload into GPU memory at startup and eagerly builds about 4.6 GiB of Q8 decode
+repacks. Full-copy is therefore opt-in. Conservative HIP server mode keeps
+zero-copy mapped GGUF weights and avoids the full copy.
 
 ## ROCm/HIP quick start and max performance
 
@@ -193,13 +193,14 @@ The next work is kernel quality, then decode/inference behavior, then KV/cache
 work. After the first Q2_K WMMA microbench, dense Q8 is the Phase 1 target:
 
 1. **rocWMMA on dense Q8 projections**
-   - Start with the cleanest high-impact targets: output projection
-     (`attn_output_a`/`attn_output_b`) and the q-path (`attn_q_a`/`attn_q_b`).
-   - The standalone dense Q8 microbench now validates this priority: packed
-     multi-N WMMA is about 2.2-2.6x faster than the current shared-X batched
-     kernel on DS4-like prefill shapes, with rel RMS around `3e-4`.
+   - The production opt-in path is currently restricted to the q-side
+     (`attn_q_a`/`attn_q_b` plus indexer q) because output projection WMMA caused
+     worse greedy drift while writing directly into the residual stream.
+   - The standalone dense Q8 microbench validates the raw kernel potential:
+     packed multi-N WMMA is about 2.2-2.6x faster than the current shared-X
+     batched kernel on DS4-like prefill shapes, with rel RMS around `3e-4`.
    - Use tile-major/repacked layouts suitable for WMMA rather than the raw GGUF
-     row layout.
+     row layout, and keep greedy correctness gates on by default.
 
 2. **rocWMMA on Q2_K routed experts**
    - The first down-projection microbench shows direct dequant-to-LDS WMMA is
@@ -227,9 +228,9 @@ work. After the first Q2_K WMMA microbench, dense Q8 is the Phase 1 target:
      long-context cache movement, and cache/server ergonomics.
 
 Realistic prefill trajectory for the HIP fast path is roughly: current ~32 tok/s;
-dense Q8 WMMA on output projection/q-path ~36-40 tok/s; Q2_K MoE WMMA after a
-validated repack design ~38-42 tok/s; then fusion, attention work, and polish
-for a possible ~42-50 tok/s.
+q-side dense Q8 WMMA gives a smaller opt-in gain on long prompts; Q2_K MoE WMMA
+after a validated repack design is the next larger compute target; then fusion,
+attention work, and polish for a possible ~42-50 tok/s.
 
 ## CLI
 

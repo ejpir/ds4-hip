@@ -1304,7 +1304,10 @@ static void ds4_hip_q8_repack_eager_from_gguf(const void *model_map, uint64_t mo
             }
             if (std::getenv("DS4_HIP_Q8_WMMA_FAST") != nullptr) {
                 const bool is_q_a = name.find(".attn_q_a.weight") != std::string::npos;
-                if (is_q_a || is_q_b || is_out_a || is_out_b) wmma_hot.push_back({name, dims[0], dims[1], rel});
+                /* WMMA remains opt-in and is restricted to attention/indexer Q-side
+                 * projections.  Output projections write directly to the residual
+                 * stream and showed worse greedy drift with little useful speedup. */
+                if (is_q_a || is_q_b) wmma_hot.push_back({name, dims[0], dims[1], rel});
             }
         }
     }
@@ -1866,6 +1869,83 @@ __global__ static void ds4_hip_matmul_q8_wmma_packed_multin_kernel(float *__rest
         if (wave < TILES_N) {
             rocwmma::load_matrix_sync(a, shA, BK);
             rocwmma::load_matrix_sync(b, shB + wave * BK * BN, BN);
+            rocwmma::mma_sync(acc, a, b, acc);
+        }
+        __syncthreads();
+    }
+
+    if (wave < TILES_N) rocwmma::store_matrix_sync(shC + wave * BM * BN, acc, BN, rocwmma::mem_row_major);
+    __syncthreads();
+    for (uint32_t j = tid; j < TILES_N * BM * BN; j += blockDim.x) {
+        const uint32_t tile = j / (BM * BN);
+        const uint32_t r = j - tile * (BM * BN);
+        const uint32_t mm = r / BN;
+        const uint32_t nn = r - mm * BN;
+        const uint32_t m = m0 + mm;
+        const uint32_t n = n0 + tile * BN + nn;
+        if (m < n_tok && n < out_dim) out[(uint64_t)m * out_dim + n] = shC[j];
+    }
+}
+
+template <int TILES_N, int BM = 16, int BN = 16, int BK = 16>
+__global__ static void ds4_hip_matmul_q8_wmma_packed_multin_xsplit_kernel(float *__restrict__ out,
+                                                                          const half *__restrict__ bhalf_kn,
+                                                                          const float *__restrict__ x,
+                                                                          uint32_t n_tok,
+                                                                          uint32_t in_dim,
+                                                                          uint32_t out_dim) {
+    extern __shared__ unsigned char shmem_raw[];
+    half *shA = reinterpret_cast<half *>(shmem_raw);
+    half *shB = shA + BM * BK;
+    float *shC = reinterpret_cast<float *>(shB + TILES_N * BK * BN);
+    const uint32_t tid = threadIdx.x;
+    const uint32_t wave = tid >> 5;
+    const uint32_t m0 = blockIdx.y * BM;
+    const uint32_t n0 = blockIdx.x * (TILES_N * BN);
+
+    using frag_a = rocwmma::fragment<rocwmma::matrix_a, BM, BN, BK, half, rocwmma::row_major>;
+    using frag_b = rocwmma::fragment<rocwmma::matrix_b, BM, BN, BK, half, rocwmma::row_major>;
+    using frag_c = rocwmma::fragment<rocwmma::accumulator, BM, BN, BK, float>;
+
+    frag_a a;
+    frag_b b;
+    frag_c acc;
+    if (wave < TILES_N) rocwmma::fill_fragment(acc, 0.0f);
+
+    for (uint32_t k0 = 0; k0 < in_dim; k0 += BK) {
+        for (uint32_t j = tid; j < BM * BK; j += blockDim.x) {
+            const uint32_t mm = j / BK;
+            const uint32_t kk = j - mm * BK;
+            const uint32_t m = m0 + mm;
+            const float xv = (m < n_tok) ? x[(uint64_t)m * in_dim + k0 + kk] : 0.0f;
+            shA[j] = __float2half(xv);
+        }
+        for (uint32_t j = tid; j < TILES_N * BK * BN; j += blockDim.x) {
+            const uint32_t tile = j / (BK * BN);
+            const uint32_t r = j - tile * (BK * BN);
+            const uint32_t kk = r / BN;
+            const uint32_t nn = r - kk * BN;
+            const uint32_t n = n0 + tile * BN + nn;
+            shB[j] = (n < out_dim) ? bhalf_kn[(uint64_t)(k0 + kk) * out_dim + n] : __float2half(0.0f);
+        }
+        __syncthreads();
+        if (wave < TILES_N) {
+            rocwmma::load_matrix_sync(a, shA, BK);
+            rocwmma::load_matrix_sync(b, shB + wave * BK * BN, BN);
+            rocwmma::mma_sync(acc, a, b, acc);
+        }
+        __syncthreads();
+        for (uint32_t j = tid; j < BM * BK; j += blockDim.x) {
+            const uint32_t mm = j / BK;
+            const uint32_t kk = j - mm * BK;
+            const uint32_t m = m0 + mm;
+            const float xv = (m < n_tok) ? x[(uint64_t)m * in_dim + k0 + kk] : 0.0f;
+            const half xh = __float2half(xv);
+            shA[j] = __float2half(xv - __half2float(xh));
+        }
+        __syncthreads();
+        if (wave < TILES_N) {
+            rocwmma::load_matrix_sync(a, shA, BK);
             rocwmma::mma_sync(acc, a, b, acc);
         }
         __syncthreads();
@@ -5651,8 +5731,13 @@ extern "C" int ds4_metal_matmul_q8_0_tensor(
             return ok ? 1 : 0;
         }
     }
+    uint64_t q8_wmma_min_tokens = 64u;
+    if (const char *min_tok_env = std::getenv("DS4_HIP_Q8_WMMA_MIN_TOKENS")) {
+        const uint64_t v = std::strtoull(min_tok_env, nullptr, 10);
+        if (v >= 16u && v <= 4096u) q8_wmma_min_tokens = v;
+    }
     if (std::getenv("DS4_HIP_Q8_WMMA_FAST") != nullptr &&
-        warp_threads_top == 32u && n_tok >= 16u && (in_dim & 15u) == 0u && out_dim >= 1024u) {
+        warp_threads_top == 32u && n_tok >= q8_wmma_min_tokens && (in_dim & 15u) == 0u && out_dim >= 1024u) {
         const ds4_hip_repacked_q8_wmma_tensor *rw = ds4_hip_q8_wmma_lookup(model_map, model_size, weight_offset, in_dim, out_dim);
         if (rw) {
             hipEvent_t prof_start{}, prof_stop{};
@@ -5666,11 +5751,11 @@ extern "C" int ds4_metal_matmul_q8_0_tensor(
             const unsigned threads = 256u;
             const size_t shmem = (size_t)(bm * bk + tiles_n * bk * bn) * sizeof(half) +
                                  (size_t)(tiles_n * bm * bn) * sizeof(float);
-            ds4_hip_matmul_q8_wmma_packed_multin_kernel<tiles_n, bm, bn, bk><<<grid, threads, shmem, g_stream>>>(
+            ds4_hip_matmul_q8_wmma_packed_multin_xsplit_kernel<tiles_n, bm, bn, bk><<<grid, threads, shmem, g_stream>>>(
                     (float *)out->ptr, rw->bhalf_kn, (const float *)x->ptr,
                     (uint32_t)n_tok, (uint32_t)in_dim, (uint32_t)out_dim);
             const bool ok = ds4_hip_launch_ok("Q8_0 WMMA packed matmul launch");
-            ds4_hip_profile_end(prof, prof_start, prof_stop, "q8_matmul_wmma_packed_multin", in_dim, out_dim, n_tok);
+            ds4_hip_profile_end(prof, prof_start, prof_stop, "q8_matmul_wmma_packed_multin_xsplit", in_dim, out_dim, n_tok);
             return ok ? 1 : 0;
         }
     }

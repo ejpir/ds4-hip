@@ -320,12 +320,12 @@ Immediate targets:
   - `attn_q_a`-like `4096 -> 1024`: current ~0.75 ms, packed multi-N WMMA ~0.35 ms, ~2.16x
   - rel RMS vs current FP32 path is ~2.9e-4.
 - [x] Integrate packed multi-N WMMA for prefill behind `DS4_HIP_Q8_WMMA_FAST=1`:
-  - engine-side eager Q8 FP16 `KxN` repack for hot tensors: `attn_output_a`, `attn_output_b`, `attn_q_a`, `attn_q_b`
-  - production path ports only the winning packed multi-N WMMA kernel; direct and single-N loser variants remain microbench-only
-  - current shared-X path remains fallback for decode, unsupported shapes, and when the flag is off.
+  - engine-side eager Q8 FP16 `KxN` repack for Q-side tensors: `attn_q_a`, `attn_q_b`, and indexer `attn_q_b`
+  - production path uses FP32-accumulate WMMA ISA (`v_wmma_f32_16x16x16_f16`) and a two-pass activation split to reduce FP16 input rounding drift
+  - current shared-X path remains fallback for decode, unsupported shapes, small batches (`DS4_HIP_Q8_WMMA_MIN_TOKENS`, default 64), and when the flag is off.
 - [x] Replace slow host repack with GPU repack kernel:
-  - zero-copy Q8 WMMA repack now builds 193 tensors / 8.73 GiB in about 1.8-2.4 s
-  - full-copy + decode repacks + Q8 WMMA repack builds q_b/split16/wmma in about 4.8-9.0 s.
+  - q-side zero-copy Q8 WMMA repack now builds 107 tensors / 3.35 GiB in about 1.7-2.6 s
+  - full output-projection WMMA repack was pruned from the production path because it caused worse greedy drift with little useful graph speedup.
 - [x] Add chunk-level prefill instrumentation:
   - `DS4_HIP_PREFILL_CHUNK_PROFILE=1` / `DS4_METAL_GRAPH_PREFILL_CHUNK_PROFILE=1`
   - optional stage filters: `DS4_METAL_LAYER_STAGE_PROFILE_POS`, `DS4_METAL_LAYER_STAGE_PROFILE_LAYER`, `DS4_METAL_Q_STAGE_PROFILE_POS`, `DS4_METAL_Q_STAGE_PROFILE_LAYER`.
@@ -334,7 +334,8 @@ Immediate targets:
   - new parallel iterative top-k path reduces this to ~4-5 ms per layer and now covers `n_comp<=8192`, `top_k<=1024` so 32k contexts do not fall back to the serial path
   - 4180-token prefill recovered from ~8 t/s to ~29 t/s without WMMA and ~31 t/s with WMMA.
 - [ ] Next dense Q8 step:
-  - Q8 WMMA remains experimental opt-in, not part of `DS4_SERVER_FAST_FULL`, because a 4180-token greedy spot check swapped the first token between two close logits (`It` vs `This`)
+  - Q8 WMMA remains experimental opt-in, not part of `DS4_SERVER_FAST_FULL`, because greedy continuations still diverge on close logit margins even with q-side/xsplit gating
+  - quantify stochastic sampling variance vs WMMA drift at nonzero temperature before deciding whether the opt-in path is acceptable for non-greedy serving
   - graph/profile per-stage savings with `DS4_HIP_Q8_MATMUL_PROFILE=1`
   - tune packed multi-N tile count/VGPR occupancy if profiling shows headroom
   - validate longer generations and server stability.
@@ -489,10 +490,10 @@ The backend now has a stable fast path and the known non-winning experiments
 have been removed. The next roadmap is:
 
 1. rocWMMA on dense Q8_0 projections.
-   - Phase 1 target is output projection: `attn_output_a` and `attn_output_b`.
-   - Then q-path: `attn_q_a` and `attn_q_b`.
+   - Production opt-in target is now q-side only: `attn_q_a`, `attn_q_b`, and indexer q.
+   - Output projection WMMA was pruned from production because greedy drift was worse and graph speedup was not compelling.
    - Use tile-major/repacked layouts instead of raw GGUF rows.
-   - Expected prefill move: ~32 tok/s -> ~36-40 tok/s if the dense kernels land.
+   - Expected prefill move is modest for q-side only; larger gains likely require Q2_K/expert work.
 2. rocWMMA on Q2_K routed experts.
    - First down-projection microbench is in place.
    - Direct dequant-to-LDS WMMA is slower; pre-repacked half `KxN` WMMA is faster.
