@@ -1951,16 +1951,6 @@ __global__ static void ds4_hip_matmul_q8_wmma_packed_multin_xsplit_kernel(float 
         __syncthreads();
     }
 
-    if ((n_tok % BM) == 0u && (out_dim % (TILES_N * BN)) == 0u) {
-        if (wave < TILES_N) {
-            rocwmma::store_matrix_sync(out + (uint64_t)m0 * out_dim + n0 + wave * BN,
-                                       acc,
-                                       out_dim,
-                                       rocwmma::mem_row_major);
-        }
-        return;
-    }
-
     if (wave < TILES_N) rocwmma::store_matrix_sync(shC + wave * BM * BN, acc, BN, rocwmma::mem_row_major);
     __syncthreads();
     for (uint32_t j = tid; j < TILES_N * BM * BN; j += blockDim.x) {
