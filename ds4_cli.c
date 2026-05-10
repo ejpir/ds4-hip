@@ -88,11 +88,13 @@ static void usage(FILE *fp) {
         "  -c, --ctx N\n"
         "      Context size allocated for the session. Default: 32768\n"
         "  --metal\n"
-        "      Use the Metal graph backend. This is the normal fast path and the default.\n"
+        "      Use the GPU graph backend. On Linux HIP builds, this selects HIP; on macOS, Metal. Default.\n"
+        "  --hip\n"
+        "      Alias for --metal on HIP builds.\n"
         "  --cpu\n"
         "      Use the CPU reference/debug backend. Not recommended for normal inference.\n"
         "  --backend NAME\n"
-        "      Select backend explicitly: metal or cpu. Default: metal\n"
+        "      Select backend explicitly: hip/metal or cpu. Default: GPU backend\n"
         "  -t, --threads N\n"
         "      CPU helper threads for host-side or reference work.\n"
         "  --quality\n"
@@ -202,9 +204,16 @@ static float parse_float_range(const char *s, const char *opt, float min, float 
 
 static ds4_backend parse_backend(const char *s) {
     if (!strcmp(s, "metal")) return DS4_BACKEND_METAL;
+#ifdef DS4_USE_HIP
+    if (!strcmp(s, "hip")) return DS4_BACKEND_METAL;
+#endif
     if (!strcmp(s, "cpu")) return DS4_BACKEND_CPU;
     fprintf(stderr, "ds4: invalid backend: %s\n", s);
+#ifdef DS4_USE_HIP
+    fprintf(stderr, "ds4: valid backends are: hip, metal, cpu\n");
+#else
     fprintf(stderr, "ds4: valid backends are: metal, cpu\n");
+#endif
     exit(2);
 }
 
@@ -253,10 +262,10 @@ typedef struct {
     bool use_color;
 } cli_prefill_progress;
 
-static void cli_prefill_progress_cb(void *ud, const char *event, int current, int total) {
+static bool cli_prefill_progress_cb(void *ud, const char *event, int current, int total) {
     (void)total;
     cli_prefill_progress *p = ud;
-    if (!p || !event || strcmp(event, "prefill_chunk") || p->input_tokens <= 0) return;
+    if (!p || !event || strcmp(event, "prefill_chunk") || p->input_tokens <= 0) return true;
 
     int processed = current - p->base_tokens;
     if (processed < 0) processed = 0;
@@ -284,6 +293,7 @@ static void cli_prefill_progress_cb(void *ud, const char *event, int current, in
                 pct);
     }
     fflush(stderr);
+    return true;
 }
 
 static bool is_rendered_chat_prompt(const char *prompt) {
@@ -1217,7 +1227,7 @@ static cli_config parse_options(int argc, char **argv) {
             c.engine.backend = parse_backend(need_arg(&i, argc, argv, arg));
         } else if (!strcmp(arg, "--cpu")) {
             c.engine.backend = DS4_BACKEND_CPU;
-        } else if (!strcmp(arg, "--metal")) {
+        } else if (!strcmp(arg, "--metal") || !strcmp(arg, "--hip")) {
             c.engine.backend = DS4_BACKEND_METAL;
         } else if (!strcmp(arg, "--dump-tokens")) {
             c.gen.dump_tokens = true;

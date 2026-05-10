@@ -36,6 +36,7 @@ int ds4_metal_synchronize(void);
 
 int ds4_metal_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_metal_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size);
+int ds4_metal_set_model_map_range_fd(const void *model_map, uint64_t model_size, int model_fd, uint64_t map_offset, uint64_t map_size);
 void ds4_metal_set_quality(bool quality);
 void ds4_metal_print_memory_report(const char *label);
 

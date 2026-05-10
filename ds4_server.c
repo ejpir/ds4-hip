@@ -39,6 +39,9 @@ static volatile sig_atomic_t g_listen_fd = -1;
 
 #define DS4_SERVER_IO_TIMEOUT_SEC 10
 #define DS4_SERVER_SEND_STALL_TIMEOUT_MS 2000
+#ifndef POLLRDHUP
+#define POLLRDHUP 0
+#endif
 
 static void stop_signal_handler(int sig) {
     (void)sig;
@@ -4572,10 +4575,29 @@ struct job {
     int fd;
     request req;
     bool done;
+    bool cancel_requested;
+    bool cancel_logged;
     pthread_mutex_t mu;
     pthread_cond_t cv;
     job *next;
 };
+
+static bool job_cancel_requested(job *j) {
+    if (!j) return false;
+    pthread_mutex_lock(&j->mu);
+    bool cancelled = j->cancel_requested;
+    pthread_mutex_unlock(&j->mu);
+    return cancelled;
+}
+
+static bool job_cancel_log_once(job *j) {
+    if (!j) return false;
+    pthread_mutex_lock(&j->mu);
+    bool first = j->cancel_requested && !j->cancel_logged;
+    if (first) j->cancel_logged = true;
+    pthread_mutex_unlock(&j->mu);
+    return first;
+}
 
 /* =========================================================================
  * Tool Call Text Memory.
@@ -4946,7 +4968,7 @@ static void apply_openai_stream_tool_ids(tool_calls *calls,
  * chunk schedule, which keeps compressor row finalization identical to a cold
  * full prompt. */
 #define KV_CACHE_DEFAULT_BOUNDARY_TRIM_TOKENS 32
-#define KV_CACHE_DEFAULT_BOUNDARY_ALIGN_TOKENS 2048
+#define KV_CACHE_DEFAULT_BOUNDARY_ALIGN_TOKENS 512
 #define KV_CACHE_DEFAULT_CONTINUED_INTERVAL_TOKENS 10000
 #define KV_CACHE_DEFAULT_MB 4096
 #define KV_EXT_TOOL_MAP (1u << 0)
@@ -6218,16 +6240,52 @@ static void trace_finish(
 
 typedef struct {
     server *srv;
+    job *job;
     req_kind kind;
     int prompt_tokens;
     int cached_tokens;
     char ctx[48];
     bool has_tools;
+    bool thinking;
     double t0;
     double last_t;
     int last_current;
     bool seen;
 } server_prefill_progress;
+
+typedef struct {
+    server *srv;
+    job *job;
+    req_kind kind;
+    char ctx[48];
+    bool has_tools;
+    bool thinking;
+    int prompt_tokens;
+    int cached_tokens;
+    int max_tokens;
+    double t0;
+    double interval_s;
+    volatile sig_atomic_t done;
+    pthread_t thread;
+    bool started;
+} server_prefill_heartbeat;
+
+static const char *req_kind_name(req_kind kind) {
+    return kind == REQ_CHAT ? "chat" : "completion";
+}
+
+static const char *api_style_name(api_style api) {
+    return api == API_ANTHROPIC ? "anthropic" : "openai";
+}
+
+static double server_prefill_heartbeat_interval(void) {
+    const char *env = getenv("DS4_SERVER_PREFILL_HEARTBEAT_SEC");
+    if (!env || !env[0]) return 2.0;
+    char *end = NULL;
+    double v = strtod(env, &end);
+    if (end == env || v < 0.0) return 2.0;
+    return v;
+}
 
 static void request_ctx_span(char *buf, size_t len, int cached, int prompt) {
     int suffix = prompt - cached;
@@ -6248,6 +6306,53 @@ static void log_flags(char *buf, size_t len, bool tools, bool thinking,
     if (dsml_start) ADD_FLAG("DSML_START");
     if (dsml_end) ADD_FLAG("DSML_END");
 #undef ADD_FLAG
+}
+
+static void *server_prefill_heartbeat_main(void *ud) {
+    server_prefill_heartbeat *hb = ud;
+    if (!hb || hb->interval_s <= 0.0) return NULL;
+    double next = hb->t0 + hb->interval_s;
+    while (!hb->done && !g_stop_requested) {
+        usleep(100000);
+        const double now = now_sec();
+        if (now < next) continue;
+        char flags[80];
+        log_flags(flags, sizeof(flags), hb->has_tools, hb->thinking, false, false);
+        const int suffix = hb->prompt_tokens > hb->cached_tokens ? hb->prompt_tokens - hb->cached_tokens : 0;
+        const bool cancelled = job_cancel_requested(hb->job);
+        server_log(DS4_LOG_PREFILL,
+                   "ds4-server: %s ctx=%s%s%s prefill heartbeat elapsed=%.3fs prompt=%d cached=%d suffix=%d max_tokens=%d client_cancelled=%d",
+                   req_kind_name(hb->kind),
+                   hb->ctx,
+                   flags[0] ? " " : "",
+                   flags,
+                   now - hb->t0,
+                   hb->prompt_tokens,
+                   hb->cached_tokens,
+                   suffix,
+                   hb->max_tokens,
+                   cancelled ? 1 : 0);
+        next = now + hb->interval_s;
+    }
+    return NULL;
+}
+
+static void server_prefill_heartbeat_start(server_prefill_heartbeat *hb) {
+    if (!hb) return;
+    hb->interval_s = server_prefill_heartbeat_interval();
+    hb->done = 0;
+    hb->started = false;
+    if (hb->interval_s <= 0.0) return;
+    if (pthread_create(&hb->thread, NULL, server_prefill_heartbeat_main, hb) == 0) {
+        hb->started = true;
+    }
+}
+
+static void server_prefill_heartbeat_stop(server_prefill_heartbeat *hb) {
+    if (!hb || !hb->started) return;
+    hb->done = 1;
+    pthread_join(hb->thread, NULL);
+    hb->started = false;
 }
 
 static void log_decode_progress(req_kind kind, const char *ctx, int completion,
@@ -6326,15 +6431,63 @@ static void log_tool_calls_summary(const char *ctx, const tool_calls *calls) {
     buf_free(&names);
 }
 
-static void server_progress_cb(void *ud, const char *event, int current, int total) {
+static bool server_progress_cb(void *ud, const char *event, int current, int total) {
     server_prefill_progress *p = ud;
-    if (!p || !event || strcmp(event, "prefill_chunk")) return;
+    if (!p || !event) return true;
 
     double now = now_sec();
+    if (job_cancel_requested(p->job)) {
+        if (job_cancel_log_once(p->job)) {
+            char flags[64];
+            log_flags(flags, sizeof(flags), p->has_tools, p->thinking, false, false);
+            server_log(DS4_LOG_PREFILL,
+                       "ds4-server: %s ctx=%s%s%s prefill cancelled by client at %s current=%d total=%d elapsed=%.3fs",
+                       req_kind_name(p->kind),
+                       p->ctx,
+                       flags[0] ? " " : "",
+                       flags,
+                       event,
+                       current,
+                       total,
+                       now - p->t0);
+        }
+        return false;
+    }
+
+    if (strcmp(event, "prefill_chunk") != 0) {
+        char flags[64];
+        log_flags(flags, sizeof(flags), p->has_tools, p->thinking, false, false);
+        if (strcmp(event, "prefill_layer_done") == 0) {
+            if (current != 1 && current != total && (current % 8) != 0) return true;
+            server_log(DS4_LOG_PREFILL,
+                       "ds4-server: %s ctx=%s%s%s %s %d/%d elapsed=%.3fs",
+                       req_kind_name(p->kind),
+                       p->ctx,
+                       flags[0] ? " " : "",
+                       flags,
+                       event,
+                       current,
+                       total,
+                       now - p->t0);
+            return true;
+        }
+        server_log(DS4_LOG_PREFILL,
+                   "ds4-server: %s ctx=%s%s%s %s current=%d total=%d elapsed=%.3fs",
+                   req_kind_name(p->kind),
+                   p->ctx,
+                   flags[0] ? " " : "",
+                   flags,
+                   event,
+                   current,
+                   total,
+                   now - p->t0);
+        return true;
+    }
+
     double elapsed = now - p->t0;
     if (p->seen && current == p->last_current) {
         if (p->srv && current > p->cached_tokens) kv_cache_maybe_store_continued(p->srv);
-        return;
+        return true;
     }
     int display_total = p->prompt_tokens > total ? p->prompt_tokens : total;
     double pct = display_total > 0 ? 100.0 * (double)current / (double)display_total : 100.0;
@@ -6352,10 +6505,10 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
     p->last_t = now;
     p->seen = true;
     char flags[64];
-    log_flags(flags, sizeof(flags), p->has_tools, false, false, false);
+    log_flags(flags, sizeof(flags), p->has_tools, p->thinking, false, false);
     server_log(DS4_LOG_PREFILL,
                "ds4-server: %s ctx=%s%s%s prefill chunk %d/%d (%.1f%%) chunk=%.2f t/s avg=%.2f t/s %.3fs",
-               p->kind == REQ_CHAT ? "chat" : "completion",
+               req_kind_name(p->kind),
                p->ctx,
                flags[0] ? " " : "",
                flags,
@@ -6366,6 +6519,7 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
                avg_tps,
                elapsed);
     if (p->srv && current > p->cached_tokens) kv_cache_maybe_store_continued(p->srv);
+    return true;
 }
 
 static char *build_tool_checkpoint_suffix(const request *r, const char *content,
@@ -6510,24 +6664,55 @@ static void generate_job(server *s, job *j) {
     free(disk_cache_path);
     char ctx_span[48];
     request_ctx_span(ctx_span, sizeof(ctx_span), cached, j->req.prompt.len);
+    const bool thinking_enabled = ds4_think_mode_enabled(j->req.think_mode);
     server_prefill_progress progress = {
         .srv = s,
+        .job = j,
         .kind = j->req.kind,
         .prompt_tokens = j->req.prompt.len,
         .cached_tokens = cached,
         .has_tools = j->req.has_tools,
+        .thinking = thinking_enabled,
         .t0 = t0,
     };
     snprintf(progress.ctx, sizeof(progress.ctx), "%s", ctx_span);
     char req_flags[64];
-    log_flags(req_flags, sizeof(req_flags), j->req.has_tools, false, false, false);
+    log_flags(req_flags, sizeof(req_flags), j->req.has_tools, thinking_enabled, false, false);
+    const size_t prompt_bytes = j->req.prompt_text ? strlen(j->req.prompt_text) : 0;
     server_log(DS4_LOG_PREFILL,
-               "ds4-server: %s ctx=%s%s%s prompt start",
-               j->req.kind == REQ_CHAT ? "chat" : "completion",
+               "ds4-server: %s ctx=%s%s%s prompt start api=%s stream=%d model=%s prompt_tokens=%d prompt_bytes=%zu cached=%d cache=%s old_pos=%d common=%d max_tokens=%d temp=%.3f top_k=%d top_p=%.3f min_p=%.3f",
+               req_kind_name(j->req.kind),
                ctx_span,
                req_flags[0] ? " " : "",
-               req_flags);
+               req_flags,
+               api_style_name(j->req.api),
+               j->req.stream ? 1 : 0,
+               j->req.model ? j->req.model : "",
+               j->req.prompt.len,
+               prompt_bytes,
+               cached,
+               cache_source,
+               old_pos,
+               common,
+               j->req.max_tokens,
+               j->req.temperature,
+               j->req.top_k,
+               j->req.top_p,
+               j->req.min_p);
     ds4_session_set_progress(s->session, server_progress_cb, &progress);
+    server_prefill_heartbeat heartbeat = {
+        .srv = s,
+        .job = j,
+        .kind = j->req.kind,
+        .has_tools = j->req.has_tools,
+        .thinking = thinking_enabled,
+        .prompt_tokens = j->req.prompt.len,
+        .cached_tokens = cached,
+        .max_tokens = j->req.max_tokens,
+        .t0 = t0,
+    };
+    snprintf(heartbeat.ctx, sizeof(heartbeat.ctx), "%s", ctx_span);
+    server_prefill_heartbeat_start(&heartbeat);
 
     int cold_store_len = 0;
     if (cached == 0 &&
@@ -6543,28 +6728,80 @@ static void generate_job(server *s, job *j) {
         cold_store_len >= s->kv.opt.min_tokens &&
         cold_store_len < j->req.prompt.len)
     {
+        server_log(DS4_LOG_PREFILL,
+                   "ds4-server: %s ctx=%s%s%s cold-cache prefill begin tokens=%d full_prompt=%d",
+                   req_kind_name(j->req.kind),
+                   ctx_span,
+                   req_flags[0] ? " " : "",
+                   req_flags,
+                   cold_store_len,
+                   j->req.prompt.len);
         ds4_tokens prefix = {0};
         tokens_copy_prefix(&prefix, &j->req.prompt, cold_store_len);
         if (ds4_session_sync(s->session, &prefix, err, sizeof(err)) != 0) {
             ds4_tokens_free(&prefix);
+            server_prefill_heartbeat_stop(&heartbeat);
             ds4_session_set_progress(s->session, NULL, NULL);
+            if (job_cancel_requested(j)) {
+                trace_event(s, trace_id, "prefill cancelled by client");
+                server_log(DS4_LOG_PREFILL,
+                           "ds4-server: %s ctx=%s%s%s prefill stopped after client cancellation %.3fs",
+                           req_kind_name(j->req.kind), ctx_span,
+                           req_flags[0] ? " " : "", req_flags, now_sec() - t0);
+                return;
+            }
             trace_event(s, trace_id, "prefill failed: %s", err);
             http_error(j->fd, 500, err);
             return;
         }
+        server_log(DS4_LOG_PREFILL,
+                   "ds4-server: %s ctx=%s%s%s cold-cache prefill done tokens=%d %.3fs",
+                   req_kind_name(j->req.kind),
+                   ctx_span,
+                   req_flags[0] ? " " : "",
+                   req_flags,
+                   cold_store_len,
+                   now_sec() - t0);
         if (kv_cache_store_live_prefix(s, &j->req.prompt, cold_store_len, "cold")) {
             kv_cache_note_store(&s->kv, cold_store_len);
         }
         ds4_tokens_free(&prefix);
     }
 
+    server_log(DS4_LOG_PREFILL,
+               "ds4-server: %s ctx=%s%s%s session sync begin prompt_tokens=%d cached=%d suffix=%d",
+               req_kind_name(j->req.kind),
+               ctx_span,
+               req_flags[0] ? " " : "",
+               req_flags,
+               j->req.prompt.len,
+               cached,
+               j->req.prompt.len > cached ? j->req.prompt.len - cached : 0);
     if (ds4_session_sync(s->session, &j->req.prompt, err, sizeof(err)) != 0) {
+        server_prefill_heartbeat_stop(&heartbeat);
         ds4_session_set_progress(s->session, NULL, NULL);
+        if (job_cancel_requested(j)) {
+            trace_event(s, trace_id, "prefill cancelled by client");
+            server_log(DS4_LOG_PREFILL,
+                       "ds4-server: %s ctx=%s%s%s prefill stopped after client cancellation %.3fs",
+                       req_kind_name(j->req.kind), ctx_span,
+                       req_flags[0] ? " " : "", req_flags, now_sec() - t0);
+            return;
+        }
         trace_event(s, trace_id, "prefill failed: %s", err);
         http_error(j->fd, 500, err);
         return;
     }
+    server_prefill_heartbeat_stop(&heartbeat);
     ds4_session_set_progress(s->session, NULL, NULL);
+    server_log(DS4_LOG_PREFILL,
+               "ds4-server: %s ctx=%s%s%s session sync done pos=%d %.3fs",
+               req_kind_name(j->req.kind),
+               ctx_span,
+               req_flags[0] ? " " : "",
+               req_flags,
+               ds4_session_pos(s->session),
+               now_sec() - t0);
     server_log(DS4_LOG_PREFILL,
                "ds4-server: %s ctx=%s%s%s prompt done %.3fs",
                j->req.kind == REQ_CHAT ? "chat" : "completion",
@@ -6581,6 +6818,13 @@ static void generate_job(server *s, job *j) {
     snprintf(id, sizeof(id), "%s-%llu",
              j->req.kind == REQ_CHAT ? "chatcmpl" : "cmpl",
              (unsigned long long)++s->seq);
+
+    if (job_cancel_requested(j)) {
+        server_log(DS4_LOG_GENERATION,
+                   "ds4-server: %s ctx=%s client cancelled after prefill %.3fs",
+                   req_kind_name(j->req.kind), ctx_span, now_sec() - t0);
+        return;
+    }
 
     bool structured_stream = request_uses_structured_stream(&j->req);
     anthropic_stream anthropic_live = {0};
@@ -6630,7 +6874,7 @@ static void generate_job(server *s, job *j) {
     dsml_decode_tracker dsml_tracker;
     dsml_decode_tracker_init(&dsml_tracker);
 
-    while (!g_stop_requested && completion < max_tokens &&
+    while (!g_stop_requested && !job_cancel_requested(j) && completion < max_tokens &&
            ds4_session_pos(s->session) < ds4_session_ctx(s->session)) {
         dsml_decode_state dsml_state = j->req.kind == REQ_CHAT && j->req.has_tools ?
             dsml_tracker.decode : DSML_DECODE_OUTSIDE;
@@ -6814,6 +7058,14 @@ static void generate_job(server *s, job *j) {
             }
         }
         if (stop_decode) break;
+    }
+
+    if (job_cancel_requested(j)) {
+        server_log(DS4_LOG_GENERATION,
+                   "ds4-server: %s ctx=%s generation stopped after client cancellation gen=%d %.3fs",
+                   req_kind_name(j->req.kind), ctx_span, completion, now_sec() - t0);
+        buf_free(&text);
+        return;
     }
 
     if (g_stop_requested && strcmp(finish, "error") != 0) {
@@ -7029,7 +7281,13 @@ static void *worker_main(void *arg) {
     for (;;) {
         job *j = dequeue(s);
         if (!j) break;
-        generate_job(s, j);
+        if (job_cancel_requested(j)) {
+            server_log(DS4_LOG_GENERATION,
+                       "ds4-server: %s request cancelled before worker start",
+                       req_kind_name(j->req.kind));
+        } else {
+            generate_job(s, j);
+        }
         pthread_mutex_lock(&j->mu);
         j->done = true;
         pthread_cond_signal(&j->cv);
@@ -7129,6 +7387,23 @@ typedef struct {
     server *srv;
     int fd;
 } client_arg;
+
+static bool client_socket_closed(int fd) {
+    struct pollfd pfd;
+    memset(&pfd, 0, sizeof(pfd));
+    pfd.fd = fd;
+    pfd.events = POLLIN | POLLERR | POLLHUP | POLLRDHUP;
+    int n = poll(&pfd, 1, 0);
+    if (n <= 0) return false;
+    if (pfd.revents & (POLLERR | POLLHUP | POLLRDHUP)) return true;
+    if (pfd.revents & POLLIN) {
+        char c;
+        ssize_t r = recv(fd, &c, 1, MSG_PEEK | MSG_DONTWAIT);
+        if (r == 0) return true;
+        if (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) return true;
+    }
+    return false;
+}
 
 static void append_model_json_values(buf *b, int ctx, int default_tokens) {
     const int max_completion = default_tokens < ctx ? default_tokens : ctx;
@@ -7257,7 +7532,27 @@ static void *client_main(void *arg) {
         request_free(&j.req);
         goto done;
     }
-    while (!j.done) pthread_cond_wait(&j.cv, &j.mu);
+    while (!j.done) {
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_nsec += 200000000L;
+        if (ts.tv_nsec >= 1000000000L) {
+            ts.tv_sec++;
+            ts.tv_nsec -= 1000000000L;
+        }
+        (void)pthread_cond_timedwait(&j.cv, &j.mu, &ts);
+        if (!j.done && !j.cancel_requested) {
+            pthread_mutex_unlock(&j.mu);
+            bool closed = client_socket_closed(fd);
+            pthread_mutex_lock(&j.mu);
+            if (closed && !j.cancel_requested) {
+                j.cancel_requested = true;
+                server_log(DS4_LOG_GENERATION,
+                           "ds4-server: %s client disconnected; requesting cancellation",
+                           req_kind_name(j.req.kind));
+            }
+        }
+    }
     pthread_mutex_unlock(&j.mu);
 
     pthread_cond_destroy(&j.cv);
@@ -7448,7 +7743,7 @@ static void usage(FILE *fp) {
         "  --kv-cache-boundary-trim-tokens N\n"
         "      Trim this many tail tokens before cold boundary saves to avoid tokenizer boundary merges. Default: 32\n"
         "  --kv-cache-boundary-align-tokens N\n"
-        "      Align cold boundary saves down to this token multiple. 0 disables alignment. Default: 2048\n"
+        "      Align cold boundary saves down to this token multiple. 0 disables alignment. Default: 512\n"
         "  --kv-cache-reject-different-quant\n"
         "      Refuse checkpoints written by the same model with a different routed-expert quantization.\n"
         "  --disable-exact-dsml-tool-replay\n"
@@ -9064,8 +9359,8 @@ static void test_canonical_rewrite_rebuilds_when_live_tail_changes(void) {
 static void test_kv_cache_store_len_uses_configured_boundary(void) {
     kv_disk_cache kc = {0};
     kc.opt = kv_cache_default_options();
-    TEST_ASSERT(kv_cache_store_len(&kc, 11011) == 10240);
-    TEST_ASSERT(kv_cache_store_len(&kc, 1695) == 1695);
+    TEST_ASSERT(kv_cache_store_len(&kc, 11011) == 10752);
+    TEST_ASSERT(kv_cache_store_len(&kc, 1695) == 1536);
 
     kc.opt.boundary_trim_tokens = 0;
     kc.opt.boundary_align_tokens = 1000;

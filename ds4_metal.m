@@ -4358,6 +4358,11 @@ int ds4_metal_embed_tokens_hc_tensor(
 }
 
 int ds4_metal_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size) {
+    return ds4_metal_set_model_map_range_fd(model_map, model_size, -1, map_offset, map_size);
+}
+
+int ds4_metal_set_model_map_range_fd(const void *model_map, uint64_t model_size, int model_fd, uint64_t map_offset, uint64_t map_size) {
+    (void)model_fd;
     if (!g_initialized && !ds4_metal_init()) return 0;
     if (!model_map || model_size == 0) return 0;
     if (map_offset > model_size || map_size == 0 || map_size > model_size - map_offset) return 0;
