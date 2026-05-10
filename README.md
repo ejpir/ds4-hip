@@ -117,13 +117,17 @@ repack, and split16 Q8 decode repack.
 
 | Machine | Backend | Quant | Prompt | Prefill | Generation |
 | --- | --- | ---: | ---: | ---: | ---: |
+| AMD Radeon 8060S / ROCm HIP | HIP zero-copy fast | Q2_K | 1003 tokens | 33.21 t/s | 7.17 t/s |
+| AMD Radeon 8060S / ROCm HIP | HIP zero-copy fast | Q2_K | 1905 tokens | 32.61 t/s | 8.88 t/s |
 | AMD Radeon 8060S / ROCm HIP | HIP full-copy | Q2_K | 1003 tokens | 33.72 t/s | 9.37 t/s |
 | AMD Radeon 8060S / ROCm HIP | HIP full-copy | Q2_K | 1905 tokens | 33.46 t/s | 9.20 t/s |
 
-The HIP full-copy profile copies about 92 GiB of GGUF tensor payload into GPU
-memory at startup and eagerly builds about 4.6 GiB of Q8 decode repacks. It is
-therefore opt-in. Conservative HIP server mode keeps zero-copy mapped GGUF
-weights and avoids the full copy.
+The HIP zero-copy fast profile keeps the 92 GiB GGUF tensor payload mapped from
+host memory and avoids the full model copy, while still using the fast prefill
+kernels and Q8 decode repacks. The HIP full-copy profile copies that tensor
+payload into GPU memory at startup and eagerly builds about 4.6 GiB of Q8 decode
+repacks. Full-copy is therefore opt-in. Conservative HIP server mode keeps
+zero-copy mapped GGUF weights and avoids the full copy.
 
 ## ROCm/HIP quick start and max performance
 
