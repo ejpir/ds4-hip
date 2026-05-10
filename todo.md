@@ -309,14 +309,20 @@ Reasons:
 
 Immediate targets:
 
-- [ ] Build dense Q8 WMMA microbench for output projection first:
-  - `attn_output_a`: `4096 -> 8192`
-  - `attn_output_b`: `8192 -> 4096`
-  - prefill token tiles: 16, 32, 64, 128, 512
-  - compare against current Q8 shared-X batched prefill path.
-- [ ] Then test q-path:
-  - `attn_q_a`: `4096 -> 1024`
-  - `attn_q_b`: `1024 -> 32768`
+- [x] Build dense Q8 WMMA microbench for output projection first:
+  - source: `tools/hip_q8_wmma_microbench.cpp`
+  - build: `make hip-q8-wmma-bench`
+  - compares current Q8 shared-X batched prefill path against direct Q8 dequant WMMA, packed half WMMA, and multi-N packed half WMMA.
+- [x] Test output projection and q-path at `M=128` tokens:
+  - `attn_output_a`-like `4096 -> 8192`: current ~7.72 ms, packed multi-N WMMA ~3.13 ms, ~2.46x
+  - `attn_output_b`-like `8192 -> 4096`: current ~7.37 ms, packed multi-N WMMA ~2.81 ms, ~2.63x
+  - `attn_q_b`-like `1024 -> 32768`: current ~9.35 ms, packed multi-N WMMA ~4.00 ms, ~2.34x
+  - `attn_q_a`-like `4096 -> 1024`: current ~0.75 ms, packed multi-N WMMA ~0.35 ms, ~2.16x
+  - rel RMS vs current FP32 path is ~2.9e-4.
+- [ ] Next dense Q8 step:
+  - design engine-side Q8 WMMA repack metadata/layout for hot tensors
+  - integrate packed multi-N WMMA for prefill first, behind `DS4_HIP_Q8_WMMA_FAST=1`
+  - keep current shared-X path as fallback.
 - [ ] Keep one small profile loop around current decode/prefill to measure real graph savings:
   - dense MLA/projection Q8_0 matmuls
   - routed Q2_K MoE kernels
@@ -325,7 +331,7 @@ Immediate targets:
 
 ### Phase 2: Q8_0 WMMA microbench before integration
 
-- [ ] Create a standalone microbench for DS4-like shapes:
+- [x] Create a standalone microbench for DS4-like shapes:
   - A = activations `[tokens, K]`
   - B = weights `[K, out_dim]`, derived from GGUF Q8_0 row layout
   - C = output `[tokens, out_dim]`

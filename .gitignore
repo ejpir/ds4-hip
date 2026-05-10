@@ -5,6 +5,7 @@
 /ds4_test
 /hip-rocwmma-smoke
 /hip-q2-moe-wmma-bench
+/hip-q8-wmma-bench
 /ds4flash.gguf
 /TODO.md
 /gguf/

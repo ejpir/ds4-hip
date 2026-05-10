@@ -191,9 +191,9 @@ work. After the first Q2_K WMMA microbench, dense Q8 is the Phase 1 target:
 1. **rocWMMA on dense Q8 projections**
    - Start with the cleanest high-impact targets: output projection
      (`attn_output_a`/`attn_output_b`) and the q-path (`attn_q_a`/`attn_q_b`).
-   - This should validate the WMMA infrastructure with simpler dispatch and
-     dequantization than routed experts, and has a higher expected first-step
-     speedup than the current Q2_K MoE WMMA prototype.
+   - The standalone dense Q8 microbench now validates this priority: packed
+     multi-N WMMA is about 2.2-2.6x faster than the current shared-X batched
+     kernel on DS4-like prefill shapes, with rel RMS around `3e-4`.
    - Use tile-major/repacked layouts suitable for WMMA rather than the raw GGUF
      row layout.
 
