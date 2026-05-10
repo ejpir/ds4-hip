@@ -1,0 +1,312 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Safe ds4-server launcher for local OpenAI-compatible testing.
+# Defaults are conservative after the previous machine reset:
+# - no rocm-smi perflevel change unless DS4_SERVER_PERFLEVEL is set
+# - managed HIP tensors unless DS4_SERVER_DEVICE_TENSORS=1
+# - no optional final-Q8 cache/repack/top-only unless explicitly enabled
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT_DIR"
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  cat <<'EOF'
+Usage: scripts/start_ds4_server.sh [-- extra ds4-server args]
+
+Environment:
+  DS4_MODEL=FILE                  GGUF model path
+  DS4_SERVER_HOST=127.0.0.1       Bind host
+  DS4_SERVER_PORT=8000            Bind port
+  DS4_SERVER_CTX=4096             Context size, conservative default
+  DS4_SERVER_TOKENS=1024          Default max output tokens
+  DS4_SERVER_KV_DIR=/tmp/ds4-kv   Disk KV directory
+  DS4_SERVER_KV_MB=2048           Disk KV budget MB
+  DS4_SERVER_KV_ALIGN_TOKENS=512  Cold KV prefix alignment; helps <2k agent prompts reuse
+  DS4_SERVER_LOG=/tmp/ds4-server.log
+  DS4_SERVER_PID=/tmp/ds4-server.pid
+  DS4_SERVER_TRACE=FILE           Optional trace file
+  DS4_SERVER_PREFILL_HEARTBEAT_SEC=2  Prefill heartbeat interval; 0 disables
+  DS4_SERVER_PREFILL_CHUNK=N      Set prefill chunk/allocation cap
+  DS4_SERVER_DECODE_PREFILL=1     Safest prompt path: prefill via decode kernels
+  DS4_SERVER_PREFILL_STAGE_PROFILE=1  Log/sync prefill stages to isolate crashes
+  DS4_SERVER_PREFILL_RAW_FAST=1  Experimental FlashAttention-style raw SWA prefill kernel
+  DS4_SERVER_PREFILL_MIXED_FAST=1  Experimental fast compressed/mixed prefill attention
+  DS4_SERVER_Q8_BATCH_FAST=1     Experimental batched Q8_0 matmul for faster prefill q/output paths
+  DS4_SERVER_Q8_BATCH_TILE=8     Token tile for Q8 batch fast; passed through when set
+  DS4_SERVER_Q8_BATCH_RPB=N      Rows/block for Q8 batch fast; e.g. 32 with shared-X experiment
+  DS4_SERVER_Q8_BATCH_SHARED_X=1 Experimental LDS shared-X batched Q8 prefill kernel
+  DS4_SERVER_Q8_BATCH_SHARED_X_BLOCKS=16  K-block chunk for Q8 shared-X batch, 8|16|32
+  DS4_SERVER_Q8_REPACK=1         Opt-in eager q_b Q8_0 repack for decode; uses ~1.43 GiB VRAM
+  DS4_SERVER_Q8_REPACK_BATCH=1   Experimental use of q_b Q8 repack in batched prefill; currently slower
+  DS4_SERVER_Q8_REPACK_BATCH_ALL=1  Also try non-q_b matching shapes in batched prefill; currently slower
+  DS4_SERVER_Q8_REPACK_SPLIT16=1 Opt-in split-major Q8_0 repack for attn_output/shared-down; uses ~3.2 GiB VRAM
+  DS4_SERVER_Q8_REPACK_SPLIT16_BATCH=1 Experimental split16 layout in batched prefill; currently flat/slower
+  DS4_SERVER_Q8_REPACK_SPLITK=1  Older experimental separate-scale split-K Q8 path; currently not default
+  DS4_SERVER_MOE_EXPERT_BATCH=1  Experimental expert-bucketed Q2_K MoE for faster prefill
+  DS4_SERVER_MOE_EXPERT_TILE=4|8|16  Pair tile for expert-bucketed Q2_K MoE; default 8
+  DS4_SERVER_MOE_GATE_RPB=N      Rows/block for expert-bucketed gate/up; e.g. 16 with shared-x experiment
+  DS4_SERVER_MOE_DOWN_RPB=N      Rows/block for expert-bucketed down; e.g. 16 with shared-mid experiment
+  DS4_SERVER_MOE_EXPERT_SHARED_X=1    Experimental LDS x tile reuse for gate/up; use with GATE_RPB>1
+  DS4_SERVER_MOE_EXPERT_SHARED_MID=1  Experimental LDS mid tile reuse for down; use with DOWN_RPB>1
+  DS4_SERVER_MOE_EXPERT_TILE_LIST=1  Experimental tile-list Q2_K MoE scheduling for skewed prefill buckets
+  DS4_SERVER_MOE_EXPERT_TILE_LIST_THRESHOLD=N  Hybrid mode: tile-list buckets >=N, scalar expert-batch below
+  DS4_SERVER_MOE_EXPERT_TILE_LIST_DOWN_ONLY=1  Experimental tile-list only for down path
+  DS4_SERVER_COPY_MODEL=1        Copy GGUF tensor payload to HIP allocation using staged chunks
+  DS4_SERVER_COPY_MODEL_CHUNK_MB=256  Staged full-copy chunk size
+  DS4_SESSION_PROGRESS_RAW_MAX_TOKENS=512  Use cancellable layer-by-layer prefill above this
+  DS4_SESSION_PROGRESS_CHUNK_TOKENS=512    Cap cancellable prefill chunks; 0 disables cap
+
+Safety/perf toggles:
+  DS4_SERVER_PERFLEVEL=high|auto  Optional rocm-smi --setperflevel
+  DS4_SERVER_DEVICE_TENSORS=1     Use faster hipMalloc device tensors
+  DS4_SERVER_TOP_ONLY=1           Greedy top-only decode
+  DS4_SERVER_CACHE_FINAL_Q8=1     Cache final Q8 projection
+
+Examples:
+  scripts/start_ds4_server.sh
+  DS4_SERVER_CTX=32768 scripts/start_ds4_server.sh
+  DS4_SERVER_PERFLEVEL=high DS4_SERVER_DEVICE_TENSORS=1 scripts/start_ds4_server.sh
+  scripts/start_ds4_server.sh -- --quality
+EOF
+  exit 0
+fi
+
+MODEL_DEFAULT="/home/nick/.cache/huggingface/hub/models--cyberneurova--CyberNeurova-DeepSeek-V4-Flash-abliterated-GGUF/snapshots/665c8e035e2602d12d28b84920808b158f337e09/cyberneurova-DeepSeek-V4-Flash-abliterated-Q2_K.gguf"
+MODEL="${DS4_MODEL:-$MODEL_DEFAULT}"
+HOST="${DS4_SERVER_HOST:-127.0.0.1}"
+PORT="${DS4_SERVER_PORT:-8000}"
+CTX="${DS4_SERVER_CTX:-4096}"
+TOKENS="${DS4_SERVER_TOKENS:-1024}"
+KV_DIR="${DS4_SERVER_KV_DIR:-/tmp/ds4-kv}"
+KV_MB="${DS4_SERVER_KV_MB:-2048}"
+KV_ALIGN="${DS4_SERVER_KV_ALIGN_TOKENS:-512}"
+LOG="${DS4_SERVER_LOG:-/tmp/ds4-server.log}"
+PIDFILE="${DS4_SERVER_PID:-/tmp/ds4-server.pid}"
+TRACE="${DS4_SERVER_TRACE:-}"
+
+if [[ ! -f "$MODEL" ]]; then
+  echo "ds4-server: model not found: $MODEL" >&2
+  exit 1
+fi
+
+mkdir -p "$KV_DIR" "$(dirname "$LOG")" "$(dirname "$PIDFILE")"
+
+# Build if missing/stale enough for normal make dependency tracking.
+make ds4-server -j"$(nproc)"
+
+# Stop previous server from our pidfile only. Avoid pkill -f self-match accidents.
+if [[ -f "$PIDFILE" ]]; then
+  oldpid="$(cat "$PIDFILE" 2>/dev/null || true)"
+  if [[ "$oldpid" =~ ^[0-9]+$ ]] && kill -0 "$oldpid" 2>/dev/null; then
+    if tr '\0' ' ' < "/proc/$oldpid/cmdline" 2>/dev/null | grep -q 'ds4-server'; then
+      echo "ds4-server: stopping previous pid $oldpid"
+      kill "$oldpid" 2>/dev/null || true
+      for _ in {1..30}; do
+        kill -0 "$oldpid" 2>/dev/null || break
+        sleep 0.2
+      done
+      kill -0 "$oldpid" 2>/dev/null && kill -9 "$oldpid" 2>/dev/null || true
+      lockpid="$(cat /tmp/ds4.lock 2>/dev/null || true)"
+      if [[ "$lockpid" == "$oldpid" ]]; then
+        rm -f /tmp/ds4.lock
+      fi
+    fi
+  fi
+  rm -f "$PIDFILE"
+fi
+
+# Clear stale ds4 single-process lock if the recorded process is gone.
+if [[ -f /tmp/ds4.lock ]]; then
+  lockpid="$(cat /tmp/ds4.lock 2>/dev/null || true)"
+  if [[ "$lockpid" =~ ^[0-9]+$ ]] && ! kill -0 "$lockpid" 2>/dev/null; then
+    echo "ds4-server: removing stale /tmp/ds4.lock for dead pid $lockpid"
+    rm -f /tmp/ds4.lock
+  fi
+fi
+
+# Optional ROCm perf level. Leave unset for safer/stable startup.
+# Examples:
+#   DS4_SERVER_PERFLEVEL=high scripts/start_ds4_server.sh
+#   DS4_SERVER_PERFLEVEL=auto scripts/start_ds4_server.sh
+if [[ -n "${DS4_SERVER_PERFLEVEL:-}" ]]; then
+  if command -v rocm-smi >/dev/null 2>&1; then
+    echo "ds4-server: setting ROCm perflevel ${DS4_SERVER_PERFLEVEL}"
+    rocm-smi --setperflevel "${DS4_SERVER_PERFLEVEL}" || true
+  fi
+fi
+
+# Conservative default: managed tensors. For faster but less battle-tested mode:
+#   DS4_SERVER_DEVICE_TENSORS=1 scripts/start_ds4_server.sh
+if [[ "${DS4_SERVER_DEVICE_TENSORS:-0}" != "1" ]]; then
+  export DS4_HIP_MANAGED_TENSORS=1
+else
+  unset DS4_HIP_MANAGED_TENSORS || true
+fi
+
+# Server progress/cancellation defaults. Long prompts use cancellable
+# layer-by-layer prefill; cap chunks so a client abort is noticed sooner.
+# Device tensors can drive much larger HIP power/driver bursts during batched
+# prefill, so keep that mode on smaller chunks unless explicitly overridden.
+if [[ -n "${DS4_SERVER_PREFILL_CHUNK:-}" ]]; then
+  export DS4_METAL_PREFILL_CHUNK="$DS4_SERVER_PREFILL_CHUNK"
+  export DS4_SESSION_PROGRESS_CHUNK_TOKENS="${DS4_SESSION_PROGRESS_CHUNK_TOKENS:-$DS4_SERVER_PREFILL_CHUNK}"
+elif [[ "${DS4_SERVER_DEVICE_TENSORS:-0}" == "1" ]]; then
+  export DS4_SESSION_PROGRESS_CHUNK_TOKENS="${DS4_SESSION_PROGRESS_CHUNK_TOKENS:-128}"
+  export DS4_METAL_PREFILL_CHUNK="${DS4_METAL_PREFILL_CHUNK:-$DS4_SESSION_PROGRESS_CHUNK_TOKENS}"
+else
+  export DS4_SESSION_PROGRESS_CHUNK_TOKENS="${DS4_SESSION_PROGRESS_CHUNK_TOKENS:-512}"
+fi
+
+if [[ "${DS4_SERVER_DECODE_PREFILL:-0}" == "1" ]]; then
+  export DS4_SESSION_DECODE_PREFILL=1
+fi
+if [[ "${DS4_SERVER_PREFILL_STAGE_PROFILE:-0}" == "1" ]]; then
+  export DS4_METAL_LAYER_STAGE_PROFILE=1
+  export DS4_METAL_Q_STAGE_PROFILE=1
+fi
+if [[ "${DS4_SERVER_PREFILL_RAW_FAST:-0}" == "1" ]]; then
+  export DS4_HIP_PREFILL_RAW_FAST=1
+fi
+if [[ "${DS4_SERVER_PREFILL_MIXED_FAST:-0}" == "1" ]]; then
+  export DS4_HIP_PREFILL_MIXED_FAST=1
+fi
+if [[ "${DS4_SERVER_Q8_BATCH_FAST:-0}" == "1" ]]; then
+  export DS4_HIP_Q8_BATCH_FAST=1
+fi
+if [[ -n "${DS4_SERVER_Q8_BATCH_TILE:-}" ]]; then
+  export DS4_HIP_Q8_BATCH_TILE="$DS4_SERVER_Q8_BATCH_TILE"
+fi
+if [[ -n "${DS4_SERVER_Q8_BATCH_RPB:-}" ]]; then
+  export DS4_HIP_Q8_BATCH_RPB="$DS4_SERVER_Q8_BATCH_RPB"
+fi
+if [[ "${DS4_SERVER_Q8_BATCH_SHARED_X:-0}" == "1" ]]; then
+  export DS4_HIP_Q8_BATCH_FAST=1
+  export DS4_HIP_Q8_BATCH_SHARED_X=1
+fi
+if [[ -n "${DS4_SERVER_Q8_BATCH_SHARED_X_BLOCKS:-}" ]]; then
+  export DS4_HIP_Q8_BATCH_SHARED_X_BLOCKS="$DS4_SERVER_Q8_BATCH_SHARED_X_BLOCKS"
+fi
+if [[ "${DS4_SERVER_Q8_REPACK:-0}" == "1" ]]; then
+  export DS4_HIP_Q8_REPACK=1
+fi
+if [[ "${DS4_SERVER_Q8_REPACK_BATCH:-0}" == "1" ]]; then
+  export DS4_HIP_Q8_REPACK=1
+  export DS4_HIP_Q8_REPACK_BATCH=1
+fi
+if [[ "${DS4_SERVER_Q8_REPACK_BATCH_ALL:-0}" == "1" ]]; then
+  export DS4_HIP_Q8_REPACK=1
+  export DS4_HIP_Q8_REPACK_BATCH=1
+  export DS4_HIP_Q8_REPACK_BATCH_ALL=1
+fi
+if [[ "${DS4_SERVER_Q8_REPACK_SPLIT16:-0}" == "1" ]]; then
+  export DS4_HIP_Q8_REPACK_SPLIT16=1
+fi
+if [[ "${DS4_SERVER_Q8_REPACK_SPLIT16_BATCH:-0}" == "1" ]]; then
+  export DS4_HIP_Q8_REPACK_SPLIT16=1
+  export DS4_HIP_Q8_REPACK_SPLIT16_BATCH=1
+fi
+if [[ "${DS4_SERVER_Q8_REPACK_SPLITK:-0}" == "1" ]]; then
+  export DS4_HIP_Q8_REPACK=1
+  export DS4_HIP_Q8_REPACK_SPLITK=1
+fi
+if [[ "${DS4_SERVER_MOE_EXPERT_BATCH:-0}" == "1" ]]; then
+  export DS4_HIP_MOE_EXPERT_BATCH=1
+fi
+if [[ -n "${DS4_SERVER_MOE_EXPERT_TILE:-}" ]]; then
+  export DS4_HIP_MOE_EXPERT_TILE="$DS4_SERVER_MOE_EXPERT_TILE"
+fi
+if [[ -n "${DS4_SERVER_MOE_GATE_RPB:-}" ]]; then
+  export DS4_HIP_MOE_GATE_RPB="$DS4_SERVER_MOE_GATE_RPB"
+fi
+if [[ -n "${DS4_SERVER_MOE_DOWN_RPB:-}" ]]; then
+  export DS4_HIP_MOE_DOWN_RPB="$DS4_SERVER_MOE_DOWN_RPB"
+fi
+if [[ "${DS4_SERVER_MOE_EXPERT_SHARED_X:-0}" == "1" ]]; then
+  export DS4_HIP_MOE_EXPERT_SHARED_X=1
+fi
+if [[ "${DS4_SERVER_MOE_EXPERT_SHARED_MID:-0}" == "1" ]]; then
+  export DS4_HIP_MOE_EXPERT_SHARED_MID=1
+fi
+if [[ "${DS4_SERVER_MOE_EXPERT_TILE_LIST:-0}" == "1" ]]; then
+  export DS4_HIP_MOE_EXPERT_TILE_LIST=1
+fi
+if [[ -n "${DS4_SERVER_MOE_EXPERT_TILE_LIST_THRESHOLD:-}" ]]; then
+  export DS4_HIP_MOE_EXPERT_TILE_LIST=1
+  export DS4_HIP_MOE_EXPERT_TILE_LIST_THRESHOLD="$DS4_SERVER_MOE_EXPERT_TILE_LIST_THRESHOLD"
+fi
+if [[ "${DS4_SERVER_MOE_EXPERT_TILE_LIST_DOWN_ONLY:-0}" == "1" ]]; then
+  export DS4_HIP_MOE_EXPERT_TILE_LIST=1
+  export DS4_HIP_MOE_EXPERT_TILE_LIST_DOWN_ONLY=1
+fi
+if [[ -n "${DS4_SERVER_MOE_EXPERT_TILE_SMALL:-}" ]]; then
+  export DS4_HIP_MOE_EXPERT_TILE_SMALL="$DS4_SERVER_MOE_EXPERT_TILE_SMALL"
+fi
+if [[ -n "${DS4_SERVER_MOE_EXPERT_TILE_BIG:-}" ]]; then
+  export DS4_HIP_MOE_EXPERT_TILE_BIG="$DS4_SERVER_MOE_EXPERT_TILE_BIG"
+fi
+if [[ "${DS4_SERVER_COPY_MODEL:-0}" == "1" ]]; then
+  export DS4_HIP_COPY_MODEL=1
+fi
+if [[ -n "${DS4_SERVER_COPY_MODEL_CHUNK_MB:-}" ]]; then
+  export DS4_HIP_COPY_MODEL_CHUNK_MB="$DS4_SERVER_COPY_MODEL_CHUNK_MB"
+fi
+
+# Optional speed knobs, off by default for stability.
+if [[ "${DS4_SERVER_TOP_ONLY:-0}" == "1" ]]; then
+  export DS4_METAL_TOP_ONLY_DECODE=1
+fi
+if [[ "${DS4_SERVER_CACHE_FINAL_Q8:-0}" == "1" ]]; then
+  export DS4_HIP_CACHE_FINAL_Q8=1
+fi
+
+args=(
+  ./ds4-server
+  --model "$MODEL"
+  --host "$HOST"
+  --port "$PORT"
+  --ctx "$CTX"
+  --tokens "$TOKENS"
+  --kv-disk-dir "$KV_DIR"
+  --kv-disk-space-mb "$KV_MB"
+  --kv-cache-boundary-align-tokens "$KV_ALIGN"
+)
+
+if [[ -n "$TRACE" ]]; then
+  args+=(--trace "$TRACE")
+fi
+
+# Pass additional server args after --, e.g.:
+#   scripts/start_ds4_server.sh -- --quality
+if [[ "${1:-}" == "--" ]]; then
+  shift
+fi
+args+=("$@")
+
+: > "$LOG"
+echo "ds4-server: starting on http://$HOST:$PORT"
+echo "ds4-server: log: $LOG"
+echo "ds4-server: ctx=$CTX tokens=$TOKENS kv=$KV_DIR model=$MODEL"
+
+nohup "${args[@]}" >> "$LOG" 2>&1 &
+pid=$!
+echo "$pid" > "$PIDFILE"
+
+# Wait for process to stay alive and socket to appear.
+for _ in {1..120}; do
+  if ! kill -0 "$pid" 2>/dev/null; then
+    echo "ds4-server: failed to start; log follows:" >&2
+    tail -120 "$LOG" >&2 || true
+    exit 1
+  fi
+  if ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE "(^|:)${PORT}$"; then
+    echo "ds4-server: ready pid=$pid"
+    tail -40 "$LOG" || true
+    exit 0
+  fi
+  sleep 0.5
+done
+
+echo "ds4-server: process alive pid=$pid but port $PORT not observed yet; log follows:" >&2
+tail -120 "$LOG" >&2 || true
+exit 1

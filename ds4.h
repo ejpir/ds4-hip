@@ -52,7 +52,7 @@ typedef struct {
 typedef struct ds4_engine ds4_engine;
 typedef struct ds4_session ds4_session;
 
-typedef void (*ds4_session_progress_fn)(void *ud, const char *event, int current, int total);
+typedef bool (*ds4_session_progress_fn)(void *ud, const char *event, int current, int total);
 
 typedef struct {
     const char *model_path;
