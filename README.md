@@ -180,6 +180,46 @@ above or set the corresponding `DS4_HIP_*` variables directly. The server script
 is recommended because it also handles model path, KV cache, pid/log files, and
 safe restart behavior.
 
+## HIP roadmap
+
+The HIP backend is now at the first stable fast path: zero-copy and full-copy
+loading both work, the non-winning experiments have been removed, and the
+current best prefill/decode flags are exposed through `DS4_SERVER_FAST_FULL=1`.
+The next work is kernel quality, then decode/inference behavior, then KV/cache
+work:
+
+1. **rocWMMA on Q2_K routed experts**
+   - Target the Q2_K MoE expert-batched path first, because routed MoE is the
+     largest remaining prefill stage.
+   - Dequantize Q2_K tiles into LDS/FP16, use rocWMMA FP16 fragments with FP32
+     accumulation, and keep the existing scalar path for small expert buckets
+     and correctness fallback.
+
+2. **rocWMMA on dense Q8 projections**
+   - Target DS4's hot dense Q8_0 shapes: `attn_q_b`, `attn_output_a`,
+     `attn_output_b`, `attn_q_a`, `attn_kv`, shared Q8 experts, and eventually
+     the output head where profiling proves value.
+   - Use tile-major/repacked layouts suitable for WMMA rather than the raw GGUF
+     row layout.
+
+3. **hipBLASLt-quality custom kernels**
+   - The goal is not merely “use WMMA”, but kernels with hipBLASLt-like quality:
+     high occupancy, good LDS usage, coalesced loads, low register pressure,
+     tuned tile shapes, and strict correctness gates.
+   - Keep opt-in/fallback paths until they beat the current scalar/shared-X
+     kernels in real graph tests.
+
+4. **Decode/inference optimization**
+   - After the WMMA/repack kernel work, focus on single-stream decode and server
+     inference: dense projection fusion, output/head behavior, speculative or
+     top-only paths where useful, and reduced memory traffic per generated
+     token.
+
+5. **K/V cache work**
+   - Last in this sequence: improve KV behavior after the compute kernels are
+     better understood. This includes live KV memory layout, disk KV reuse,
+     long-context cache movement, and cache/server ergonomics.
+
 ## CLI
 
 One-shot prompt:

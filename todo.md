@@ -431,15 +431,28 @@ Harder and still important, but lower priority for single-stream decode than den
 
 ## Near-term execution order
 
-1. Server A/B with `DS4_SERVER_Q8_REPACK=1`; optionally test `DS4_SERVER_Q8_REPACK_SPLIT16=1` but keep it off by default because gain is modest for +3.21 GiB.
-2. Re-profile decode after q_b repack; final/lm_head and remaining dense/attention stages now dominate more clearly.
-3. Find a real final/lm_head lever: top-k fused output, partial vocab/top-only path, layout tuned for `4096->129280`, or speculative decode; generic row-major repack did not help.
-4. Validate correctness and measure decode/prefill stage profiles; target 12+ tok/s decode.
-5. Loader cleanup: actual allocation probe, loader-mode log, pinned slab, optional 3 buffers.
-6. Quick full-copy chunk-size A/B: 64/128/256/512 MiB.
-7. Prototype Q2_K routed-expert repack layout and microbench; this is the next prefill lever.
-8. rocWMMA smoke compile and tiny FP16 GEMM.
-9. Q8_0 WMMA microbench on repacked dense MLA shapes; use it primarily for prefill/multi-token paths.
-10. Prototype `output_a -> output_b` fusion, then `q_a -> q_b` fusion.
-11. Q2_K MoE WMMA/grouped expert work after Q2_K layout is understood.
-12. Run Q6_K dense-requant as a separate decode/quality branch before any Q4_K attention work.
+The backend now has a stable fast path and the known non-winning experiments
+have been removed. The next roadmap is:
+
+1. rocWMMA on Q2_K routed experts.
+   - Build from the existing expert-batched MoE path.
+   - Dequantize Q2_K expert weight tiles into LDS/FP16.
+   - Use FP32 accumulation and keep scalar fallbacks for small expert buckets.
+   - This is the next prefill lever.
+2. rocWMMA on dense Q8_0 projections.
+   - Start with hot DS4 shapes: `attn_q_b`, `attn_output_a`, `attn_output_b`,
+     then `attn_q_a`, `attn_kv`, shared Q8 experts, and output/lm_head if
+     profiling justifies it.
+   - Use tile-major/repacked layouts instead of raw GGUF rows.
+3. hipBLASLt-quality custom kernels.
+   - Focus on occupancy, LDS/coalescing, register pressure, tile scheduling,
+     and real graph performance rather than just adding WMMA instructions.
+   - Keep opt-in fallback gates until kernels beat the current fast path.
+4. Decode/inference optimization.
+   - Re-profile after the WMMA/repack work.
+   - Optimize single-stream decode and server inference: dense projection
+     fusion, output/head behavior, speculative/top-only paths where useful, and
+     lower memory traffic per generated token.
+5. K/V cache work.
+   - After compute kernels, improve live KV layout, disk KV reuse, long-context
+     cache movement, and server/cache ergonomics.
