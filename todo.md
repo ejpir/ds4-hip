@@ -393,14 +393,22 @@ Do not jump straight from Q8_0 to Q4_K for attention. Attention, especially `att
 
 Harder and still important, but lower priority for single-stream decode than dense MLA. Likely bigger payoff for prefill and batched workloads.
 
+- [x] Start with routed down projection microbench:
+  - source: `tools/hip_q2_moe_wmma_microbench.cpp`
+  - build: `make hip-q2-moe-wmma-bench`
+  - compares current-style Q2_K expert down against direct WMMA and pre-repacked half-KxN WMMA.
+- [x] Implement Q2_K tile dequant into LDS FP16 in the microbench:
+  - B tile = expert weight tile
+  - A tile = selected token activations converted from float to FP16
+  - FP32 accumulation
+- [x] Initial result on synthetic `M pairs x K mid x N out = 64 x 2048 x 4096`:
+  - direct Q2_K dequant-to-LDS WMMA: ~0.94 ms, slower than current-like ~0.71 ms
+  - pre-repacked `KxN` half WMMA: ~0.57 ms, about 1.25x faster than current-like
+  - error vs current-like FP32 path: rel RMS ~3e-4
+  - conclusion: do not integrate direct dequant WMMA; Q2_K WMMA needs load-time/tile-major repack or a better cooperative dequant layout.
 - [ ] Reuse existing expert-bucketed prefill path:
   - only run WMMA for experts with enough `(token, expert)` pairs
   - keep current scalar/rowwise kernels for small buckets and decode.
-- [ ] Implement Q2_K tile dequant into LDS FP16:
-  - B tile = expert weight tile
-  - A tile = selected token activations
-  - FP32 accumulation
-- [ ] Start with routed down projection or gate/up, whichever microbench shows is simpler/faster.
 - [ ] Consider fused gate/up later:
   - compute gate and up for the same expert bucket
   - apply SiLU/gating
@@ -440,10 +448,10 @@ The backend now has a stable fast path and the known non-winning experiments
 have been removed. The next roadmap is:
 
 1. rocWMMA on Q2_K routed experts.
-   - Build from the existing expert-batched MoE path.
-   - Dequantize Q2_K expert weight tiles into LDS/FP16.
+   - First down-projection microbench is in place.
+   - Direct dequant-to-LDS WMMA is slower; pre-repacked half `KxN` WMMA is faster.
+   - Next: design a load-time/tile-major Q2_K expert repack path and integrate only for sufficiently large expert buckets.
    - Use FP32 accumulation and keep scalar fallbacks for small expert buckets.
-   - This is the next prefill lever.
 2. rocWMMA on dense Q8_0 projections.
    - Start with hot DS4 shapes: `attn_q_b`, `attn_output_a`, `attn_output_b`,
      then `attn_q_a`, `attn_kv`, shared Q8 experts, and output/lm_head if

@@ -96,9 +96,12 @@ ds4_hip.o: ds4_hip.cpp ds4_metal.h
 ifneq ($(HIPCC),)
 hip-rocwmma-smoke: tools/hip_rocwmma_smoke.cpp
 	$(HIPCC) $(HIPCXXFLAGS) -o $@ $<
+
+hip-q2-moe-wmma-bench: tools/hip_q2_moe_wmma_microbench.cpp
+	$(HIPCC) $(HIPCXXFLAGS) -o $@ $<
 else
-hip-rocwmma-smoke:
-	@echo "hipcc not found; cannot build hip-rocwmma-smoke" >&2
+hip-rocwmma-smoke hip-q2-moe-wmma-bench:
+	@echo "hipcc not found; cannot build $@" >&2
 	@exit 1
 endif
 
@@ -109,4 +112,4 @@ test: ds4_test
 	./ds4_test
 
 clean:
-	rm -f ds4 ds4-server ds4_native ds4_server_test ds4_test hip-rocwmma-smoke *.o
+	rm -f ds4 ds4-server ds4_native ds4_server_test ds4_test hip-rocwmma-smoke hip-q2-moe-wmma-bench *.o
