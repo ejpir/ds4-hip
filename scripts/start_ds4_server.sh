@@ -41,6 +41,8 @@ Environment:
   DS4_SERVER_Q8_REPACK=1         Opt-in eager q_b Q8_0 repack for decode; uses ~1.43 GiB VRAM
   DS4_SERVER_Q8_REPACK_SPLIT16=1 Opt-in split-major Q8_0 repack for attn_output/shared-down; uses ~3.2 GiB VRAM
   DS4_SERVER_Q8_WMMA_FAST=1      Opt-in q-side FP16 Q8 WMMA prefill path; uses ~3.35 GiB VRAM
+  DS4_SERVER_Q8_HIPBLASLT=1      Opt-in q-side hipBLASLt xsplit path for small prefill batches
+  DS4_SERVER_Q8_HIPBLASLT_MAX_TOKENS=N  Max batch routed to hipBLASLt; default 256
   DS4_SERVER_MOE_EXPERT_BATCH=1  Experimental expert-bucketed Q2_K MoE for faster prefill
   DS4_SERVER_MOE_EXPERT_TILE=4|8|16  Pair tile for expert-bucketed Q2_K MoE; default 8
   DS4_SERVER_MOE_GATE_RPB=N      Rows/block for expert-bucketed gate/up; e.g. 16 with shared-x experiment
@@ -211,6 +213,12 @@ if [[ "${DS4_SERVER_Q8_REPACK_SPLIT16:-0}" == "1" ]]; then
 fi
 if [[ "${DS4_SERVER_Q8_WMMA_FAST:-0}" == "1" ]]; then
   export DS4_HIP_Q8_WMMA_FAST=1
+fi
+if [[ "${DS4_SERVER_Q8_HIPBLASLT:-0}" == "1" ]]; then
+  export DS4_HIP_Q8_HIPBLASLT=1
+fi
+if [[ -n "${DS4_SERVER_Q8_HIPBLASLT_MAX_TOKENS:-}" ]]; then
+  export DS4_HIP_Q8_HIPBLASLT_MAX_TOKENS="$DS4_SERVER_Q8_HIPBLASLT_MAX_TOKENS"
 fi
 if [[ "${DS4_SERVER_MOE_EXPERT_BATCH:-0}" == "1" ]]; then
   export DS4_HIP_MOE_EXPERT_BATCH=1

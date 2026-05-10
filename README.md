@@ -128,10 +128,13 @@ host memory and avoids the full model copy, while still using the fast prefill
 kernels and Q8 decode repacks. Q8-WMMA remains experimental and opt-in: the
 current guarded path only applies WMMA to attention/indexer Q-side projections,
 uses FP32 WMMA accumulation, skips small batches by default, and builds about
-3.35 GiB of FP16 Q8 WMMA prefill weights. Full-copy copies the GGUF tensor
-payload into GPU memory at startup and eagerly builds about 4.6 GiB of Q8 decode
-repacks. Full-copy is therefore opt-in. Conservative HIP server mode keeps
-zero-copy mapped GGUF weights and avoids the full copy.
+3.35 GiB of FP16 Q8 WMMA prefill weights. `DS4_HIP_Q8_HIPBLASLT=1` is a separate
+experimental q-side path that uses hipBLASLt for small prefill batches
+(default `DS4_HIP_Q8_HIPBLASLT_MAX_TOKENS=256`) and falls back to the custom
+path for larger chunks. Full-copy copies the GGUF tensor payload into GPU memory
+at startup and eagerly builds about 4.6 GiB of Q8 decode repacks. Full-copy is
+therefore opt-in. Conservative HIP server mode keeps zero-copy mapped GGUF
+weights and avoids the full copy.
 
 ## ROCm/HIP quick start and max performance
 

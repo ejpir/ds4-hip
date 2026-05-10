@@ -1,5 +1,6 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
+#include <hipblaslt/hipblaslt.h>
 #include <rocwmma/rocwmma.hpp>
 
 #include <algorithm>
@@ -72,6 +73,20 @@ struct ds4_hip_repacked_q8_wmma_tensor {
     uint64_t half_bytes;
 };
 
+struct ds4_hip_q8_blaslt_plan {
+    uint64_t m;
+    uint64_t k;
+    uint64_t n;
+    hipblasLtMatmulDesc_t op;
+    hipblasLtMatrixLayout_t adesc;
+    hipblasLtMatrixLayout_t bdesc;
+    hipblasLtMatrixLayout_t cdesc;
+    hipblasLtMatrixLayout_t ddesc;
+    hipblasLtMatmulAlgo_t algo;
+    size_t workspace;
+    bool valid;
+};
+
 static std::mutex g_mu;
 static bool g_initialized;
 static bool g_quality;
@@ -89,11 +104,17 @@ static uint64_t g_q8_wmma_repacked_bytes;
 static bool g_unsupported_warned;
 static float *g_q8_partial_scratch;
 static uint64_t g_q8_partial_scratch_floats;
+static half *g_q8_blaslt_xhalf_scratch;
+static uint64_t g_q8_blaslt_xhalf_scratch_halfs;
+static void *g_q8_blaslt_workspace;
+static uint64_t g_q8_blaslt_workspace_bytes;
+static hipblasLtHandle_t g_q8_blaslt_handle;
 static std::vector<ds4_hip_model_range> g_model_ranges;
 static std::vector<ds4_hip_cached_model_tensor> g_model_cache;
 static std::vector<ds4_hip_repacked_q8_tensor> g_q8_repack_cache;
 static std::vector<ds4_hip_repacked_q8_split16_tensor> g_q8_split16_cache;
 static std::vector<ds4_hip_repacked_q8_wmma_tensor> g_q8_wmma_cache;
+static std::vector<ds4_hip_q8_blaslt_plan> g_q8_blaslt_plans;
 
 static void ds4_hip_q8_repack_eager_from_gguf(const void *model_map, uint64_t model_size);
 
@@ -104,6 +125,12 @@ static const char *ds4_hip_err(hipError_t e) {
 static bool ds4_hip_check(hipError_t e, const char *what) {
     if (e == hipSuccess) return true;
     std::fprintf(stderr, "ds4: HIP %s failed: %s\n", what, ds4_hip_err(e));
+    return false;
+}
+
+static bool ds4_hip_blaslt_check(hipblasStatus_t s, const char *what) {
+    if (s == HIPBLAS_STATUS_SUCCESS) return true;
+    std::fprintf(stderr, "ds4: hipBLASLt %s failed: status %d\n", what, (int)s);
     return false;
 }
 
@@ -258,6 +285,14 @@ extern "C" void ds4_metal_cleanup(void) {
         if (q8w.bhalf_kn) (void)hipFree(q8w.bhalf_kn);
     }
     g_q8_wmma_cache.clear();
+    for (auto &p : g_q8_blaslt_plans) {
+        if (p.adesc) (void)hipblasLtMatrixLayoutDestroy(p.adesc);
+        if (p.bdesc) (void)hipblasLtMatrixLayoutDestroy(p.bdesc);
+        if (p.cdesc) (void)hipblasLtMatrixLayoutDestroy(p.cdesc);
+        if (p.ddesc) (void)hipblasLtMatrixLayoutDestroy(p.ddesc);
+        if (p.op) (void)hipblasLtMatmulDescDestroy(p.op);
+    }
+    g_q8_blaslt_plans.clear();
     for (auto &c : g_model_cache) {
         if (c.device_ptr) (void)hipFree(c.device_ptr);
     }
@@ -279,6 +314,14 @@ extern "C" void ds4_metal_cleanup(void) {
     if (g_q8_partial_scratch) (void)hipFree(g_q8_partial_scratch);
     g_q8_partial_scratch = nullptr;
     g_q8_partial_scratch_floats = 0;
+    if (g_q8_blaslt_xhalf_scratch) (void)hipFree(g_q8_blaslt_xhalf_scratch);
+    g_q8_blaslt_xhalf_scratch = nullptr;
+    g_q8_blaslt_xhalf_scratch_halfs = 0;
+    if (g_q8_blaslt_workspace) (void)hipFree(g_q8_blaslt_workspace);
+    g_q8_blaslt_workspace = nullptr;
+    g_q8_blaslt_workspace_bytes = 0;
+    if (g_q8_blaslt_handle) (void)hipblasLtDestroy(g_q8_blaslt_handle);
+    g_q8_blaslt_handle = nullptr;
 
     if (g_stream) (void)hipStreamDestroy(g_stream);
     g_stream = nullptr;
@@ -852,7 +895,8 @@ extern "C" int ds4_metal_set_model_map_range_fd(const void *model_map,
                  map_offset);
     if (std::getenv("DS4_HIP_Q8_REPACK") != nullptr ||
         std::getenv("DS4_HIP_Q8_REPACK_SPLIT16") != nullptr ||
-        std::getenv("DS4_HIP_Q8_WMMA_FAST") != nullptr) {
+        std::getenv("DS4_HIP_Q8_WMMA_FAST") != nullptr ||
+        std::getenv("DS4_HIP_Q8_HIPBLASLT") != nullptr) {
         ds4_hip_q8_repack_eager_from_gguf(model_map, model_size);
     }
     return 1;
@@ -907,6 +951,111 @@ static float *ds4_hip_q8_partial_scratch(uint64_t floats) {
     g_q8_partial_scratch = p;
     g_q8_partial_scratch_floats = floats;
     return p;
+}
+
+static half *ds4_hip_q8_blaslt_xhalf_scratch(uint64_t halfs) {
+    if (halfs == 0) return nullptr;
+    if (g_q8_blaslt_xhalf_scratch && g_q8_blaslt_xhalf_scratch_halfs >= halfs) return g_q8_blaslt_xhalf_scratch;
+    if (g_q8_blaslt_xhalf_scratch) {
+        (void)hipStreamSynchronize(g_stream);
+        (void)hipFree(g_q8_blaslt_xhalf_scratch);
+        g_q8_blaslt_xhalf_scratch = nullptr;
+        g_q8_blaslt_xhalf_scratch_halfs = 0;
+    }
+    half *p = nullptr;
+    hipError_t e = hipMalloc(reinterpret_cast<void **>(&p), (size_t)(halfs * sizeof(half)));
+    if (!ds4_hip_check(e, "Q8 hipBLASLt activation scratch allocation")) return nullptr;
+    g_q8_blaslt_xhalf_scratch = p;
+    g_q8_blaslt_xhalf_scratch_halfs = halfs;
+    return p;
+}
+
+static void *ds4_hip_q8_blaslt_workspace(uint64_t bytes) {
+    if (bytes == 0) return nullptr;
+    if (g_q8_blaslt_workspace && g_q8_blaslt_workspace_bytes >= bytes) return g_q8_blaslt_workspace;
+    if (g_q8_blaslt_workspace) {
+        (void)hipStreamSynchronize(g_stream);
+        (void)hipFree(g_q8_blaslt_workspace);
+        g_q8_blaslt_workspace = nullptr;
+        g_q8_blaslt_workspace_bytes = 0;
+    }
+    void *p = nullptr;
+    hipError_t e = hipMalloc(&p, (size_t)bytes);
+    if (!ds4_hip_check(e, "Q8 hipBLASLt workspace allocation")) return nullptr;
+    g_q8_blaslt_workspace = p;
+    g_q8_blaslt_workspace_bytes = bytes;
+    return p;
+}
+
+static void ds4_hip_q8_blaslt_plan_destroy(ds4_hip_q8_blaslt_plan &p) {
+    if (p.adesc) (void)hipblasLtMatrixLayoutDestroy(p.adesc);
+    if (p.bdesc) (void)hipblasLtMatrixLayoutDestroy(p.bdesc);
+    if (p.cdesc) (void)hipblasLtMatrixLayoutDestroy(p.cdesc);
+    if (p.ddesc) (void)hipblasLtMatrixLayoutDestroy(p.ddesc);
+    if (p.op) (void)hipblasLtMatmulDescDestroy(p.op);
+    p = {};
+}
+
+static ds4_hip_q8_blaslt_plan *ds4_hip_q8_blaslt_plan_get(uint64_t m, uint64_t k, uint64_t n) {
+    for (auto &p : g_q8_blaslt_plans) {
+        if (p.valid && p.m == m && p.k == k && p.n == n) return &p;
+    }
+    if (!g_q8_blaslt_handle) {
+        if (!ds4_hip_blaslt_check(hipblasLtCreate(&g_q8_blaslt_handle), "handle create")) return nullptr;
+    }
+
+    ds4_hip_q8_blaslt_plan p{};
+    p.m = m;
+    p.k = k;
+    p.n = n;
+    if (!ds4_hip_blaslt_check(hipblasLtMatmulDescCreate(&p.op, HIPBLAS_COMPUTE_32F, HIP_R_32F), "matmul desc create")) goto fail;
+    {
+        hipblasOperation_t opn = HIPBLAS_OP_N;
+        if (!ds4_hip_blaslt_check(hipblasLtMatmulDescSetAttribute(p.op, HIPBLASLT_MATMUL_DESC_TRANSA, &opn, sizeof(opn)), "set transA")) goto fail;
+        if (!ds4_hip_blaslt_check(hipblasLtMatmulDescSetAttribute(p.op, HIPBLASLT_MATMUL_DESC_TRANSB, &opn, sizeof(opn)), "set transB")) goto fail;
+    }
+
+    /* Row-major C[M,N] = X[M,K] * B[K,N] is exposed to hipBLASLt as
+     * column-major C^T[N,M] = B^T[N,K] * X^T[K,M].  The buffers are unchanged:
+     * B is the Q8-repacked KxN half matrix, X is MxK half, C is MxN float. */
+    if (!ds4_hip_blaslt_check(hipblasLtMatrixLayoutCreate(&p.adesc, HIP_R_16F, n, k, (int64_t)n), "A layout create")) goto fail;
+    if (!ds4_hip_blaslt_check(hipblasLtMatrixLayoutCreate(&p.bdesc, HIP_R_16F, k, m, (int64_t)k), "B layout create")) goto fail;
+    if (!ds4_hip_blaslt_check(hipblasLtMatrixLayoutCreate(&p.cdesc, HIP_R_32F, n, m, (int64_t)n), "C layout create")) goto fail;
+    if (!ds4_hip_blaslt_check(hipblasLtMatrixLayoutCreate(&p.ddesc, HIP_R_32F, n, m, (int64_t)n), "D layout create")) goto fail;
+
+    {
+        hipblasLtMatmulPreference_t pref = nullptr;
+        if (!ds4_hip_blaslt_check(hipblasLtMatmulPreferenceCreate(&pref), "preference create")) goto fail;
+        uint64_t max_ws = ds4_hip_env_mb("DS4_HIP_Q8_HIPBLASLT_WORKSPACE_MB", 64, 0, 1024) * 1024ull * 1024ull;
+        if (!ds4_hip_blaslt_check(hipblasLtMatmulPreferenceSetAttribute(pref, HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &max_ws, sizeof(max_ws)), "set max workspace")) {
+            (void)hipblasLtMatmulPreferenceDestroy(pref);
+            goto fail;
+        }
+        hipblasLtMatmulHeuristicResult_t heur[16]{};
+        int returned = 0;
+        hipblasStatus_t hs = hipblasLtMatmulAlgoGetHeuristic(g_q8_blaslt_handle, p.op, p.adesc, p.bdesc, p.cdesc, p.ddesc,
+                                                             pref, 16, heur, &returned);
+        (void)hipblasLtMatmulPreferenceDestroy(pref);
+        if (!ds4_hip_blaslt_check(hs, "heuristic query")) goto fail;
+        int best = -1;
+        for (int i = 0; i < returned; i++) {
+            if (heur[i].state == HIPBLAS_STATUS_SUCCESS && heur[i].workspaceSize <= max_ws) { best = i; break; }
+        }
+        if (best < 0) {
+            std::fprintf(stderr, "ds4: hipBLASLt no Q8 matmul algo for m=%" PRIu64 " k=%" PRIu64 " n=%" PRIu64 "\n", m, k, n);
+            goto fail;
+        }
+        p.algo = heur[best].algo;
+        p.workspace = heur[best].workspaceSize;
+    }
+
+    p.valid = true;
+    g_q8_blaslt_plans.push_back(p);
+    return &g_q8_blaslt_plans.back();
+
+fail:
+    ds4_hip_q8_blaslt_plan_destroy(p);
+    return nullptr;
 }
 
 static const unsigned char *ds4_hip_model_ptr(const void *model_map,
@@ -1189,7 +1338,7 @@ static const ds4_hip_repacked_q8_wmma_tensor *ds4_hip_q8_wmma_repack_create(cons
                                                                              uint64_t in_dim,
                                                                              uint64_t out_dim,
                                                                              const char *what) {
-    if (std::getenv("DS4_HIP_Q8_WMMA_FAST") == nullptr) return nullptr;
+    if (std::getenv("DS4_HIP_Q8_WMMA_FAST") == nullptr && std::getenv("DS4_HIP_Q8_HIPBLASLT") == nullptr) return nullptr;
     if (!model_map || in_dim == 0 || out_dim == 0 || (in_dim & 15ull) != 0 || out_dim > UINT32_MAX) return nullptr;
     const uint64_t n_blocks = (in_dim + 31u) >> 5;
     if ((in_dim & 31ull) != 0) return nullptr; // Q8_0 tensors in DS4 hot path are block-aligned.
@@ -1302,10 +1451,10 @@ static void ds4_hip_q8_repack_eager_from_gguf(const void *model_map, uint64_t mo
                 const bool is_shared_down = name.find(".ffn_down_shexp.weight") != std::string::npos;
                 if (is_out_a || is_out_b || is_shared_down) split16_hot.push_back({name, dims[0], dims[1], rel});
             }
-            if (std::getenv("DS4_HIP_Q8_WMMA_FAST") != nullptr) {
+            if (std::getenv("DS4_HIP_Q8_WMMA_FAST") != nullptr || std::getenv("DS4_HIP_Q8_HIPBLASLT") != nullptr) {
                 const bool is_q_a = name.find(".attn_q_a.weight") != std::string::npos;
-                /* WMMA remains opt-in and is restricted to attention/indexer Q-side
-                 * projections.  Output projections write directly to the residual
+                /* WMMA/hipBLASLt remains opt-in and is restricted to attention/indexer
+                 * Q-side projections.  Output projections write directly to the residual
                  * stream and showed worse greedy drift with little useful speedup. */
                 if (is_q_a || is_q_b) wmma_hot.push_back({name, dims[0], dims[1], rel});
             }
@@ -1822,6 +1971,18 @@ static inline void ds4_hip_launch_q8_0_batch_sharedx(float *out,
     } else {
         ds4_hip_matmul_q8_0_warp_rows_w32_toktile_sharedx_kernel<4, BLOCKS_TILE><<<grid, threads, shmem, g_stream>>>(out, w, x, n_blocks, out_dim, n_tok, row_bytes);
     }
+}
+
+__global__ static void ds4_hip_q8_blaslt_x_repack_half_split_kernel(half *__restrict__ xhi,
+                                                                    half *__restrict__ xlo,
+                                                                    const float *__restrict__ x,
+                                                                    uint64_t elems) {
+    const uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= elems) return;
+    const float xv = x[idx];
+    const half hi = __float2half(xv);
+    xhi[idx] = hi;
+    xlo[idx] = __float2half(xv - __half2float(hi));
 }
 
 template <int TILES_N, int BM = 16, int BN = 16, int BK = 16>
@@ -5736,27 +5897,75 @@ extern "C" int ds4_metal_matmul_q8_0_tensor(
         const uint64_t v = std::strtoull(min_tok_env, nullptr, 10);
         if (v >= 16u && v <= 4096u) q8_wmma_min_tokens = v;
     }
-    if (std::getenv("DS4_HIP_Q8_WMMA_FAST") != nullptr &&
-        warp_threads_top == 32u && n_tok >= q8_wmma_min_tokens && (in_dim & 15u) == 0u && out_dim >= 1024u) {
+    const bool q8_wmma_enabled = std::getenv("DS4_HIP_Q8_WMMA_FAST") != nullptr;
+    const bool q8_blaslt_enabled = std::getenv("DS4_HIP_Q8_HIPBLASLT") != nullptr;
+    uint64_t q8_blaslt_max_tokens = 256u;
+    if (const char *max_tok_env = std::getenv("DS4_HIP_Q8_HIPBLASLT_MAX_TOKENS")) {
+        const uint64_t v = std::strtoull(max_tok_env, nullptr, 10);
+        if (v >= 1u && v <= 4096u) q8_blaslt_max_tokens = v;
+    }
+    if ((q8_wmma_enabled || q8_blaslt_enabled) &&
+        warp_threads_top == 32u && n_tok >= (q8_blaslt_enabled ? 2u : q8_wmma_min_tokens) &&
+        (in_dim & 15u) == 0u && out_dim >= 1024u) {
         const ds4_hip_repacked_q8_wmma_tensor *rw = ds4_hip_q8_wmma_lookup(model_map, model_size, weight_offset, in_dim, out_dim);
         if (rw) {
             hipEvent_t prof_start{}, prof_stop{};
             const bool prof = ds4_hip_profile_begin("DS4_HIP_Q8_MATMUL_PROFILE", &prof_start, &prof_stop);
-            constexpr int tiles_n = 8;
-            constexpr int bm = 16;
-            constexpr int bn = 16;
-            constexpr int bk = 16;
-            const dim3 grid((unsigned)((out_dim + (tiles_n * bn) - 1u) / (tiles_n * bn)),
-                            (unsigned)((n_tok + bm - 1u) / bm), 1u);
-            const unsigned threads = 256u;
-            const size_t shmem = (size_t)(bm * bk + tiles_n * bk * bn) * sizeof(half) +
-                                 (size_t)(tiles_n * bm * bn) * sizeof(float);
-            ds4_hip_matmul_q8_wmma_packed_multin_xsplit_kernel<tiles_n, bm, bn, bk><<<grid, threads, shmem, g_stream>>>(
-                    (float *)out->ptr, rw->bhalf_kn, (const float *)x->ptr,
-                    (uint32_t)n_tok, (uint32_t)in_dim, (uint32_t)out_dim);
-            const bool ok = ds4_hip_launch_ok("Q8_0 WMMA packed matmul launch");
-            ds4_hip_profile_end(prof, prof_start, prof_stop, "q8_matmul_wmma_packed_multin_xsplit", in_dim, out_dim, n_tok);
-            return ok ? 1 : 0;
+            if (q8_blaslt_enabled && n_tok <= q8_blaslt_max_tokens) {
+                const uint64_t x_elems = n_tok * in_dim;
+                half *xs = ds4_hip_q8_blaslt_xhalf_scratch(x_elems * 2u);
+                ds4_hip_q8_blaslt_plan *plan = xs ? ds4_hip_q8_blaslt_plan_get(n_tok, in_dim, out_dim) : nullptr;
+                if (plan) {
+                    half *xhi = xs;
+                    half *xlo = xs + x_elems;
+                    ds4_hip_q8_blaslt_x_repack_half_split_kernel<<<
+                            (unsigned)((x_elems + 255u) / 256u), 256u, 0, g_stream>>>(
+                            xhi, xlo, (const float *)x->ptr, x_elems);
+                    bool ok = ds4_hip_launch_ok("Q8_0 hipBLASLt activation repack launch");
+                    void *workspace = plan->workspace ? ds4_hip_q8_blaslt_workspace(plan->workspace) : nullptr;
+                    if (ok && (plan->workspace == 0 || workspace)) {
+                        const float alpha = 1.0f;
+                        const float beta0 = 0.0f;
+                        const float beta1 = 1.0f;
+                        hipblasStatus_t st = hipblasLtMatmul(g_q8_blaslt_handle, plan->op, &alpha,
+                                                              rw->bhalf_kn, plan->adesc,
+                                                              xhi, plan->bdesc, &beta0,
+                                                              out->ptr, plan->cdesc,
+                                                              out->ptr, plan->ddesc,
+                                                              &plan->algo, workspace, plan->workspace, g_stream);
+                        ok = ds4_hip_blaslt_check(st, "Q8 matmul first GEMM");
+                        if (ok) {
+                            st = hipblasLtMatmul(g_q8_blaslt_handle, plan->op, &alpha,
+                                                  rw->bhalf_kn, plan->adesc,
+                                                  xlo, plan->bdesc, &beta1,
+                                                  out->ptr, plan->cdesc,
+                                                  out->ptr, plan->ddesc,
+                                                  &plan->algo, workspace, plan->workspace, g_stream);
+                            ok = ds4_hip_blaslt_check(st, "Q8 matmul residual GEMM");
+                        }
+                    }
+                    ds4_hip_profile_end(prof, prof_start, prof_stop, "q8_matmul_hipblaslt_xsplit", in_dim, out_dim, n_tok);
+                    return ok ? 1 : 0;
+                }
+            }
+            if (q8_wmma_enabled && n_tok >= q8_wmma_min_tokens) {
+                constexpr int tiles_n = 8;
+                constexpr int bm = 16;
+                constexpr int bn = 16;
+                constexpr int bk = 16;
+                const dim3 grid((unsigned)((out_dim + (tiles_n * bn) - 1u) / (tiles_n * bn)),
+                                (unsigned)((n_tok + bm - 1u) / bm), 1u);
+                const unsigned threads = 256u;
+                const size_t shmem = (size_t)(bm * bk + tiles_n * bk * bn) * sizeof(half) +
+                                     (size_t)(tiles_n * bm * bn) * sizeof(float);
+                ds4_hip_matmul_q8_wmma_packed_multin_xsplit_kernel<tiles_n, bm, bn, bk><<<grid, threads, shmem, g_stream>>>(
+                        (float *)out->ptr, rw->bhalf_kn, (const float *)x->ptr,
+                        (uint32_t)n_tok, (uint32_t)in_dim, (uint32_t)out_dim);
+                const bool ok = ds4_hip_launch_ok("Q8_0 WMMA packed matmul launch");
+                ds4_hip_profile_end(prof, prof_start, prof_stop, "q8_matmul_wmma_packed_multin_xsplit", in_dim, out_dim, n_tok);
+                return ok ? 1 : 0;
+            }
+            ds4_hip_profile_end(prof, prof_start, prof_stop, "q8_matmul_accel_skip", in_dim, out_dim, n_tok);
         }
     }
 

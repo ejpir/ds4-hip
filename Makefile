@@ -23,6 +23,7 @@ CFLAGS += -D_GNU_SOURCE -DDS4_USE_HIP
 CORE_OBJS = ds4.o ds4_hip.o
 NATIVE_CORE_OBJS = ds4_native.o
 METAL_LDLIBS := $(LDLIBS)
+HIP_LDLIBS := $(LDLIBS) -lhipblaslt
 LINK.ds4 = $(HIPCC)
 TEST_CORE_OBJS = $(NATIVE_CORE_OBJS)
 TEST_CFLAGS = $(CFLAGS) -UDS4_USE_HIP -DDS4_NO_METAL
@@ -54,10 +55,10 @@ ds4_native: ds4_cli_native.o linenoise.o $(NATIVE_CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ ds4_cli_native.o linenoise.o $(NATIVE_CORE_OBJS) $(NATIVE_LDLIBS)
 else
 ds4: ds4_cli.o linenoise.o $(CORE_OBJS)
-	$(LINK.ds4) -o $@ $^ $(LDLIBS)
+	$(LINK.ds4) -o $@ $^ $(if $(HIPCC),$(HIP_LDLIBS),$(LDLIBS))
 
 ds4-server: ds4_server.o rax.o $(CORE_OBJS)
-	$(LINK.ds4) -o $@ $^ $(LDLIBS)
+	$(LINK.ds4) -o $@ $^ $(if $(HIPCC),$(HIP_LDLIBS),$(LDLIBS))
 
 ds4_native: ds4_cli_native.o linenoise.o $(NATIVE_CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ ds4_cli_native.o linenoise.o $(NATIVE_CORE_OBJS) $(LDLIBS)
