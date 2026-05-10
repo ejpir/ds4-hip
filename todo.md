@@ -120,18 +120,21 @@
   - `q8_matmul_repack` appears only for decode `tokens=1`: 43 calls, total ≈14.0 ms, avg ≈0.324 ms/layer.
   - Unprofiled fast CLI A/B on same 1003-token prompt: no-repack ≈19.95 t/s, q8-repack ≈20.02 t/s; effectively no prefill gain.
   - Conclusion: the earlier q_b repack/microbench win did not translate to prefill because `ds4_metal_matmul_q8_0_tensor()` only checked repack when `n_tok == 1`; batched prefill takes `DS4_HIP_Q8_BATCH_FAST` raw-layout kernels.
-- Implemented token-tiled repacked Q8 prefill kernels, opt-in only:
-  - env: `DS4_HIP_Q8_REPACK_BATCH=1` plus `DS4_HIP_Q8_REPACK=1`; server knob: `DS4_SERVER_Q8_REPACK_BATCH=1`.
-  - kernels: `ds4_hip_matmul_q8_repack_warp_rows_w32_toktile_kernel<TOK_TILE>` and `_2row_kernel<TOK_TILE>`.
-  - Correctness smoke: `DS4_HIP_Q8_REPACK=1 DS4_HIP_Q8_REPACK_BATCH=1 --metal-graph-prompt-test` kept same top on a short prompt.
-  - Result: current separate-scale repack is slower for batched prefill. On 1003-token profile, q_b `1024->32768` raw was ~75 ms/layer; repack-batch was ~118–150 ms/layer depending tile. `8192->4096` also became slower (~120–204 ms/layer vs raw ~106 ms). Fast unprofiled prefill dropped to ~17–18.5 t/s with repack batch.
-  - Interpretation: decode q_b benefited from row-major separated q/scales, but token-tiled prefill already reuses raw weight rows across multiple tokens; separated scales add another memory stream and lose. The next Q8 prefill layout, if pursued, should be a block/interleaved aligned layout (e.g. 64B record with scale+32B q) or shape-specific fusion, not the decode repack layout.
-- Tried split16 layout in generic batched prefill matmul:
-  - env: `DS4_HIP_Q8_REPACK_SPLIT16_BATCH=1` with `DS4_HIP_Q8_REPACK_SPLIT16=1`; server knob: `DS4_SERVER_Q8_REPACK_SPLIT16_BATCH=1`.
-  - kernels: `ds4_hip_q8_split16_toktile_w32_kernel<TOK_TILE>` and `_2row_w32_kernel<TOK_TILE>`.
-  - default scope restricted to `4096->8192`, `8192->4096`, `2048->4096` unless `DS4_HIP_Q8_REPACK_SPLIT16_BATCH_ALL=1`.
-  - correctness smoke: `DS4_HIP_Q8_REPACK_SPLIT16=1 DS4_HIP_Q8_REPACK_SPLIT16_BATCH=1 --metal-graph-prompt-test` kept same top on short prompt.
-  - result: flat/slower on 1003-token profile. `8192->4096` raw ≈106 ms/layer, split16 batch ≈107.5 ms/layer; `2048->4096` raw ≈21.0 ms/layer, split16 batch ≈21.9 ms/layer. Prefill stayed ≈19.9 t/s. Keep off.
+- Added a one-command max-performance/full-copy server preset:
+  - `DS4_SERVER_FAST_FULL=1 scripts/start_ds4_server.sh`
+  - expands to the current best prefill flags: raw/mixed attention, Q8 batch shared-X with RPB32/block16, Q2 MoE expert-batch with RPB16 shared-X/shared-mid.
+  - also enables current decode/full-memory knobs: device tensors, staged full model copy, Q8 decode repack, and split16 decode repack.
+  - removed server exposure for older non-winners: Q8 splitK knob and Q2 tile-list knobs.
+  - pruned internal Q2 tile-list kernels/launch paths and older env-only Q8 splitK/repack-splitK branches. Kept raw automatic split-K helpers where they are part of current decode/attention output path.
+  - Q8 shared-X tail validation passed prompt-graph tests for odd/non-tile token counts 19, 23, 27, 35, 43, 51, 75, 83, 139, and 147; all matched CPU/GPU top token.
+  - Tried a fused lm_head/Q8 top-1 decode path that skipped materializing logits; it was not faster than the existing `4096->129280` matmul/top path (~6.6 ms either way for the projection), so it was removed rather than leaving a non-winning experiment.
+- Removed nonperformant Q8 batched-prefill repack experiments:
+  - Deleted the `DS4_HIP_Q8_REPACK_BATCH` / `DS4_SERVER_Q8_REPACK_BATCH` path and token-tiled repacked kernels. It was slower than raw-layout Q8 batch prefill.
+  - Deleted the `DS4_HIP_Q8_REPACK_SPLIT16_BATCH` / `DS4_SERVER_Q8_REPACK_SPLIT16_BATCH` path and split16 token-tiled kernels. It was flat/slower than raw-layout Q8 batch prefill.
+  - Kept decode-only Q8 repack and split16 repack paths for now; only the batched prefill variants were removed.
+- Tried and removed a q_b-specific 4-row Q8 batched-prefill kernel:
+  - tested fixed `1024 -> 32768` q_b with 4 output rows/wave.
+  - result: slower than both baseline 2-row and shared-X. Profile on 1003-token prompt: baseline q_b ≈75.4 ms/layer, shared-X q_b ≈65.9 ms/layer, 4-row q_b ≈100.5 ms/layer, shared-X+4row ≈91.4 ms/layer. Removed immediately to keep the backend lean.
 - Added optional LDS shared-X dense Q8 batched-prefill kernel:
   - env: `DS4_HIP_Q8_BATCH_SHARED_X=1`; server knob: `DS4_SERVER_Q8_BATCH_SHARED_X=1`. Also `DS4_HIP_Q8_BATCH_RPB`/`DS4_SERVER_Q8_BATCH_RPB` and `DS4_HIP_Q8_BATCH_SHARED_X_BLOCKS=8|16|32`.
   - kernel/helper: `ds4_hip_matmul_q8_0_warp_rows_w32_toktile_sharedx_kernel<TOK_TILE,BLOCKS_TILE>` and `ds4_hip_launch_q8_0_batch_sharedx<BLOCKS_TILE>`.

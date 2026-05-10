@@ -1429,111 +1429,6 @@ __global__ static void ds4_hip_matmul_q8_repack_warp_rows_w32_kernel(float *__re
     if (lane == 0) out[o] = acc;
 }
 
-template <uint32_t TOK_TILE>
-__global__ static void ds4_hip_matmul_q8_repack_warp_rows_w32_toktile_kernel(float *__restrict__ out,
-                                                                             const int8_t *__restrict__ q,
-                                                                             const uint16_t *__restrict__ scales,
-                                                                             const float *__restrict__ x,
-                                                                             uint32_t n_blocks,
-                                                                             uint32_t out_dim,
-                                                                             uint32_t n_tok) {
-    const uint32_t tid = threadIdx.x;
-    const uint32_t lane = tid & 31u;
-    const uint32_t wave = tid >> 5;
-    const uint32_t rows_per_block = blockDim.x >> 5;
-    const uint32_t o = blockIdx.x * rows_per_block + wave;
-    const uint32_t t0 = blockIdx.y * TOK_TILE;
-    if (o >= out_dim || t0 >= n_tok) return;
-    const int8_t *qrow = q + (uint64_t)o * ((uint64_t)n_blocks << 5);
-    const uint16_t *srow = scales + (uint64_t)o * n_blocks;
-    float acc[TOK_TILE];
-#pragma unroll
-    for (uint32_t u = 0; u < TOK_TILE; u++) acc[u] = 0.0f;
-    for (uint32_t b = 0; b < n_blocks; b++) {
-        const float d = ds4_hip_q8_repack_scale_broadcast_w32(srow, b);
-        const int8_t qv = qrow[((uint64_t)b << 5) + lane];
-        const float wv = d * (float)qv;
-        const uint64_t xoff = ((uint64_t)b << 5) + lane;
-#pragma unroll
-        for (uint32_t u = 0; u < TOK_TILE; u++) {
-            const uint32_t t = t0 + u;
-            if (t < n_tok) acc[u] += wv * x[(uint64_t)t * ((uint64_t)n_blocks << 5) + xoff];
-        }
-    }
-#pragma unroll
-    for (uint32_t u = 0; u < TOK_TILE; u++) acc[u] = ds4_hip_warp_reduce_sum(acc[u]);
-    if (lane == 0) {
-#pragma unroll
-        for (uint32_t u = 0; u < TOK_TILE; u++) {
-            const uint32_t t = t0 + u;
-            if (t < n_tok) out[(uint64_t)t * out_dim + o] = acc[u];
-        }
-    }
-}
-
-template <uint32_t TOK_TILE>
-__global__ static void ds4_hip_matmul_q8_repack_warp_rows_w32_toktile_2row_kernel(float *__restrict__ out,
-                                                                                  const int8_t *__restrict__ q,
-                                                                                  const uint16_t *__restrict__ scales,
-                                                                                  const float *__restrict__ x,
-                                                                                  uint32_t n_blocks,
-                                                                                  uint32_t out_dim,
-                                                                                  uint32_t n_tok) {
-    const uint32_t tid = threadIdx.x;
-    const uint32_t lane = tid & 31u;
-    const uint32_t wave = tid >> 5;
-    const uint32_t rows_per_block = (blockDim.x >> 5) << 1;
-    const uint32_t o0 = blockIdx.x * rows_per_block + (wave << 1);
-    const uint32_t o1 = o0 + 1u;
-    const uint32_t t0 = blockIdx.y * TOK_TILE;
-    if (o0 >= out_dim || t0 >= n_tok) return;
-    const uint64_t in_dim = (uint64_t)n_blocks << 5;
-    const int8_t *qrow0 = q + (uint64_t)o0 * in_dim;
-    const uint16_t *srow0 = scales + (uint64_t)o0 * n_blocks;
-    const int8_t *qrow1 = qrow0 + in_dim;
-    const uint16_t *srow1 = srow0 + n_blocks;
-    float acc0[TOK_TILE];
-    float acc1[TOK_TILE];
-#pragma unroll
-    for (uint32_t u = 0; u < TOK_TILE; u++) { acc0[u] = 0.0f; acc1[u] = 0.0f; }
-    for (uint32_t b = 0; b < n_blocks; b++) {
-        const uint64_t xoff = ((uint64_t)b << 5) + lane;
-        const float d0 = ds4_hip_q8_repack_scale_broadcast_w32(srow0, b);
-        const int8_t q0 = qrow0[((uint64_t)b << 5) + lane];
-        const float wv0 = d0 * (float)q0;
-        float wv1 = 0.0f;
-        if (o1 < out_dim) {
-            const float d1 = ds4_hip_q8_repack_scale_broadcast_w32(srow1, b);
-            const int8_t q1 = qrow1[((uint64_t)b << 5) + lane];
-            wv1 = d1 * (float)q1;
-        }
-#pragma unroll
-        for (uint32_t u = 0; u < TOK_TILE; u++) {
-            const uint32_t t = t0 + u;
-            if (t < n_tok) {
-                const float xv = x[(uint64_t)t * in_dim + xoff];
-                acc0[u] += wv0 * xv;
-                acc1[u] += wv1 * xv;
-            }
-        }
-    }
-#pragma unroll
-    for (uint32_t u = 0; u < TOK_TILE; u++) {
-        acc0[u] = ds4_hip_warp_reduce_sum(acc0[u]);
-        acc1[u] = ds4_hip_warp_reduce_sum(acc1[u]);
-    }
-    if (lane == 0) {
-#pragma unroll
-        for (uint32_t u = 0; u < TOK_TILE; u++) {
-            const uint32_t t = t0 + u;
-            if (t < n_tok) {
-                out[(uint64_t)t * out_dim + o0] = acc0[u];
-                if (o1 < out_dim) out[(uint64_t)t * out_dim + o1] = acc1[u];
-            }
-        }
-    }
-}
-
 __global__ static void ds4_hip_matmul_q8_repack_sharedx_rows_w32_kernel(float *__restrict__ out,
                                                                         const int8_t *__restrict__ q,
                                                                         const uint16_t *__restrict__ scales,
@@ -4477,115 +4372,6 @@ __global__ static void ds4_hip_q8_split16_partial_w32_kernel(float *__restrict__
     if (lane == 0) partial[(uint64_t)split * out_dim + row] = acc;
 }
 
-template <uint32_t TOK_TILE>
-__global__ static void ds4_hip_q8_split16_toktile_w32_kernel(float *__restrict__ out,
-                                                            const unsigned char *__restrict__ pack,
-                                                            const float *__restrict__ x,
-                                                            uint32_t n_splits,
-                                                            uint32_t out_dim,
-                                                            uint32_t n_tok) {
-    const uint32_t tid = threadIdx.x;
-    const uint32_t lane = tid & 31u;
-    const uint32_t wave = tid >> 5;
-    const uint32_t rows_per_block = blockDim.x >> 5;
-    const uint32_t row = blockIdx.x * rows_per_block + wave;
-    const uint32_t t0 = blockIdx.y * TOK_TILE;
-    if (row >= out_dim || t0 >= n_tok) return;
-    float acc[TOK_TILE];
-#pragma unroll
-    for (uint32_t u = 0; u < TOK_TILE; u++) acc[u] = 0.0f;
-    for (uint32_t s = 0; s < n_splits; s++) {
-        const unsigned char *rec = pack + ((uint64_t)s * out_dim + row) * 544ull;
-        const uint16_t *sc = reinterpret_cast<const uint16_t *>(rec);
-        const int8_t *q = reinterpret_cast<const int8_t *>(rec + 32u);
-#pragma unroll
-        for (uint32_t bb = 0; bb < 16u; bb++) {
-            const float d = ds4_hip_q8_repack_scale_broadcast_w32(sc, bb);
-            const int8_t qv = q[(bb << 5) + lane];
-            const float wv = d * (float)qv;
-            const uint64_t xoff = ((uint64_t)s << 9) + ((uint64_t)bb << 5) + lane;
-#pragma unroll
-            for (uint32_t u = 0; u < TOK_TILE; u++) {
-                const uint32_t t = t0 + u;
-                if (t < n_tok) acc[u] += wv * x[(uint64_t)t * ((uint64_t)n_splits << 9) + xoff];
-            }
-        }
-    }
-#pragma unroll
-    for (uint32_t u = 0; u < TOK_TILE; u++) acc[u] = ds4_hip_warp_reduce_sum(acc[u]);
-    if (lane == 0) {
-#pragma unroll
-        for (uint32_t u = 0; u < TOK_TILE; u++) {
-            const uint32_t t = t0 + u;
-            if (t < n_tok) out[(uint64_t)t * out_dim + row] = acc[u];
-        }
-    }
-}
-
-template <uint32_t TOK_TILE>
-__global__ static void ds4_hip_q8_split16_toktile_2row_w32_kernel(float *__restrict__ out,
-                                                                 const unsigned char *__restrict__ pack,
-                                                                 const float *__restrict__ x,
-                                                                 uint32_t n_splits,
-                                                                 uint32_t out_dim,
-                                                                 uint32_t n_tok) {
-    const uint32_t tid = threadIdx.x;
-    const uint32_t lane = tid & 31u;
-    const uint32_t wave = tid >> 5;
-    const uint32_t rows_per_block = (blockDim.x >> 5) << 1;
-    const uint32_t row0 = blockIdx.x * rows_per_block + (wave << 1);
-    const uint32_t row1 = row0 + 1u;
-    const uint32_t t0 = blockIdx.y * TOK_TILE;
-    if (row0 >= out_dim || t0 >= n_tok) return;
-    float acc0[TOK_TILE];
-    float acc1[TOK_TILE];
-#pragma unroll
-    for (uint32_t u = 0; u < TOK_TILE; u++) { acc0[u] = 0.0f; acc1[u] = 0.0f; }
-    for (uint32_t s = 0; s < n_splits; s++) {
-        const unsigned char *rec0 = pack + ((uint64_t)s * out_dim + row0) * 544ull;
-        const uint16_t *sc0 = reinterpret_cast<const uint16_t *>(rec0);
-        const int8_t *q0 = reinterpret_cast<const int8_t *>(rec0 + 32u);
-        const unsigned char *rec1 = rec0 + 544ull;
-        const uint16_t *sc1 = reinterpret_cast<const uint16_t *>(rec1);
-        const int8_t *q1 = reinterpret_cast<const int8_t *>(rec1 + 32u);
-#pragma unroll
-        for (uint32_t bb = 0; bb < 16u; bb++) {
-            const uint64_t xoff = ((uint64_t)s << 9) + ((uint64_t)bb << 5) + lane;
-            const float d0 = ds4_hip_q8_repack_scale_broadcast_w32(sc0, bb);
-            const float wv0 = d0 * (float)q0[(bb << 5) + lane];
-            float wv1 = 0.0f;
-            if (row1 < out_dim) {
-                const float d1 = ds4_hip_q8_repack_scale_broadcast_w32(sc1, bb);
-                wv1 = d1 * (float)q1[(bb << 5) + lane];
-            }
-#pragma unroll
-            for (uint32_t u = 0; u < TOK_TILE; u++) {
-                const uint32_t t = t0 + u;
-                if (t < n_tok) {
-                    const float xv = x[(uint64_t)t * ((uint64_t)n_splits << 9) + xoff];
-                    acc0[u] += wv0 * xv;
-                    acc1[u] += wv1 * xv;
-                }
-            }
-        }
-    }
-#pragma unroll
-    for (uint32_t u = 0; u < TOK_TILE; u++) {
-        acc0[u] = ds4_hip_warp_reduce_sum(acc0[u]);
-        acc1[u] = ds4_hip_warp_reduce_sum(acc1[u]);
-    }
-    if (lane == 0) {
-#pragma unroll
-        for (uint32_t u = 0; u < TOK_TILE; u++) {
-            const uint32_t t = t0 + u;
-            if (t < n_tok) {
-                out[(uint64_t)t * out_dim + row0] = acc0[u];
-                if (row1 < out_dim) out[(uint64_t)t * out_dim + row1] = acc1[u];
-            }
-        }
-    }
-}
-
 __global__ static void ds4_hip_q8_grouped_partial_w32_kernel(float *__restrict__ partial, const unsigned char *__restrict__ w, const float *__restrict__ heads,
                                                              uint32_t n_groups, uint32_t n_blocks, uint32_t rank,
                                                              uint64_t row_bytes, uint32_t n_splits) {
@@ -4874,29 +4660,6 @@ __global__ static void ds4_hip_moe_bucket_pairs_kernel(int *__restrict__ counts,
     if (idx < stride) buckets[(uint64_t)(uint32_t)expert * stride + idx] = (int)pair;
 }
 
-__global__ static void ds4_hip_moe_make_tile_list_kernel(int *__restrict__ tile_count,
-                                                         int *__restrict__ tile_experts,
-                                                         int *__restrict__ tile_p0,
-                                                         const int *__restrict__ counts,
-                                                         uint32_t tile_capacity,
-                                                         uint32_t pair_tile,
-                                                         uint32_t min_count,
-                                                         uint32_t max_count) {
-    const uint32_t expert = blockIdx.x * blockDim.x + threadIdx.x;
-    if (expert >= 256u) return;
-    const uint32_t count = (uint32_t)counts[expert];
-    if (count == 0 || count < min_count || (max_count != 0u && count >= max_count)) return;
-    const uint32_t nt = (count + pair_tile - 1u) / pair_tile;
-    const uint32_t base = (uint32_t)atomicAdd(tile_count, (int)nt);
-    for (uint32_t j = 0; j < nt; j++) {
-        const uint32_t idx = base + j;
-        if (idx < tile_capacity) {
-            tile_experts[idx] = (int)expert;
-            tile_p0[idx] = (int)(j * pair_tile);
-        }
-    }
-}
-
 template <uint32_t PAIR_TILE>
 __global__ static void ds4_hip_moe_q2_gate_up_expert_batch_kernel(float *__restrict__ mid,
                                                                   const unsigned char *__restrict__ gate_w,
@@ -5084,193 +4847,6 @@ __global__ static void ds4_hip_moe_q2_gate_up_expert_batch_sharedx_kernel(float 
 }
 
 template <uint32_t PAIR_TILE>
-__global__ static void ds4_hip_moe_q2_gate_up_tile_list_kernel(float *__restrict__ mid,
-                                                               const unsigned char *__restrict__ gate_w,
-                                                               const unsigned char *__restrict__ up_w,
-                                                               const float *__restrict__ x,
-                                                               const float *__restrict__ weights,
-                                                               const int *__restrict__ counts,
-                                                               const int *__restrict__ buckets,
-                                                               const int *__restrict__ tile_count,
-                                                               const int *__restrict__ tile_experts,
-                                                               const int *__restrict__ tile_p0,
-                                                               uint32_t stride,
-                                                               uint32_t in_dim,
-                                                               uint32_t mid_dim,
-                                                               uint64_t gate_expert_bytes,
-                                                               uint64_t gate_row_bytes,
-                                                               uint64_t up_expert_bytes,
-                                                               uint64_t up_row_bytes,
-                                                               float clamp) {
-    const uint32_t tid = threadIdx.x;
-    const uint32_t lane = tid & 31u;
-    const uint32_t wave = tid >> 5;
-    const uint32_t rows_per_block = blockDim.x >> 5;
-    const uint32_t row = blockIdx.x * rows_per_block + wave;
-    const uint32_t tile_idx = blockIdx.y;
-    if (row >= mid_dim || tile_idx >= (uint32_t)tile_count[0]) return;
-    const uint32_t expert = (uint32_t)tile_experts[tile_idx];
-    const uint32_t count = (uint32_t)counts[expert];
-    const uint32_t p0 = (uint32_t)tile_p0[tile_idx];
-    if (expert >= 256u || p0 >= count) return;
-    const unsigned char *grow = gate_w + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes;
-    const unsigned char *urow = up_w + (uint64_t)expert * up_expert_bytes + (uint64_t)row * up_row_bytes;
-    int pair[PAIR_TILE];
-    float g_acc[PAIR_TILE];
-    float u_acc[PAIR_TILE];
-#pragma unroll
-    for (uint32_t u = 0; u < PAIR_TILE; u++) {
-        pair[u] = (p0 + u < count) ? buckets[(uint64_t)expert * stride + p0 + u] : -1;
-        g_acc[u] = 0.0f;
-        u_acc[u] = 0.0f;
-    }
-    const uint32_t nb = in_dim >> 8;
-    for (uint32_t b = 0; b < nb; b++) {
-        const unsigned char *gblk = grow + (uint64_t)b * 84u;
-        const unsigned char *ublk = urow + (uint64_t)b * 84u;
-        float gd, gdmin, ud, udmin;
-        ds4_hip_q2_k_scale_broadcast_w32(gblk, &gd, &gdmin);
-        ds4_hip_q2_k_scale_broadcast_w32(ublk, &ud, &udmin);
-        const uint64_t xbase = (uint64_t)b * 256u;
-#pragma unroll
-        for (uint32_t kk = 0; kk < 8u; kk++) {
-            const uint32_t i = lane + (kk << 5);
-            const float gwv = ds4_hip_q2_k_dequant_256_scaled_w32(gblk, lane, kk, gd, gdmin);
-            const float uwv = ds4_hip_q2_k_dequant_256_scaled_w32(ublk, lane, kk, ud, udmin);
-#pragma unroll
-            for (uint32_t u = 0; u < PAIR_TILE; u++) {
-                if (pair[u] >= 0) {
-                    const uint32_t t = (uint32_t)pair[u] / 6u;
-                    const float xv = x[(uint64_t)t * in_dim + xbase + i];
-                    g_acc[u] += gwv * xv;
-                    u_acc[u] += uwv * xv;
-                }
-            }
-        }
-    }
-#pragma unroll
-    for (uint32_t u = 0; u < PAIR_TILE; u++) {
-        g_acc[u] = ds4_hip_warp_reduce_sum(g_acc[u]);
-        u_acc[u] = ds4_hip_warp_reduce_sum(u_acc[u]);
-    }
-    if (lane == 0) {
-#pragma unroll
-        for (uint32_t u = 0; u < PAIR_TILE; u++) {
-            if (pair[u] >= 0) {
-                float g = g_acc[u];
-                float upv = u_acc[u];
-                if (clamp > 1.0e-6f) {
-                    if (g > clamp) g = clamp;
-                    if (upv > clamp) upv = clamp;
-                    if (upv < -clamp) upv = -clamp;
-                }
-                mid[(uint64_t)(uint32_t)pair[u] * mid_dim + row] = ds4_hip_silu(g) * upv * weights[(uint32_t)pair[u]];
-            }
-        }
-    }
-}
-
-template <uint32_t PAIR_TILE>
-__global__ static void ds4_hip_moe_q2_gate_up_tile_list_sharedx_kernel(float *__restrict__ mid,
-                                                                      const unsigned char *__restrict__ gate_w,
-                                                                      const unsigned char *__restrict__ up_w,
-                                                                      const float *__restrict__ x,
-                                                                      const float *__restrict__ weights,
-                                                                      const int *__restrict__ counts,
-                                                                      const int *__restrict__ buckets,
-                                                                      const int *__restrict__ tile_count,
-                                                                      const int *__restrict__ tile_experts,
-                                                                      const int *__restrict__ tile_p0,
-                                                                      uint32_t stride,
-                                                                      uint32_t in_dim,
-                                                                      uint32_t mid_dim,
-                                                                      uint64_t gate_expert_bytes,
-                                                                      uint64_t gate_row_bytes,
-                                                                      uint64_t up_expert_bytes,
-                                                                      uint64_t up_row_bytes,
-                                                                      float clamp) {
-    extern __shared__ float shx[];
-    const uint32_t tid = threadIdx.x;
-    const uint32_t lane = tid & 31u;
-    const uint32_t wave = tid >> 5;
-    const uint32_t rows_per_block = blockDim.x >> 5;
-    const uint32_t row = blockIdx.x * rows_per_block + wave;
-    const uint32_t tile_idx = blockIdx.y;
-    if (tile_idx >= (uint32_t)tile_count[0]) return;
-    const uint32_t expert = (uint32_t)tile_experts[tile_idx];
-    const uint32_t count = (uint32_t)counts[expert];
-    const uint32_t p0 = (uint32_t)tile_p0[tile_idx];
-    if (expert >= 256u || p0 >= count) return;
-    const bool row_valid = row < mid_dim;
-    const unsigned char *grow = gate_w + (uint64_t)expert * gate_expert_bytes + (uint64_t)(row_valid ? row : 0u) * gate_row_bytes;
-    const unsigned char *urow = up_w + (uint64_t)expert * up_expert_bytes + (uint64_t)(row_valid ? row : 0u) * up_row_bytes;
-    int pair[PAIR_TILE];
-    float g_acc[PAIR_TILE];
-    float u_acc[PAIR_TILE];
-#pragma unroll
-    for (uint32_t u = 0; u < PAIR_TILE; u++) {
-        pair[u] = (p0 + u < count) ? buckets[(uint64_t)expert * stride + p0 + u] : -1;
-        g_acc[u] = 0.0f;
-        u_acc[u] = 0.0f;
-    }
-    const uint32_t nb = in_dim >> 8;
-    for (uint32_t b = 0; b < nb; b++) {
-        const uint64_t xbase = (uint64_t)b * 256u;
-        for (uint32_t j = tid; j < PAIR_TILE * 256u; j += blockDim.x) {
-            const uint32_t u = j >> 8;
-            const uint32_t k = j & 255u;
-            if (pair[u] >= 0) {
-                const uint32_t t = (uint32_t)pair[u] / 6u;
-                shx[j] = x[(uint64_t)t * in_dim + xbase + k];
-            } else {
-                shx[j] = 0.0f;
-            }
-        }
-        __syncthreads();
-        if (row_valid) {
-            const unsigned char *gblk = grow + (uint64_t)b * 84u;
-            const unsigned char *ublk = urow + (uint64_t)b * 84u;
-            float gd, gdmin, ud, udmin;
-            ds4_hip_q2_k_scale_broadcast_w32(gblk, &gd, &gdmin);
-            ds4_hip_q2_k_scale_broadcast_w32(ublk, &ud, &udmin);
-#pragma unroll
-            for (uint32_t kk = 0; kk < 8u; kk++) {
-                const uint32_t i = lane + (kk << 5);
-                const float gwv = ds4_hip_q2_k_dequant_256_scaled_w32(gblk, lane, kk, gd, gdmin);
-                const float uwv = ds4_hip_q2_k_dequant_256_scaled_w32(ublk, lane, kk, ud, udmin);
-#pragma unroll
-                for (uint32_t u = 0; u < PAIR_TILE; u++) {
-                    const float xv = shx[(u << 8) + i];
-                    g_acc[u] += gwv * xv;
-                    u_acc[u] += uwv * xv;
-                }
-            }
-        }
-        __syncthreads();
-    }
-#pragma unroll
-    for (uint32_t u = 0; u < PAIR_TILE; u++) {
-        g_acc[u] = ds4_hip_warp_reduce_sum(g_acc[u]);
-        u_acc[u] = ds4_hip_warp_reduce_sum(u_acc[u]);
-    }
-    if (lane == 0 && row_valid) {
-#pragma unroll
-        for (uint32_t u = 0; u < PAIR_TILE; u++) {
-            if (pair[u] >= 0) {
-                float g = g_acc[u];
-                float upv = u_acc[u];
-                if (clamp > 1.0e-6f) {
-                    if (g > clamp) g = clamp;
-                    if (upv > clamp) upv = clamp;
-                    if (upv < -clamp) upv = -clamp;
-                }
-                mid[(uint64_t)(uint32_t)pair[u] * mid_dim + row] = ds4_hip_silu(g) * upv * weights[(uint32_t)pair[u]];
-            }
-        }
-    }
-}
-
-template <uint32_t PAIR_TILE>
 __global__ static void ds4_hip_moe_q2_down_expert_batch_kernel(float *__restrict__ experts,
                                                                const unsigned char *__restrict__ down_w,
                                                                const float *__restrict__ mid,
@@ -5391,133 +4967,6 @@ __global__ static void ds4_hip_moe_q2_down_expert_batch_sharedmid_kernel(float *
             for (uint32_t u = 0; u < PAIR_TILE; u++) {
                 if (pair[u] >= 0) experts[(uint64_t)(uint32_t)pair[u] * out_dim + row] = acc[u];
             }
-        }
-    }
-}
-
-template <uint32_t PAIR_TILE>
-__global__ static void ds4_hip_moe_q2_down_tile_list_sharedmid_kernel(float *__restrict__ experts,
-                                                                     const unsigned char *__restrict__ down_w,
-                                                                     const float *__restrict__ mid,
-                                                                     const int *__restrict__ counts,
-                                                                     const int *__restrict__ buckets,
-                                                                     const int *__restrict__ tile_count,
-                                                                     const int *__restrict__ tile_experts,
-                                                                     const int *__restrict__ tile_p0,
-                                                                     uint32_t stride,
-                                                                     uint32_t mid_dim,
-                                                                     uint32_t out_dim,
-                                                                     uint64_t down_expert_bytes,
-                                                                     uint64_t down_row_bytes) {
-    extern __shared__ float shmid[];
-    const uint32_t tid = threadIdx.x;
-    const uint32_t lane = tid & 31u;
-    const uint32_t wave = tid >> 5;
-    const uint32_t rows_per_block = blockDim.x >> 5;
-    const uint32_t row = blockIdx.x * rows_per_block + wave;
-    const uint32_t tile_idx = blockIdx.y;
-    if (tile_idx >= (uint32_t)tile_count[0]) return;
-    const uint32_t expert = (uint32_t)tile_experts[tile_idx];
-    const uint32_t count = (uint32_t)counts[expert];
-    const uint32_t p0 = (uint32_t)tile_p0[tile_idx];
-    if (expert >= 256u || p0 >= count) return;
-    const bool row_valid = row < out_dim;
-    const unsigned char *drow = down_w + (uint64_t)expert * down_expert_bytes + (uint64_t)(row_valid ? row : 0u) * down_row_bytes;
-    int pair[PAIR_TILE];
-    float acc[PAIR_TILE];
-#pragma unroll
-    for (uint32_t u = 0; u < PAIR_TILE; u++) {
-        pair[u] = (p0 + u < count) ? buckets[(uint64_t)expert * stride + p0 + u] : -1;
-        acc[u] = 0.0f;
-    }
-    const uint32_t nb = mid_dim >> 8;
-    for (uint32_t b = 0; b < nb; b++) {
-        const uint64_t mbase = (uint64_t)b * 256u;
-        for (uint32_t j = tid; j < PAIR_TILE * 256u; j += blockDim.x) {
-            const uint32_t u = j >> 8;
-            const uint32_t k = j & 255u;
-            shmid[j] = (pair[u] >= 0) ? mid[(uint64_t)(uint32_t)pair[u] * mid_dim + mbase + k] : 0.0f;
-        }
-        __syncthreads();
-        if (row_valid) {
-            const unsigned char *dblk = drow + (uint64_t)b * 84u;
-            float d, dmin;
-            ds4_hip_q2_k_scale_broadcast_w32(dblk, &d, &dmin);
-#pragma unroll
-            for (uint32_t kk = 0; kk < 8u; kk++) {
-                const uint32_t i = lane + (kk << 5);
-                const float wv = ds4_hip_q2_k_dequant_256_scaled_w32(dblk, lane, kk, d, dmin);
-#pragma unroll
-                for (uint32_t u = 0; u < PAIR_TILE; u++) acc[u] += wv * shmid[(u << 8) + i];
-            }
-        }
-        __syncthreads();
-    }
-#pragma unroll
-    for (uint32_t u = 0; u < PAIR_TILE; u++) acc[u] = ds4_hip_warp_reduce_sum(acc[u]);
-    if (lane == 0 && row_valid) {
-#pragma unroll
-        for (uint32_t u = 0; u < PAIR_TILE; u++) {
-            if (pair[u] >= 0) experts[(uint64_t)(uint32_t)pair[u] * out_dim + row] = acc[u];
-        }
-    }
-}
-
-template <uint32_t PAIR_TILE>
-__global__ static void ds4_hip_moe_q2_down_tile_list_kernel(float *__restrict__ experts,
-                                                            const unsigned char *__restrict__ down_w,
-                                                            const float *__restrict__ mid,
-                                                            const int *__restrict__ counts,
-                                                            const int *__restrict__ buckets,
-                                                            const int *__restrict__ tile_count,
-                                                            const int *__restrict__ tile_experts,
-                                                            const int *__restrict__ tile_p0,
-                                                            uint32_t stride,
-                                                            uint32_t mid_dim,
-                                                            uint32_t out_dim,
-                                                            uint64_t down_expert_bytes,
-                                                            uint64_t down_row_bytes) {
-    const uint32_t tid = threadIdx.x;
-    const uint32_t lane = tid & 31u;
-    const uint32_t wave = tid >> 5;
-    const uint32_t rows_per_block = blockDim.x >> 5;
-    const uint32_t row = blockIdx.x * rows_per_block + wave;
-    const uint32_t tile_idx = blockIdx.y;
-    if (row >= out_dim || tile_idx >= (uint32_t)tile_count[0]) return;
-    const uint32_t expert = (uint32_t)tile_experts[tile_idx];
-    const uint32_t count = (uint32_t)counts[expert];
-    const uint32_t p0 = (uint32_t)tile_p0[tile_idx];
-    if (expert >= 256u || p0 >= count) return;
-    const unsigned char *drow = down_w + (uint64_t)expert * down_expert_bytes + (uint64_t)row * down_row_bytes;
-    int pair[PAIR_TILE];
-    float acc[PAIR_TILE];
-#pragma unroll
-    for (uint32_t u = 0; u < PAIR_TILE; u++) {
-        pair[u] = (p0 + u < count) ? buckets[(uint64_t)expert * stride + p0 + u] : -1;
-        acc[u] = 0.0f;
-    }
-    const uint32_t nb = mid_dim >> 8;
-    for (uint32_t b = 0; b < nb; b++) {
-        const unsigned char *dblk = drow + (uint64_t)b * 84u;
-        float d, dmin;
-        ds4_hip_q2_k_scale_broadcast_w32(dblk, &d, &dmin);
-        const uint64_t mbase = (uint64_t)b * 256u;
-#pragma unroll
-        for (uint32_t kk = 0; kk < 8u; kk++) {
-            const uint32_t i = lane + (kk << 5);
-            const float wv = ds4_hip_q2_k_dequant_256_scaled_w32(dblk, lane, kk, d, dmin);
-#pragma unroll
-            for (uint32_t u = 0; u < PAIR_TILE; u++) {
-                if (pair[u] >= 0) acc[u] += wv * mid[(uint64_t)(uint32_t)pair[u] * mid_dim + mbase + i];
-            }
-        }
-    }
-#pragma unroll
-    for (uint32_t u = 0; u < PAIR_TILE; u++) acc[u] = ds4_hip_warp_reduce_sum(acc[u]);
-    if (lane == 0) {
-#pragma unroll
-        for (uint32_t u = 0; u < PAIR_TILE; u++) {
-            if (pair[u] >= 0) experts[(uint64_t)(uint32_t)pair[u] * out_dim + row] = acc[u];
         }
     }
 }
@@ -5965,160 +5414,11 @@ extern "C" int ds4_metal_matmul_q8_0_tensor(
             return ok ? 1 : 0;
         }
     }
-    if (warp_threads_top == 32u && n_tok > 1u && (in_dim & 511u) == 0u &&
-        std::getenv("DS4_HIP_Q8_REPACK_SPLIT16_BATCH") != nullptr &&
-        (std::getenv("DS4_HIP_Q8_REPACK_SPLIT16_BATCH_ALL") != nullptr ||
-         (in_dim == 4096u && out_dim == 8192u) ||
-         (in_dim == 8192u && out_dim == 4096u) ||
-         (in_dim == 2048u && out_dim == 4096u))) {
-        const ds4_hip_repacked_q8_split16_tensor *sw = ds4_hip_q8_split16_repack_get(model_map, model_size, weight_offset, in_dim, out_dim, "Q8_0 split16 batch matmul");
-        if (sw) {
-            hipEvent_t prof_start{}, prof_stop{};
-            const bool prof = ds4_hip_profile_begin("DS4_HIP_Q8_MATMUL_PROFILE", &prof_start, &prof_stop);
-            unsigned rows_per_block = 16u;
-            if (const char *rpb_env = std::getenv("DS4_HIP_Q8_SPLIT16_BATCH_RPB")) {
-                const unsigned v = (unsigned)std::strtoul(rpb_env, nullptr, 10);
-                if (v >= 1u && v <= 32u) rows_per_block = v;
-            }
-            unsigned tile = 8u;
-            if (const char *tile_env = std::getenv("DS4_HIP_Q8_SPLIT16_BATCH_TILE")) {
-                const unsigned v = (unsigned)std::strtoul(tile_env, nullptr, 10);
-                if (v == 2u || v == 4u || v == 8u || v == 16u || v == 32u) tile = v;
-            } else if (const char *tile_env = std::getenv("DS4_HIP_Q8_BATCH_TILE")) {
-                const unsigned v = (unsigned)std::strtoul(tile_env, nullptr, 10);
-                if (v == 2u || v == 4u || v == 8u || v == 16u || v == 32u) tile = v;
-            }
-            const bool use_2row = std::getenv("DS4_HIP_Q8_SPLIT16_BATCH_NO_2ROW") == nullptr && tile <= 16u;
-            const unsigned out_rows_per_block = rows_per_block * (use_2row ? 2u : 1u);
-            const dim3 grid((unsigned)((out_dim + out_rows_per_block - 1u) / out_rows_per_block),
-                            (unsigned)((n_tok + tile - 1u) / tile), 1u);
-            const unsigned threads = rows_per_block * 32u;
-            if (use_2row) {
-                if (tile == 16u) {
-                    ds4_hip_q8_split16_toktile_2row_w32_kernel<16><<<grid, threads, 0, g_stream>>>((float *)out->ptr, sw->pack, (const float *)x->ptr, sw->n_splits, (uint32_t)out_dim, (uint32_t)n_tok);
-                } else if (tile == 8u) {
-                    ds4_hip_q8_split16_toktile_2row_w32_kernel<8><<<grid, threads, 0, g_stream>>>((float *)out->ptr, sw->pack, (const float *)x->ptr, sw->n_splits, (uint32_t)out_dim, (uint32_t)n_tok);
-                } else if (tile == 2u) {
-                    ds4_hip_q8_split16_toktile_2row_w32_kernel<2><<<grid, threads, 0, g_stream>>>((float *)out->ptr, sw->pack, (const float *)x->ptr, sw->n_splits, (uint32_t)out_dim, (uint32_t)n_tok);
-                } else {
-                    ds4_hip_q8_split16_toktile_2row_w32_kernel<4><<<grid, threads, 0, g_stream>>>((float *)out->ptr, sw->pack, (const float *)x->ptr, sw->n_splits, (uint32_t)out_dim, (uint32_t)n_tok);
-                }
-            } else if (tile == 32u) {
-                ds4_hip_q8_split16_toktile_w32_kernel<32><<<grid, threads, 0, g_stream>>>((float *)out->ptr, sw->pack, (const float *)x->ptr, sw->n_splits, (uint32_t)out_dim, (uint32_t)n_tok);
-            } else if (tile == 16u) {
-                ds4_hip_q8_split16_toktile_w32_kernel<16><<<grid, threads, 0, g_stream>>>((float *)out->ptr, sw->pack, (const float *)x->ptr, sw->n_splits, (uint32_t)out_dim, (uint32_t)n_tok);
-            } else if (tile == 8u) {
-                ds4_hip_q8_split16_toktile_w32_kernel<8><<<grid, threads, 0, g_stream>>>((float *)out->ptr, sw->pack, (const float *)x->ptr, sw->n_splits, (uint32_t)out_dim, (uint32_t)n_tok);
-            } else if (tile == 2u) {
-                ds4_hip_q8_split16_toktile_w32_kernel<2><<<grid, threads, 0, g_stream>>>((float *)out->ptr, sw->pack, (const float *)x->ptr, sw->n_splits, (uint32_t)out_dim, (uint32_t)n_tok);
-            } else {
-                ds4_hip_q8_split16_toktile_w32_kernel<4><<<grid, threads, 0, g_stream>>>((float *)out->ptr, sw->pack, (const float *)x->ptr, sw->n_splits, (uint32_t)out_dim, (uint32_t)n_tok);
-            }
-            const bool ok = ds4_hip_launch_ok("Q8_0 split16 batch matmul launch");
-            ds4_hip_profile_end(prof, prof_start, prof_stop, "q8_matmul_split16_batch", in_dim, out_dim, n_tok);
-            return ok ? 1 : 0;
-        }
-    }
-    if (warp_threads_top == 32u && n_tok > 1u && (in_dim & 31u) == 0u &&
-        std::getenv("DS4_HIP_Q8_REPACK_BATCH") != nullptr &&
-        (std::getenv("DS4_HIP_Q8_REPACK_BATCH_ALL") != nullptr || (in_dim == 1024u && out_dim == 32768u))) {
-        const ds4_hip_repacked_q8_tensor *rw = ds4_hip_q8_repack_get(model_map, model_size, weight_offset, in_dim, out_dim, "Q8_0 batch matmul");
-        if (rw) {
-            hipEvent_t prof_start{}, prof_stop{};
-            const bool prof = ds4_hip_profile_begin("DS4_HIP_Q8_MATMUL_PROFILE", &prof_start, &prof_stop);
-            unsigned rows_per_block = 16u;
-            if (const char *rpb_env = std::getenv("DS4_HIP_Q8_REPACK_BATCH_RPB")) {
-                const unsigned v = (unsigned)std::strtoul(rpb_env, nullptr, 10);
-                if (v >= 1u && v <= 32u) rows_per_block = v;
-            } else if (const char *rpb_env = std::getenv("DS4_HIP_Q8_BATCH_RPB")) {
-                const unsigned v = (unsigned)std::strtoul(rpb_env, nullptr, 10);
-                if (v >= 1u && v <= 32u) rows_per_block = v;
-            }
-            unsigned tile = 8u;
-            if (const char *tile_env = std::getenv("DS4_HIP_Q8_REPACK_BATCH_TILE")) {
-                const unsigned v = (unsigned)std::strtoul(tile_env, nullptr, 10);
-                if (v == 2u || v == 4u || v == 8u || v == 16u || v == 32u) tile = v;
-            } else if (const char *tile_env = std::getenv("DS4_HIP_Q8_BATCH_TILE")) {
-                const unsigned v = (unsigned)std::strtoul(tile_env, nullptr, 10);
-                if (v == 2u || v == 4u || v == 8u || v == 16u || v == 32u) tile = v;
-            }
-            const bool use_2row = std::getenv("DS4_HIP_Q8_REPACK_BATCH_NO_2ROW") == nullptr && tile <= 16u;
-            const unsigned out_rows_per_block = rows_per_block * (use_2row ? 2u : 1u);
-            const dim3 grid((unsigned)((out_dim + out_rows_per_block - 1u) / out_rows_per_block),
-                            (unsigned)((n_tok + tile - 1u) / tile), 1u);
-            const unsigned threads = rows_per_block * 32u;
-            if (use_2row) {
-                if (tile == 16u) {
-                    ds4_hip_matmul_q8_repack_warp_rows_w32_toktile_2row_kernel<16><<<grid, threads, 0, g_stream>>>(
-                            (float *)out->ptr, rw->q, rw->scales, (const float *)x->ptr,
-                            (uint32_t)(in_dim >> 5), (uint32_t)out_dim, (uint32_t)n_tok);
-                } else if (tile == 8u) {
-                    ds4_hip_matmul_q8_repack_warp_rows_w32_toktile_2row_kernel<8><<<grid, threads, 0, g_stream>>>(
-                            (float *)out->ptr, rw->q, rw->scales, (const float *)x->ptr,
-                            (uint32_t)(in_dim >> 5), (uint32_t)out_dim, (uint32_t)n_tok);
-                } else if (tile == 2u) {
-                    ds4_hip_matmul_q8_repack_warp_rows_w32_toktile_2row_kernel<2><<<grid, threads, 0, g_stream>>>(
-                            (float *)out->ptr, rw->q, rw->scales, (const float *)x->ptr,
-                            (uint32_t)(in_dim >> 5), (uint32_t)out_dim, (uint32_t)n_tok);
-                } else {
-                    ds4_hip_matmul_q8_repack_warp_rows_w32_toktile_2row_kernel<4><<<grid, threads, 0, g_stream>>>(
-                            (float *)out->ptr, rw->q, rw->scales, (const float *)x->ptr,
-                            (uint32_t)(in_dim >> 5), (uint32_t)out_dim, (uint32_t)n_tok);
-                }
-            } else if (tile == 32u) {
-                ds4_hip_matmul_q8_repack_warp_rows_w32_toktile_kernel<32><<<grid, threads, 0, g_stream>>>(
-                        (float *)out->ptr, rw->q, rw->scales, (const float *)x->ptr,
-                        (uint32_t)(in_dim >> 5), (uint32_t)out_dim, (uint32_t)n_tok);
-            } else if (tile == 16u) {
-                ds4_hip_matmul_q8_repack_warp_rows_w32_toktile_kernel<16><<<grid, threads, 0, g_stream>>>(
-                        (float *)out->ptr, rw->q, rw->scales, (const float *)x->ptr,
-                        (uint32_t)(in_dim >> 5), (uint32_t)out_dim, (uint32_t)n_tok);
-            } else if (tile == 8u) {
-                ds4_hip_matmul_q8_repack_warp_rows_w32_toktile_kernel<8><<<grid, threads, 0, g_stream>>>(
-                        (float *)out->ptr, rw->q, rw->scales, (const float *)x->ptr,
-                        (uint32_t)(in_dim >> 5), (uint32_t)out_dim, (uint32_t)n_tok);
-            } else if (tile == 2u) {
-                ds4_hip_matmul_q8_repack_warp_rows_w32_toktile_kernel<2><<<grid, threads, 0, g_stream>>>(
-                        (float *)out->ptr, rw->q, rw->scales, (const float *)x->ptr,
-                        (uint32_t)(in_dim >> 5), (uint32_t)out_dim, (uint32_t)n_tok);
-            } else {
-                ds4_hip_matmul_q8_repack_warp_rows_w32_toktile_kernel<4><<<grid, threads, 0, g_stream>>>(
-                        (float *)out->ptr, rw->q, rw->scales, (const float *)x->ptr,
-                        (uint32_t)(in_dim >> 5), (uint32_t)out_dim, (uint32_t)n_tok);
-            }
-            const bool ok = ds4_hip_launch_ok("Q8_0 repacked batch matmul launch");
-            ds4_hip_profile_end(prof, prof_start, prof_stop, "q8_matmul_repack_batch", in_dim, out_dim, n_tok);
-            return ok ? 1 : 0;
-        }
-    }
     const unsigned char *w = ds4_hip_model_ptr(model_map, model_size, weight_offset, weight_bytes, "Q8_0 matmul");
     if (!w) return 0;
     hipEvent_t prof_start{}, prof_stop{};
     const bool prof = ds4_hip_profile_begin("DS4_HIP_Q8_MATMUL_PROFILE", &prof_start, &prof_stop);
-    if (((std::getenv("DS4_HIP_SPLITK_Q_B") != nullptr && n_tok == 1u && in_dim == 1024u && out_dim == 32768u) ||
-         (std::getenv("DS4_HIP_SPLITK_FINAL") != nullptr && n_tok == 1u && in_dim == 4096u && out_dim >= 65536u)) &&
-        ds4_hip_warp_threads() == 32u && (in_dim & 31u) == 0u && out_dim <= UINT32_MAX) {
-        uint32_t n_splits = (in_dim >= 4096u) ? 16u : 8u;
-        if (const char *split_env = std::getenv("DS4_HIP_SPLITK_Q8_N")) {
-            const uint32_t v = (uint32_t)std::strtoul(split_env, nullptr, 10);
-            if (v >= 2u && v <= 32u) n_splits = v;
-        }
-        const unsigned rows_per_block = 32u;
-        float *partial = ds4_hip_q8_partial_scratch((uint64_t)n_splits * out_dim);
-        if (!partial) return 0;
-        const uint32_t chunk_blocks = (uint32_t)(((in_dim >> 5) + n_splits - 1u) / n_splits);
-        ds4_hip_matmul_q8_0_hc_partial_w32_kernel<<<dim3((unsigned)((out_dim + rows_per_block - 1u) / rows_per_block), n_splits),
-                                                     rows_per_block * 32u, (size_t)(chunk_blocks * 32u * sizeof(float)), g_stream>>>(
-                partial, w, (const float *)x->ptr, (uint32_t)(in_dim >> 5), (uint32_t)out_dim, row_bytes, n_splits);
-        bool ok = ds4_hip_launch_ok("Q8_0 split-K matmul partial launch");
-        if (ok) {
-            ds4_hip_q8_partial_sum_kernel<<<(unsigned)((out_dim + 255u) / 256u), 256, 0, g_stream>>>(
-                    (float *)out->ptr, partial, (uint32_t)out_dim, n_splits);
-            ok = ds4_hip_launch_ok("Q8_0 split-K matmul sum launch");
-        }
-        ds4_hip_profile_end(prof, prof_start, prof_stop, "q8_matmul", in_dim, out_dim, n_tok);
-        return ok ? 1 : 0;
-    }
+    const char *profile_label = "q8_matmul";
     if (out_dim >= 1024u) {
         const unsigned warp_threads = ds4_hip_warp_threads();
         if (std::getenv("DS4_HIP_Q8_BATCH_FAST") != nullptr && warp_threads == 32u && n_tok > 1u && (in_dim & 31u) == 0u) {
@@ -6139,6 +5439,7 @@ extern "C" int ds4_metal_matmul_q8_0_tensor(
                             (unsigned)((n_tok + tile - 1u) / tile), 1u);
             const unsigned threads = rows_per_block * 32u;
             if (use_sharedx_batch) {
+                profile_label = "q8_matmul_sharedx_batch";
                 unsigned chunk_blocks = 16u;
                 if (const char *chunk_env = std::getenv("DS4_HIP_Q8_BATCH_SHARED_X_BLOCKS")) {
                     const unsigned v = (unsigned)std::strtoul(chunk_env, nullptr, 10);
@@ -6245,7 +5546,7 @@ extern "C" int ds4_metal_matmul_q8_0_tensor(
         }
     }
     const bool ok = ds4_hip_launch_ok("Q8_0 matmul launch");
-    ds4_hip_profile_end(prof, prof_start, prof_stop, "q8_matmul", in_dim, out_dim, n_tok);
+    ds4_hip_profile_end(prof, prof_start, prof_stop, profile_label, in_dim, out_dim, n_tok);
     return ok ? 1 : 0;
 }
 
@@ -6274,21 +5575,7 @@ extern "C" int ds4_metal_shared_gate_up_swiglu_q8_0_tensor(
     const bool store_gate_up = g_quality || std::getenv("DS4_METAL_GRAPH_DUMP_PREFIX") != nullptr;
     const unsigned warp_threads = ds4_hip_warp_threads();
     if (warp_threads == 32u && (in_dim & 31u) == 0u) {
-        if (std::getenv("DS4_HIP_SPLITK_SHARED_GATE_UP") != nullptr && in_dim == 4096u && out_dim <= UINT32_MAX) {
-            const uint32_t n_splits = 8u;
-            const unsigned rows_per_block = 32u;
-            float *partial = ds4_hip_q8_partial_scratch((uint64_t)2u * n_splits * out_dim);
-            if (!partial) return 0;
-            float *partial_g = partial;
-            float *partial_u = partial + (uint64_t)n_splits * out_dim;
-            ds4_hip_shared_gate_up_partial16_w32_kernel<<<dim3((unsigned)((out_dim + rows_per_block - 1u) / rows_per_block), n_splits),
-                                                          rows_per_block * 32u, 512u * sizeof(float), g_stream>>>(
-                    partial_g, partial_u, wg, wu, (const float *)x->ptr, out_dim, row_bytes);
-            if (ds4_hip_launch_ok("shared gate/up split-K partial launch")) {
-                ds4_hip_shared_gate_up_partial_sum8_kernel<<<(unsigned)((out_dim + 255u) / 256u), 256, 0, g_stream>>>(
-                        (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr, partial_g, partial_u, (uint32_t)out_dim, store_gate_up);
-            }
-        } else if (std::getenv("DS4_HIP_SHARED_GATE_UP_ROWS") != nullptr) {
+        if (std::getenv("DS4_HIP_SHARED_GATE_UP_ROWS") != nullptr) {
             const unsigned rows_per_block = 32u;
             ds4_hip_shared_gate_up_swiglu_q8_0_rows_w32_kernel<<<(unsigned)((out_dim + rows_per_block - 1u) / rows_per_block),
                                                                  rows_per_block * 32u, 0, g_stream>>>(
@@ -7326,16 +6613,11 @@ extern "C" int ds4_metal_attention_output_low_q8_tensor(
     hipEvent_t prof_start{}, prof_stop{};
     const bool prof = ds4_hip_profile_begin("DS4_HIP_ATTN_OUT_STAGE_PROFILE", &prof_start, &prof_stop);
     const unsigned warp_threads = ds4_hip_warp_threads();
-    const ds4_hip_repacked_q8_tensor *rwa = nullptr;
     const ds4_hip_repacked_q8_split16_tensor *swa = nullptr;
-    if (warp_threads == 32u && group_dim == 4096u && rank == 1024u && n_groups == 8u) {
-        if (std::getenv("DS4_HIP_Q8_REPACK_SPLIT16") != nullptr) {
-            swa = ds4_hip_q8_split16_repack_get(model_map, model_size, out_a_offset, group_dim, (uint64_t)n_groups * rank,
-                                                "attention output A Q8_0");
-        } else if (std::getenv("DS4_HIP_Q8_REPACK_SPLITK") != nullptr) {
-            rwa = ds4_hip_q8_repack_get(model_map, model_size, out_a_offset, group_dim, (uint64_t)n_groups * rank,
-                                        "attention output A Q8_0");
-        }
+    if (warp_threads == 32u && group_dim == 4096u && rank == 1024u && n_groups == 8u &&
+        std::getenv("DS4_HIP_Q8_REPACK_SPLIT16") != nullptr) {
+        swa = ds4_hip_q8_split16_repack_get(model_map, model_size, out_a_offset, group_dim, (uint64_t)n_groups * rank,
+                                            "attention output A Q8_0");
     }
     if (std::getenv("DS4_HIP_DISABLE_SPLITK_ATTN_OUT_LOW") == nullptr && warp_threads == 32u && group_dim == 4096u && rank == 1024u && n_groups == 8u) {
         const uint32_t n_splits = 8u;
@@ -7346,10 +6628,6 @@ extern "C" int ds4_metal_attention_output_low_q8_tensor(
             ds4_hip_q8_grouped_split16_partial_w32_kernel<<<dim3((unsigned)((low_elems + rows_per_block - 1u) / rows_per_block), n_splits),
                                                             rows_per_block * 32u, 512u * sizeof(float), g_stream>>>(
                     partial, swa->pack, (const float *)heads->ptr, n_groups, (uint32_t)rank);
-        } else if (rwa) {
-            ds4_hip_q8_grouped_repack_partial16_w32_kernel<<<dim3((unsigned)((low_elems + rows_per_block - 1u) / rows_per_block), n_splits),
-                                                             rows_per_block * 32u, 512u * sizeof(float), g_stream>>>(
-                    partial, rwa->q, rwa->scales, (const float *)heads->ptr, n_groups, (uint32_t)rank);
         } else {
             ds4_hip_q8_grouped_partial16_w32_kernel<<<dim3((unsigned)((low_elems + rows_per_block - 1u) / rows_per_block), n_splits),
                                                       rows_per_block * 32u, 512u * sizeof(float), g_stream>>>(
@@ -7599,7 +6877,7 @@ extern "C" int ds4_metal_routed_moe_batch_tensor(
         const uint32_t v = (uint32_t)std::strtoul(min_env, nullptr, 10);
         if (v >= 1u) expert_batch_min_tokens = v;
     }
-    const uint64_t expert_scratch_bytes = (256ull + 256ull * pair_stride + 1ull + 2ull * (pair_stride + 256ull)) * sizeof(int);
+    const uint64_t expert_scratch_bytes = (256ull + 256ull * pair_stride) * sizeof(int);
     const uint64_t experts_bytes = (uint64_t)n_tokens * 6u * out_dim * sizeof(float);
     const bool expert_batch = std::getenv("DS4_HIP_MOE_EXPERT_BATCH") != nullptr && n_tokens >= expert_batch_min_tokens &&
                               warp_threads == 32u && !store_gate_up && experts &&
@@ -7620,11 +6898,6 @@ extern "C" int ds4_metal_routed_moe_batch_tensor(
             return fallback;
         };
         unsigned pair_tile = parse_moe_pair_tile("DS4_HIP_MOE_EXPERT_TILE", 8u);
-        uint32_t split_threshold = 0u;
-        if (const char *split_env = std::getenv("DS4_HIP_MOE_EXPERT_SPLIT_THRESHOLD")) {
-            const unsigned long v = std::strtoul(split_env, nullptr, 10);
-            if (v > 1ul) split_threshold = (v > 0xfffffffful) ? 0xffffffffu : (uint32_t)v;
-        }
         const dim3 expert_gate_grid((unsigned)((expert_mid_dim + moe_gate_rows_per_block - 1u) / moe_gate_rows_per_block),
                                     routed_expert_count, 1u);
         const dim3 expert_down_grid((unsigned)((out_dim + moe_down_rows_per_block - 1u) / moe_down_rows_per_block),
@@ -7707,216 +6980,8 @@ extern "C" int ds4_metal_routed_moe_batch_tensor(
             ds4_hip_profile_end(prof, prof_start, prof_stop, label, expert_mid_dim, out_dim, n_tokens);
             return true;
         };
-        const bool tile_list = split_threshold <= 1u && std::getenv("DS4_HIP_MOE_EXPERT_TILE_LIST") != nullptr;
-        auto launch_tile_list_range = [&](const char *gate_label,
-                                          const char *down_label,
-                                          uint32_t min_count,
-                                          uint32_t max_count,
-                                          unsigned tile) -> bool {
-            const uint32_t tile_capacity = (pair_stride + tile - 1u) / tile + 256u;
-            int *tile_count = buckets + (uint64_t)routed_expert_count * pair_stride;
-            int *tile_experts = tile_count + 1u;
-            int *tile_p0 = tile_experts + tile_capacity;
-            if (!ds4_hip_check(hipMemsetAsync(tile_count, 0, sizeof(int), g_stream), "routed MoE tile-list memset")) return false;
-            ds4_hip_moe_make_tile_list_kernel<<<1, 256, 0, g_stream>>>(
-                    tile_count, tile_experts, tile_p0, counts, tile_capacity, tile, min_count, max_count);
-            if (!ds4_hip_launch_ok("routed MoE tile-list build launch")) return false;
-            const dim3 tile_gate_grid((unsigned)((expert_mid_dim + moe_gate_rows_per_block - 1u) / moe_gate_rows_per_block),
-                                      tile_capacity, 1u);
-            const dim3 tile_down_grid((unsigned)((out_dim + moe_down_rows_per_block - 1u) / moe_down_rows_per_block),
-                                      tile_capacity, 1u);
-            hipEvent_t prof_start{}, prof_stop{};
-            bool prof = ds4_hip_profile_begin("DS4_HIP_MOE_PROFILE", &prof_start, &prof_stop);
-            const size_t gate_shmem = moe_shared_x ? (size_t)tile * 256u * sizeof(float) : 0u;
-            if (moe_shared_x) {
-                if (tile == 4u) {
-                    ds4_hip_moe_q2_gate_up_tile_list_sharedx_kernel<4><<<tile_gate_grid, moe_gate_threads, gate_shmem, g_stream>>>(
-                            (float *)mid->ptr, gw, uw, (const float *)x->ptr, (const float *)weights->ptr,
-                            counts, buckets, tile_count, tile_experts, tile_p0, pair_stride,
-                            expert_in_dim, expert_mid_dim, gate_expert_bytes, gate_row_bytes,
-                            gate_expert_bytes, gate_row_bytes, clamp);
-                } else if (tile == 16u) {
-                    ds4_hip_moe_q2_gate_up_tile_list_sharedx_kernel<16><<<tile_gate_grid, moe_gate_threads, gate_shmem, g_stream>>>(
-                            (float *)mid->ptr, gw, uw, (const float *)x->ptr, (const float *)weights->ptr,
-                            counts, buckets, tile_count, tile_experts, tile_p0, pair_stride,
-                            expert_in_dim, expert_mid_dim, gate_expert_bytes, gate_row_bytes,
-                            gate_expert_bytes, gate_row_bytes, clamp);
-                } else {
-                    ds4_hip_moe_q2_gate_up_tile_list_sharedx_kernel<8><<<tile_gate_grid, moe_gate_threads, gate_shmem, g_stream>>>(
-                            (float *)mid->ptr, gw, uw, (const float *)x->ptr, (const float *)weights->ptr,
-                            counts, buckets, tile_count, tile_experts, tile_p0, pair_stride,
-                            expert_in_dim, expert_mid_dim, gate_expert_bytes, gate_row_bytes,
-                            gate_expert_bytes, gate_row_bytes, clamp);
-                }
-            } else if (tile == 4u) {
-                ds4_hip_moe_q2_gate_up_tile_list_kernel<4><<<tile_gate_grid, moe_gate_threads, 0, g_stream>>>(
-                        (float *)mid->ptr, gw, uw, (const float *)x->ptr, (const float *)weights->ptr,
-                        counts, buckets, tile_count, tile_experts, tile_p0, pair_stride,
-                        expert_in_dim, expert_mid_dim, gate_expert_bytes, gate_row_bytes,
-                        gate_expert_bytes, gate_row_bytes, clamp);
-            } else if (tile == 16u) {
-                ds4_hip_moe_q2_gate_up_tile_list_kernel<16><<<tile_gate_grid, moe_gate_threads, 0, g_stream>>>(
-                        (float *)mid->ptr, gw, uw, (const float *)x->ptr, (const float *)weights->ptr,
-                        counts, buckets, tile_count, tile_experts, tile_p0, pair_stride,
-                        expert_in_dim, expert_mid_dim, gate_expert_bytes, gate_row_bytes,
-                        gate_expert_bytes, gate_row_bytes, clamp);
-            } else {
-                ds4_hip_moe_q2_gate_up_tile_list_kernel<8><<<tile_gate_grid, moe_gate_threads, 0, g_stream>>>(
-                        (float *)mid->ptr, gw, uw, (const float *)x->ptr, (const float *)weights->ptr,
-                        counts, buckets, tile_count, tile_experts, tile_p0, pair_stride,
-                        expert_in_dim, expert_mid_dim, gate_expert_bytes, gate_row_bytes,
-                        gate_expert_bytes, gate_row_bytes, clamp);
-            }
-            if (!ds4_hip_launch_ok("routed MoE Q2_K tile-list gate/up launch")) return false;
-            ds4_hip_profile_end(prof, prof_start, prof_stop, gate_label, expert_in_dim, expert_mid_dim, n_tokens);
-            prof = ds4_hip_profile_begin("DS4_HIP_MOE_PROFILE", &prof_start, &prof_stop);
-            const size_t down_shmem = moe_shared_mid ? (size_t)tile * 256u * sizeof(float) : 0u;
-            if (moe_shared_mid) {
-                if (tile == 4u) {
-                    ds4_hip_moe_q2_down_tile_list_sharedmid_kernel<4><<<tile_down_grid, moe_down_threads, down_shmem, g_stream>>>(
-                            (float *)experts->ptr, dw, (const float *)mid->ptr, counts, buckets,
-                            tile_count, tile_experts, tile_p0, pair_stride, expert_mid_dim, out_dim,
-                            down_expert_bytes, down_row_bytes);
-                } else if (tile == 16u) {
-                    ds4_hip_moe_q2_down_tile_list_sharedmid_kernel<16><<<tile_down_grid, moe_down_threads, down_shmem, g_stream>>>(
-                            (float *)experts->ptr, dw, (const float *)mid->ptr, counts, buckets,
-                            tile_count, tile_experts, tile_p0, pair_stride, expert_mid_dim, out_dim,
-                            down_expert_bytes, down_row_bytes);
-                } else {
-                    ds4_hip_moe_q2_down_tile_list_sharedmid_kernel<8><<<tile_down_grid, moe_down_threads, down_shmem, g_stream>>>(
-                            (float *)experts->ptr, dw, (const float *)mid->ptr, counts, buckets,
-                            tile_count, tile_experts, tile_p0, pair_stride, expert_mid_dim, out_dim,
-                            down_expert_bytes, down_row_bytes);
-                }
-            } else if (tile == 4u) {
-                ds4_hip_moe_q2_down_tile_list_kernel<4><<<tile_down_grid, moe_down_threads, 0, g_stream>>>(
-                        (float *)experts->ptr, dw, (const float *)mid->ptr, counts, buckets,
-                        tile_count, tile_experts, tile_p0, pair_stride, expert_mid_dim, out_dim,
-                        down_expert_bytes, down_row_bytes);
-            } else if (tile == 16u) {
-                ds4_hip_moe_q2_down_tile_list_kernel<16><<<tile_down_grid, moe_down_threads, 0, g_stream>>>(
-                        (float *)experts->ptr, dw, (const float *)mid->ptr, counts, buckets,
-                        tile_count, tile_experts, tile_p0, pair_stride, expert_mid_dim, out_dim,
-                        down_expert_bytes, down_row_bytes);
-            } else {
-                ds4_hip_moe_q2_down_tile_list_kernel<8><<<tile_down_grid, moe_down_threads, 0, g_stream>>>(
-                        (float *)experts->ptr, dw, (const float *)mid->ptr, counts, buckets,
-                        tile_count, tile_experts, tile_p0, pair_stride, expert_mid_dim, out_dim,
-                        down_expert_bytes, down_row_bytes);
-            }
-            if (!ds4_hip_launch_ok("routed MoE Q2_K tile-list down launch")) return false;
-            ds4_hip_profile_end(prof, prof_start, prof_stop, down_label, expert_mid_dim, out_dim, n_tokens);
-            return true;
-        };
-        auto launch_down_tile_list_range = [&](const char *down_label,
-                                               uint32_t min_count,
-                                               uint32_t max_count,
-                                               unsigned tile) -> bool {
-            const uint32_t tile_capacity = (pair_stride + tile - 1u) / tile + 256u;
-            int *tile_count = buckets + (uint64_t)routed_expert_count * pair_stride;
-            int *tile_experts = tile_count + 1u;
-            int *tile_p0 = tile_experts + tile_capacity;
-            if (!ds4_hip_check(hipMemsetAsync(tile_count, 0, sizeof(int), g_stream), "routed MoE tile-list memset")) return false;
-            ds4_hip_moe_make_tile_list_kernel<<<1, 256, 0, g_stream>>>(
-                    tile_count, tile_experts, tile_p0, counts, tile_capacity, tile, min_count, max_count);
-            if (!ds4_hip_launch_ok("routed MoE tile-list build launch")) return false;
-            const dim3 tile_down_grid((unsigned)((out_dim + moe_down_rows_per_block - 1u) / moe_down_rows_per_block),
-                                      tile_capacity, 1u);
-            hipEvent_t prof_start{}, prof_stop{};
-            const bool prof = ds4_hip_profile_begin("DS4_HIP_MOE_PROFILE", &prof_start, &prof_stop);
-            const size_t down_shmem = moe_shared_mid ? (size_t)tile * 256u * sizeof(float) : 0u;
-            if (moe_shared_mid) {
-                if (tile == 4u) {
-                    ds4_hip_moe_q2_down_tile_list_sharedmid_kernel<4><<<tile_down_grid, moe_down_threads, down_shmem, g_stream>>>(
-                            (float *)experts->ptr, dw, (const float *)mid->ptr, counts, buckets,
-                            tile_count, tile_experts, tile_p0, pair_stride, expert_mid_dim, out_dim,
-                            down_expert_bytes, down_row_bytes);
-                } else if (tile == 16u) {
-                    ds4_hip_moe_q2_down_tile_list_sharedmid_kernel<16><<<tile_down_grid, moe_down_threads, down_shmem, g_stream>>>(
-                            (float *)experts->ptr, dw, (const float *)mid->ptr, counts, buckets,
-                            tile_count, tile_experts, tile_p0, pair_stride, expert_mid_dim, out_dim,
-                            down_expert_bytes, down_row_bytes);
-                } else {
-                    ds4_hip_moe_q2_down_tile_list_sharedmid_kernel<8><<<tile_down_grid, moe_down_threads, down_shmem, g_stream>>>(
-                            (float *)experts->ptr, dw, (const float *)mid->ptr, counts, buckets,
-                            tile_count, tile_experts, tile_p0, pair_stride, expert_mid_dim, out_dim,
-                            down_expert_bytes, down_row_bytes);
-                }
-            } else if (tile == 4u) {
-                ds4_hip_moe_q2_down_tile_list_kernel<4><<<tile_down_grid, moe_down_threads, 0, g_stream>>>(
-                        (float *)experts->ptr, dw, (const float *)mid->ptr, counts, buckets,
-                        tile_count, tile_experts, tile_p0, pair_stride, expert_mid_dim, out_dim,
-                        down_expert_bytes, down_row_bytes);
-            } else if (tile == 16u) {
-                ds4_hip_moe_q2_down_tile_list_kernel<16><<<tile_down_grid, moe_down_threads, 0, g_stream>>>(
-                        (float *)experts->ptr, dw, (const float *)mid->ptr, counts, buckets,
-                        tile_count, tile_experts, tile_p0, pair_stride, expert_mid_dim, out_dim,
-                        down_expert_bytes, down_row_bytes);
-            } else {
-                ds4_hip_moe_q2_down_tile_list_kernel<8><<<tile_down_grid, moe_down_threads, 0, g_stream>>>(
-                        (float *)experts->ptr, dw, (const float *)mid->ptr, counts, buckets,
-                        tile_count, tile_experts, tile_p0, pair_stride, expert_mid_dim, out_dim,
-                        down_expert_bytes, down_row_bytes);
-            }
-            if (!ds4_hip_launch_ok("routed MoE Q2_K tile-list down launch")) return false;
-            ds4_hip_profile_end(prof, prof_start, prof_stop, down_label, expert_mid_dim, out_dim, n_tokens);
-            return true;
-        };
-        if (tile_list) {
-            uint32_t tile_list_threshold = 1u;
-            if (const char *thr_env = std::getenv("DS4_HIP_MOE_EXPERT_TILE_LIST_THRESHOLD")) {
-                const unsigned long v = std::strtoul(thr_env, nullptr, 10);
-                if (v > 1ul) tile_list_threshold = (v > 0xfffffffful) ? 0xffffffffu : (uint32_t)v;
-            }
-            const unsigned small_tile = parse_moe_pair_tile("DS4_HIP_MOE_EXPERT_TILE_SMALL", pair_tile);
-            const unsigned big_tile = parse_moe_pair_tile("DS4_HIP_MOE_EXPERT_TILE_BIG", pair_tile);
-            if (std::getenv("DS4_HIP_MOE_EXPERT_TILE_LIST_DOWN_ONLY") != nullptr) {
-                if (!launch_gate_range("moe_q2_gate_up_expert", 1u, 0u, pair_tile)) return 0;
-                if (tile_list_threshold > 1u) {
-                    char down_small[80], down_big[80];
-                    std::snprintf(down_small, sizeof(down_small), "moe_q2_down_expert_lt%u_t%u", tile_list_threshold, small_tile);
-                    std::snprintf(down_big, sizeof(down_big), "moe_q2_down_tile_list_ge%u_t%u", tile_list_threshold, big_tile);
-                    if (!launch_down_range(down_small, 1u, tile_list_threshold, small_tile)) return 0;
-                    if (!launch_down_tile_list_range(down_big, tile_list_threshold, 0u, big_tile)) return 0;
-                } else {
-                    if (!launch_down_tile_list_range("moe_q2_down_tile_list", 1u, 0u, pair_tile)) return 0;
-                }
-                ds4_hip_moe_experts_reduce_kernel<<<(unsigned)(((uint64_t)n_tokens * out_dim + 255u) / 256u), 256, 0, g_stream>>>(
-                        (float *)out->ptr, (const float *)experts->ptr, n_tokens, out_dim);
-                return ds4_hip_launch_ok("routed MoE expert reduce launch") ? 1 : 0;
-            }
-            if (tile_list_threshold > 1u) {
-                char gate_small[80], down_small[80], gate_big[80], down_big[80];
-                std::snprintf(gate_small, sizeof(gate_small), "moe_q2_gate_up_expert_lt%u_t%u", tile_list_threshold, small_tile);
-                std::snprintf(down_small, sizeof(down_small), "moe_q2_down_expert_lt%u_t%u", tile_list_threshold, small_tile);
-                std::snprintf(gate_big, sizeof(gate_big), "moe_q2_gate_up_tile_list_ge%u_t%u", tile_list_threshold, big_tile);
-                std::snprintf(down_big, sizeof(down_big), "moe_q2_down_tile_list_ge%u_t%u", tile_list_threshold, big_tile);
-                if (!launch_gate_range(gate_small, 1u, tile_list_threshold, small_tile)) return 0;
-                if (!launch_tile_list_range(gate_big, down_big, tile_list_threshold, 0u, big_tile)) return 0;
-                if (!launch_down_range(down_small, 1u, tile_list_threshold, small_tile)) return 0;
-            } else {
-                if (!launch_tile_list_range("moe_q2_gate_up_tile_list", "moe_q2_down_tile_list", 1u, 0u, pair_tile)) return 0;
-            }
-            ds4_hip_moe_experts_reduce_kernel<<<(unsigned)(((uint64_t)n_tokens * out_dim + 255u) / 256u), 256, 0, g_stream>>>(
-                    (float *)out->ptr, (const float *)experts->ptr, n_tokens, out_dim);
-            return ds4_hip_launch_ok("routed MoE expert reduce launch") ? 1 : 0;
-        }
-        if (split_threshold > 1u) {
-            const unsigned small_tile = parse_moe_pair_tile("DS4_HIP_MOE_EXPERT_TILE_SMALL", pair_tile);
-            const unsigned big_tile = parse_moe_pair_tile("DS4_HIP_MOE_EXPERT_TILE_BIG", pair_tile);
-            char gate_lt[64], gate_ge[64], down_lt[64], down_ge[64];
-            std::snprintf(gate_lt, sizeof(gate_lt), "moe_q2_gate_up_expert_lt%u_t%u", split_threshold, small_tile);
-            std::snprintf(gate_ge, sizeof(gate_ge), "moe_q2_gate_up_expert_ge%u_t%u", split_threshold, big_tile);
-            std::snprintf(down_lt, sizeof(down_lt), "moe_q2_down_expert_lt%u_t%u", split_threshold, small_tile);
-            std::snprintf(down_ge, sizeof(down_ge), "moe_q2_down_expert_ge%u_t%u", split_threshold, big_tile);
-            if (!launch_gate_range(gate_lt, 1u, split_threshold, small_tile)) return 0;
-            if (!launch_gate_range(gate_ge, split_threshold, 0u, big_tile)) return 0;
-            if (!launch_down_range(down_lt, 1u, split_threshold, small_tile)) return 0;
-            if (!launch_down_range(down_ge, split_threshold, 0u, big_tile)) return 0;
-        } else {
-            if (!launch_gate_range("moe_q2_gate_up_expert", 1u, 0u, pair_tile)) return 0;
-            if (!launch_down_range("moe_q2_down_expert", 1u, 0u, pair_tile)) return 0;
-        }
+        if (!launch_gate_range("moe_q2_gate_up_expert", 1u, 0u, pair_tile)) return 0;
+        if (!launch_down_range("moe_q2_down_expert", 1u, 0u, pair_tile)) return 0;
         ds4_hip_moe_experts_reduce_kernel<<<(unsigned)(((uint64_t)n_tokens * out_dim + 255u) / 256u), 256, 0, g_stream>>>(
                 (float *)out->ptr, (const float *)experts->ptr, n_tokens, out_dim);
         const bool ok = ds4_hip_launch_ok("routed MoE expert reduce launch");
@@ -8193,14 +7258,10 @@ extern "C" int ds4_metal_shared_down_hc_expand_q8_0_tensor(
             const uint64_t weight_bytes = out_dim * row_bytes;
             const unsigned char *w = ds4_hip_model_ptr(model_map, model_size, weight_offset, weight_bytes, "shared down HC Q8_0");
             if (!w) return 0;
-            const ds4_hip_repacked_q8_tensor *rw = nullptr;
             const ds4_hip_repacked_q8_split16_tensor *sw = nullptr;
             if (std::getenv("DS4_HIP_Q8_REPACK_SPLIT16") != nullptr) {
                 sw = ds4_hip_q8_split16_repack_get(model_map, model_size, weight_offset, in_dim, out_dim,
                                                    "shared down HC Q8_0");
-            } else if (std::getenv("DS4_HIP_Q8_REPACK_SPLITK") != nullptr) {
-                rw = ds4_hip_q8_repack_get(model_map, model_size, weight_offset, in_dim, out_dim,
-                                           "shared down HC Q8_0");
             }
             const unsigned rows_per_block = 32u;
             const bool store_block = g_quality || std::getenv("DS4_METAL_GRAPH_DUMP_PREFIX") != nullptr;
@@ -8215,10 +7276,6 @@ extern "C" int ds4_metal_shared_down_hc_expand_q8_0_tensor(
                     ds4_hip_q8_split16_partial_w32_kernel<<<dim3((unsigned)((out_dim + rows_per_block - 1u) / rows_per_block), n_splits),
                                                             rows_per_block * 32u, 512u * sizeof(float), g_stream>>>(
                             partial, sw->pack, (const float *)shared_mid->ptr, (uint32_t)out_dim);
-                } else if (rw) {
-                    ds4_hip_matmul_q8_repack_hc_partial16_w32_kernel<<<dim3((unsigned)((out_dim + rows_per_block - 1u) / rows_per_block), n_splits),
-                                                                        rows_per_block * 32u, 512u * sizeof(float), g_stream>>>(
-                            partial, rw->q, rw->scales, (const float *)shared_mid->ptr, (uint32_t)out_dim);
                 } else {
                     ds4_hip_matmul_q8_0_hc_partial16_w32_kernel<<<dim3((unsigned)((out_dim + rows_per_block - 1u) / rows_per_block), n_splits),
                                                                    rows_per_block * 32u, 512u * sizeof(float), g_stream>>>(
@@ -8273,14 +7330,10 @@ extern "C" int ds4_metal_matmul_q8_0_hc_expand_tensor(
             const uint64_t weight_bytes = out_dim * row_bytes;
             const unsigned char *w = ds4_hip_model_ptr(model_map, model_size, weight_offset, weight_bytes, "Q8_0 HC expand matmul");
             if (!w) return 0;
-            const ds4_hip_repacked_q8_tensor *rw = nullptr;
             const ds4_hip_repacked_q8_split16_tensor *sw = nullptr;
             if (std::getenv("DS4_HIP_Q8_REPACK_SPLIT16") != nullptr) {
                 sw = ds4_hip_q8_split16_repack_get(model_map, model_size, weight_offset, in_dim, out_dim,
                                                    "Q8_0 HC expand matmul");
-            } else if (std::getenv("DS4_HIP_Q8_REPACK_SPLITK") != nullptr) {
-                rw = ds4_hip_q8_repack_get(model_map, model_size, weight_offset, in_dim, out_dim,
-                                           "Q8_0 HC expand matmul");
             }
             const bool use_splitk_attn_out_b = std::getenv("DS4_HIP_DISABLE_SPLITK_ATTN_OUT_B") == nullptr && in_dim == 8192u && out_dim == 4096u && n_hc == 4u;
             const unsigned rows_per_block = (std::getenv("DS4_HIP_ATTN_B_RPB16") != nullptr && use_splitk_attn_out_b) ? 16u : 32u;
@@ -8296,10 +7349,6 @@ extern "C" int ds4_metal_matmul_q8_0_hc_expand_tensor(
                     ds4_hip_q8_split16_partial_w32_kernel<<<dim3((unsigned)((out_dim + rows_per_block - 1u) / rows_per_block), n_splits),
                                                             rows_per_block * 32u, 512u * sizeof(float), g_stream>>>(
                             partial, sw->pack, (const float *)x->ptr, (uint32_t)out_dim);
-                } else if (rw) {
-                    ds4_hip_matmul_q8_repack_hc_partial16_w32_kernel<<<dim3((unsigned)((out_dim + rows_per_block - 1u) / rows_per_block), n_splits),
-                                                                        rows_per_block * 32u, 512u * sizeof(float), g_stream>>>(
-                            partial, rw->q, rw->scales, (const float *)x->ptr, (uint32_t)out_dim);
                 } else {
                     ds4_hip_matmul_q8_0_hc_partial16_w32_kernel<<<dim3((unsigned)((out_dim + rows_per_block - 1u) / rows_per_block), n_splits),
                                                                    rows_per_block * 32u, 512u * sizeof(float), g_stream>>>(

@@ -26,6 +26,7 @@ Environment:
   DS4_SERVER_LOG=/tmp/ds4-server.log
   DS4_SERVER_PID=/tmp/ds4-server.pid
   DS4_SERVER_TRACE=FILE           Optional trace file
+  DS4_SERVER_FAST_FULL=1          Max-performance preset: device tensors, staged full-copy, best prefill+decode flags
   DS4_SERVER_PREFILL_HEARTBEAT_SEC=2  Prefill heartbeat interval; 0 disables
   DS4_SERVER_PREFILL_CHUNK=N      Set prefill chunk/allocation cap
   DS4_SERVER_DECODE_PREFILL=1     Safest prompt path: prefill via decode kernels
@@ -38,20 +39,13 @@ Environment:
   DS4_SERVER_Q8_BATCH_SHARED_X=1 Experimental LDS shared-X batched Q8 prefill kernel
   DS4_SERVER_Q8_BATCH_SHARED_X_BLOCKS=16  K-block chunk for Q8 shared-X batch, 8|16|32
   DS4_SERVER_Q8_REPACK=1         Opt-in eager q_b Q8_0 repack for decode; uses ~1.43 GiB VRAM
-  DS4_SERVER_Q8_REPACK_BATCH=1   Experimental use of q_b Q8 repack in batched prefill; currently slower
-  DS4_SERVER_Q8_REPACK_BATCH_ALL=1  Also try non-q_b matching shapes in batched prefill; currently slower
   DS4_SERVER_Q8_REPACK_SPLIT16=1 Opt-in split-major Q8_0 repack for attn_output/shared-down; uses ~3.2 GiB VRAM
-  DS4_SERVER_Q8_REPACK_SPLIT16_BATCH=1 Experimental split16 layout in batched prefill; currently flat/slower
-  DS4_SERVER_Q8_REPACK_SPLITK=1  Older experimental separate-scale split-K Q8 path; currently not default
   DS4_SERVER_MOE_EXPERT_BATCH=1  Experimental expert-bucketed Q2_K MoE for faster prefill
   DS4_SERVER_MOE_EXPERT_TILE=4|8|16  Pair tile for expert-bucketed Q2_K MoE; default 8
   DS4_SERVER_MOE_GATE_RPB=N      Rows/block for expert-bucketed gate/up; e.g. 16 with shared-x experiment
   DS4_SERVER_MOE_DOWN_RPB=N      Rows/block for expert-bucketed down; e.g. 16 with shared-mid experiment
   DS4_SERVER_MOE_EXPERT_SHARED_X=1    Experimental LDS x tile reuse for gate/up; use with GATE_RPB>1
   DS4_SERVER_MOE_EXPERT_SHARED_MID=1  Experimental LDS mid tile reuse for down; use with DOWN_RPB>1
-  DS4_SERVER_MOE_EXPERT_TILE_LIST=1  Experimental tile-list Q2_K MoE scheduling for skewed prefill buckets
-  DS4_SERVER_MOE_EXPERT_TILE_LIST_THRESHOLD=N  Hybrid mode: tile-list buckets >=N, scalar expert-batch below
-  DS4_SERVER_MOE_EXPERT_TILE_LIST_DOWN_ONLY=1  Experimental tile-list only for down path
   DS4_SERVER_COPY_MODEL=1        Copy GGUF tensor payload to HIP allocation using staged chunks
   DS4_SERVER_COPY_MODEL_CHUNK_MB=256  Staged full-copy chunk size
   DS4_SESSION_PROGRESS_RAW_MAX_TOKENS=512  Use cancellable layer-by-layer prefill above this
@@ -84,6 +78,27 @@ KV_ALIGN="${DS4_SERVER_KV_ALIGN_TOKENS:-512}"
 LOG="${DS4_SERVER_LOG:-/tmp/ds4-server.log}"
 PIDFILE="${DS4_SERVER_PID:-/tmp/ds4-server.pid}"
 TRACE="${DS4_SERVER_TRACE:-}"
+
+# One-command max-performance profile.  Individual env vars may still be set
+# by the caller before this script to override these defaults.
+if [[ "${DS4_SERVER_FAST_FULL:-0}" == "1" ]]; then
+  export DS4_SERVER_DEVICE_TENSORS="${DS4_SERVER_DEVICE_TENSORS:-1}"
+  export DS4_SERVER_COPY_MODEL="${DS4_SERVER_COPY_MODEL:-1}"
+  export DS4_SERVER_COPY_MODEL_CHUNK_MB="${DS4_SERVER_COPY_MODEL_CHUNK_MB:-1024}"
+  export DS4_SERVER_PREFILL_RAW_FAST="${DS4_SERVER_PREFILL_RAW_FAST:-1}"
+  export DS4_SERVER_PREFILL_MIXED_FAST="${DS4_SERVER_PREFILL_MIXED_FAST:-1}"
+  export DS4_SERVER_Q8_BATCH_FAST="${DS4_SERVER_Q8_BATCH_FAST:-1}"
+  export DS4_SERVER_Q8_BATCH_SHARED_X="${DS4_SERVER_Q8_BATCH_SHARED_X:-1}"
+  export DS4_SERVER_Q8_BATCH_RPB="${DS4_SERVER_Q8_BATCH_RPB:-32}"
+  export DS4_SERVER_Q8_BATCH_SHARED_X_BLOCKS="${DS4_SERVER_Q8_BATCH_SHARED_X_BLOCKS:-16}"
+  export DS4_SERVER_MOE_EXPERT_BATCH="${DS4_SERVER_MOE_EXPERT_BATCH:-1}"
+  export DS4_SERVER_MOE_GATE_RPB="${DS4_SERVER_MOE_GATE_RPB:-16}"
+  export DS4_SERVER_MOE_DOWN_RPB="${DS4_SERVER_MOE_DOWN_RPB:-16}"
+  export DS4_SERVER_MOE_EXPERT_SHARED_X="${DS4_SERVER_MOE_EXPERT_SHARED_X:-1}"
+  export DS4_SERVER_MOE_EXPERT_SHARED_MID="${DS4_SERVER_MOE_EXPERT_SHARED_MID:-1}"
+  export DS4_SERVER_Q8_REPACK="${DS4_SERVER_Q8_REPACK:-1}"
+  export DS4_SERVER_Q8_REPACK_SPLIT16="${DS4_SERVER_Q8_REPACK_SPLIT16:-1}"
+fi
 
 if [[ ! -f "$MODEL" ]]; then
   echo "ds4-server: model not found: $MODEL" >&2
@@ -190,25 +205,8 @@ fi
 if [[ "${DS4_SERVER_Q8_REPACK:-0}" == "1" ]]; then
   export DS4_HIP_Q8_REPACK=1
 fi
-if [[ "${DS4_SERVER_Q8_REPACK_BATCH:-0}" == "1" ]]; then
-  export DS4_HIP_Q8_REPACK=1
-  export DS4_HIP_Q8_REPACK_BATCH=1
-fi
-if [[ "${DS4_SERVER_Q8_REPACK_BATCH_ALL:-0}" == "1" ]]; then
-  export DS4_HIP_Q8_REPACK=1
-  export DS4_HIP_Q8_REPACK_BATCH=1
-  export DS4_HIP_Q8_REPACK_BATCH_ALL=1
-fi
 if [[ "${DS4_SERVER_Q8_REPACK_SPLIT16:-0}" == "1" ]]; then
   export DS4_HIP_Q8_REPACK_SPLIT16=1
-fi
-if [[ "${DS4_SERVER_Q8_REPACK_SPLIT16_BATCH:-0}" == "1" ]]; then
-  export DS4_HIP_Q8_REPACK_SPLIT16=1
-  export DS4_HIP_Q8_REPACK_SPLIT16_BATCH=1
-fi
-if [[ "${DS4_SERVER_Q8_REPACK_SPLITK:-0}" == "1" ]]; then
-  export DS4_HIP_Q8_REPACK=1
-  export DS4_HIP_Q8_REPACK_SPLITK=1
 fi
 if [[ "${DS4_SERVER_MOE_EXPERT_BATCH:-0}" == "1" ]]; then
   export DS4_HIP_MOE_EXPERT_BATCH=1
@@ -227,23 +225,6 @@ if [[ "${DS4_SERVER_MOE_EXPERT_SHARED_X:-0}" == "1" ]]; then
 fi
 if [[ "${DS4_SERVER_MOE_EXPERT_SHARED_MID:-0}" == "1" ]]; then
   export DS4_HIP_MOE_EXPERT_SHARED_MID=1
-fi
-if [[ "${DS4_SERVER_MOE_EXPERT_TILE_LIST:-0}" == "1" ]]; then
-  export DS4_HIP_MOE_EXPERT_TILE_LIST=1
-fi
-if [[ -n "${DS4_SERVER_MOE_EXPERT_TILE_LIST_THRESHOLD:-}" ]]; then
-  export DS4_HIP_MOE_EXPERT_TILE_LIST=1
-  export DS4_HIP_MOE_EXPERT_TILE_LIST_THRESHOLD="$DS4_SERVER_MOE_EXPERT_TILE_LIST_THRESHOLD"
-fi
-if [[ "${DS4_SERVER_MOE_EXPERT_TILE_LIST_DOWN_ONLY:-0}" == "1" ]]; then
-  export DS4_HIP_MOE_EXPERT_TILE_LIST=1
-  export DS4_HIP_MOE_EXPERT_TILE_LIST_DOWN_ONLY=1
-fi
-if [[ -n "${DS4_SERVER_MOE_EXPERT_TILE_SMALL:-}" ]]; then
-  export DS4_HIP_MOE_EXPERT_TILE_SMALL="$DS4_SERVER_MOE_EXPERT_TILE_SMALL"
-fi
-if [[ -n "${DS4_SERVER_MOE_EXPERT_TILE_BIG:-}" ]]; then
-  export DS4_HIP_MOE_EXPERT_TILE_BIG="$DS4_SERVER_MOE_EXPERT_TILE_BIG"
 fi
 if [[ "${DS4_SERVER_COPY_MODEL:-0}" == "1" ]]; then
   export DS4_HIP_COPY_MODEL=1
