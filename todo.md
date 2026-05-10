@@ -319,10 +319,17 @@ Immediate targets:
   - `attn_q_b`-like `1024 -> 32768`: current ~9.35 ms, packed multi-N WMMA ~4.00 ms, ~2.34x
   - `attn_q_a`-like `4096 -> 1024`: current ~0.75 ms, packed multi-N WMMA ~0.35 ms, ~2.16x
   - rel RMS vs current FP32 path is ~2.9e-4.
+- [x] Integrate packed multi-N WMMA for prefill behind `DS4_HIP_Q8_WMMA_FAST=1`:
+  - engine-side eager Q8 FP16 `KxN` repack for hot tensors: `attn_output_a`, `attn_output_b`, `attn_q_a`, `attn_q_b`
+  - production path ports only the winning packed multi-N WMMA kernel; direct and single-N loser variants remain microbench-only
+  - current shared-X path remains fallback for decode, unsupported shapes, and when the flag is off.
+- [x] Replace slow host repack with GPU repack kernel:
+  - zero-copy Q8 WMMA repack now builds 193 tensors / 8.73 GiB in about 1.8-2.4 s
+  - full-copy + decode repacks + Q8 WMMA repack builds q_b/split16/wmma in about 4.8-9.0 s.
 - [ ] Next dense Q8 step:
-  - design engine-side Q8 WMMA repack metadata/layout for hot tensors
-  - integrate packed multi-N WMMA for prefill first, behind `DS4_HIP_Q8_WMMA_FAST=1`
-  - keep current shared-X path as fallback.
+  - graph/profile per-stage savings with `DS4_HIP_Q8_MATMUL_PROFILE=1`
+  - tune packed multi-N tile count/VGPR occupancy if profiling shows headroom
+  - validate longer generations and server stability.
 - [ ] Keep one small profile loop around current decode/prefill to measure real graph savings:
   - dense MLA/projection Q8_0 matmuls
   - routed Q2_K MoE kernels

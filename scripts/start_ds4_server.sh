@@ -40,6 +40,7 @@ Environment:
   DS4_SERVER_Q8_BATCH_SHARED_X_BLOCKS=16  K-block chunk for Q8 shared-X batch, 8|16|32
   DS4_SERVER_Q8_REPACK=1         Opt-in eager q_b Q8_0 repack for decode; uses ~1.43 GiB VRAM
   DS4_SERVER_Q8_REPACK_SPLIT16=1 Opt-in split-major Q8_0 repack for attn_output/shared-down; uses ~3.2 GiB VRAM
+  DS4_SERVER_Q8_WMMA_FAST=1      Opt-in eager FP16 Q8 WMMA repack for hot prefill projections; uses ~8.7 GiB VRAM
   DS4_SERVER_MOE_EXPERT_BATCH=1  Experimental expert-bucketed Q2_K MoE for faster prefill
   DS4_SERVER_MOE_EXPERT_TILE=4|8|16  Pair tile for expert-bucketed Q2_K MoE; default 8
   DS4_SERVER_MOE_GATE_RPB=N      Rows/block for expert-bucketed gate/up; e.g. 16 with shared-x experiment
@@ -91,6 +92,7 @@ if [[ "${DS4_SERVER_FAST_FULL:-0}" == "1" ]]; then
   export DS4_SERVER_Q8_BATCH_SHARED_X="${DS4_SERVER_Q8_BATCH_SHARED_X:-1}"
   export DS4_SERVER_Q8_BATCH_RPB="${DS4_SERVER_Q8_BATCH_RPB:-32}"
   export DS4_SERVER_Q8_BATCH_SHARED_X_BLOCKS="${DS4_SERVER_Q8_BATCH_SHARED_X_BLOCKS:-16}"
+  export DS4_SERVER_Q8_WMMA_FAST="${DS4_SERVER_Q8_WMMA_FAST:-1}"
   export DS4_SERVER_MOE_EXPERT_BATCH="${DS4_SERVER_MOE_EXPERT_BATCH:-1}"
   export DS4_SERVER_MOE_GATE_RPB="${DS4_SERVER_MOE_GATE_RPB:-16}"
   export DS4_SERVER_MOE_DOWN_RPB="${DS4_SERVER_MOE_DOWN_RPB:-16}"
@@ -207,6 +209,9 @@ if [[ "${DS4_SERVER_Q8_REPACK:-0}" == "1" ]]; then
 fi
 if [[ "${DS4_SERVER_Q8_REPACK_SPLIT16:-0}" == "1" ]]; then
   export DS4_HIP_Q8_REPACK_SPLIT16=1
+fi
+if [[ "${DS4_SERVER_Q8_WMMA_FAST:-0}" == "1" ]]; then
+  export DS4_HIP_Q8_WMMA_FAST=1
 fi
 if [[ "${DS4_SERVER_MOE_EXPERT_BATCH:-0}" == "1" ]]; then
   export DS4_HIP_MOE_EXPERT_BATCH=1

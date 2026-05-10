@@ -112,22 +112,24 @@ The HIP backend is optimized for the CyberNeurova DeepSeek V4 Flash Q2_K GGUF
 on AMD ROCm. The current tested GPU is an AMD Radeon 8060S (`gfx1151`, wave32,
 124 GiB unified/global memory). Numbers below use the max-performance/full-copy
 profile: device tensors, staged full model copy, fast prefill attention, Q8
-shared-X batched prefill, Q2_K expert-batched MoE with LDS reuse, Q8 decode
-repack, and split16 Q8 decode repack.
+shared-X batched prefill, eager Q8 FP16 WMMA prefill repack, Q2_K
+expert-batched MoE with LDS reuse, Q8 decode repack, and split16 Q8 decode
+repack.
 
 | Machine | Backend | Quant | Prompt | Prefill | Generation |
 | --- | --- | ---: | ---: | ---: | ---: |
-| AMD Radeon 8060S / ROCm HIP | HIP zero-copy fast | Q2_K | 1003 tokens | 33.21 t/s | 7.17 t/s |
-| AMD Radeon 8060S / ROCm HIP | HIP zero-copy fast | Q2_K | 1905 tokens | 32.61 t/s | 8.88 t/s |
-| AMD Radeon 8060S / ROCm HIP | HIP full-copy | Q2_K | 1003 tokens | 33.72 t/s | 9.37 t/s |
-| AMD Radeon 8060S / ROCm HIP | HIP full-copy | Q2_K | 1905 tokens | 33.46 t/s | 9.20 t/s |
+| AMD Radeon 8060S / ROCm HIP | HIP zero-copy Q8-WMMA | Q2_K | 1003 tokens | 37.48 t/s | 8.33 t/s |
+| AMD Radeon 8060S / ROCm HIP | HIP zero-copy Q8-WMMA | Q2_K | 1905 tokens | 36.62 t/s | 8.52 t/s |
+| AMD Radeon 8060S / ROCm HIP | HIP full-copy Q8-WMMA | Q2_K | 1003 tokens | 38.19 t/s | 9.04 t/s |
+| AMD Radeon 8060S / ROCm HIP | HIP full-copy Q8-WMMA | Q2_K | 1905 tokens | 37.33 t/s | 7.96 t/s |
 
-The HIP zero-copy fast profile keeps the 92 GiB GGUF tensor payload mapped from
-host memory and avoids the full model copy, while still using the fast prefill
-kernels and Q8 decode repacks. The HIP full-copy profile copies that tensor
-payload into GPU memory at startup and eagerly builds about 4.6 GiB of Q8 decode
-repacks. Full-copy is therefore opt-in. Conservative HIP server mode keeps
-zero-copy mapped GGUF weights and avoids the full copy.
+The HIP zero-copy Q8-WMMA profile keeps the 92 GiB GGUF tensor payload mapped
+from host memory and avoids the full model copy, while eagerly building about
+8.7 GiB of FP16 Q8 WMMA prefill weights. The HIP full-copy profile copies the
+GGUF tensor payload into GPU memory at startup and eagerly builds about 4.6 GiB
+of Q8 decode repacks plus the 8.7 GiB Q8 WMMA prefill repack. Full-copy is
+therefore opt-in. Conservative HIP server mode keeps zero-copy mapped GGUF
+weights and avoids the full copy.
 
 ## ROCm/HIP quick start and max performance
 
@@ -165,6 +167,7 @@ DS4_SERVER_Q8_BATCH_FAST=1
 DS4_SERVER_Q8_BATCH_SHARED_X=1
 DS4_SERVER_Q8_BATCH_RPB=32
 DS4_SERVER_Q8_BATCH_SHARED_X_BLOCKS=16
+DS4_SERVER_Q8_WMMA_FAST=1
 DS4_SERVER_MOE_EXPERT_BATCH=1
 DS4_SERVER_MOE_GATE_RPB=16
 DS4_SERVER_MOE_DOWN_RPB=16

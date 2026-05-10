@@ -1,5 +1,6 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
+#include <rocwmma/rocwmma.hpp>
 
 #include <algorithm>
 #include <cerrno>
@@ -62,6 +63,15 @@ struct ds4_hip_repacked_q8_split16_tensor {
     unsigned char *pack;
 };
 
+struct ds4_hip_repacked_q8_wmma_tensor {
+    const unsigned char *host_ptr;
+    uint64_t bytes;
+    uint64_t in_dim;
+    uint64_t out_dim;
+    half *bhalf_kn;
+    uint64_t half_bytes;
+};
+
 static std::mutex g_mu;
 static bool g_initialized;
 static bool g_quality;
@@ -75,6 +85,7 @@ static uint64_t g_model_copied_bytes;
 static uint64_t g_model_cached_bytes;
 static uint64_t g_q8_repacked_bytes;
 static uint64_t g_q8_split16_repacked_bytes;
+static uint64_t g_q8_wmma_repacked_bytes;
 static bool g_unsupported_warned;
 static float *g_q8_partial_scratch;
 static uint64_t g_q8_partial_scratch_floats;
@@ -82,6 +93,7 @@ static std::vector<ds4_hip_model_range> g_model_ranges;
 static std::vector<ds4_hip_cached_model_tensor> g_model_cache;
 static std::vector<ds4_hip_repacked_q8_tensor> g_q8_repack_cache;
 static std::vector<ds4_hip_repacked_q8_split16_tensor> g_q8_split16_cache;
+static std::vector<ds4_hip_repacked_q8_wmma_tensor> g_q8_wmma_cache;
 
 static void ds4_hip_q8_repack_eager_from_gguf(const void *model_map, uint64_t model_size);
 
@@ -242,6 +254,10 @@ extern "C" void ds4_metal_cleanup(void) {
         if (q8.scales) (void)hipFree(q8.scales);
     }
     g_q8_repack_cache.clear();
+    for (auto &q8w : g_q8_wmma_cache) {
+        if (q8w.bhalf_kn) (void)hipFree(q8w.bhalf_kn);
+    }
+    g_q8_wmma_cache.clear();
     for (auto &c : g_model_cache) {
         if (c.device_ptr) (void)hipFree(c.device_ptr);
     }
@@ -259,6 +275,7 @@ extern "C" void ds4_metal_cleanup(void) {
     g_model_cached_bytes = 0;
     g_q8_repacked_bytes = 0;
     g_q8_split16_repacked_bytes = 0;
+    g_q8_wmma_repacked_bytes = 0;
     if (g_q8_partial_scratch) (void)hipFree(g_q8_partial_scratch);
     g_q8_partial_scratch = nullptr;
     g_q8_partial_scratch_floats = 0;
@@ -833,7 +850,9 @@ extern "C" int ds4_metal_set_model_map_range_fd(const void *model_map,
                  copy_model ? "copied to device memory" : "host-registered for zero-copy GPU access",
                  (double)map_size / 1073741824.0,
                  map_offset);
-    if (std::getenv("DS4_HIP_Q8_REPACK") != nullptr || std::getenv("DS4_HIP_Q8_REPACK_SPLIT16") != nullptr) {
+    if (std::getenv("DS4_HIP_Q8_REPACK") != nullptr ||
+        std::getenv("DS4_HIP_Q8_REPACK_SPLIT16") != nullptr ||
+        std::getenv("DS4_HIP_Q8_WMMA_FAST") != nullptr) {
         ds4_hip_q8_repack_eager_from_gguf(model_map, model_size);
     }
     return 1;
@@ -845,7 +864,7 @@ extern "C" void ds4_metal_set_quality(bool quality) {
 
 extern "C" void ds4_metal_print_memory_report(const char *label) {
     std::fprintf(stderr,
-                 "ds4: HIP memory%s%s: tensors live %.2f MiB peak %.2f MiB, model registered %.2f GiB copied %.2f GiB cached %.2f GiB q8_repacked %.2f GiB q8_split16 %.2f GiB\n",
+                 "ds4: HIP memory%s%s: tensors live %.2f MiB peak %.2f MiB, model registered %.2f GiB copied %.2f GiB cached %.2f GiB q8_repacked %.2f GiB q8_split16 %.2f GiB q8_wmma %.2f GiB\n",
                  label ? " " : "",
                  label ? label : "",
                  (double)g_tensor_live_bytes / 1048576.0,
@@ -854,7 +873,8 @@ extern "C" void ds4_metal_print_memory_report(const char *label) {
                  (double)g_model_copied_bytes / 1073741824.0,
                  (double)g_model_cached_bytes / 1073741824.0,
                  (double)g_q8_repacked_bytes / 1073741824.0,
-                 (double)g_q8_split16_repacked_bytes / 1073741824.0);
+                 (double)g_q8_split16_repacked_bytes / 1073741824.0,
+                 (double)g_q8_wmma_repacked_bytes / 1073741824.0);
 }
 
 static bool ds4_hip_should_cache_model_tensor(const char *what, uint64_t bytes) {
@@ -1130,6 +1150,92 @@ static std::string ds4_hip_gguf_string(const unsigned char *p, uint64_t &pos) {
     return s;
 }
 
+__global__ static void ds4_hip_q8_wmma_repack_half_kn_kernel(half *__restrict__ bhalf_kn,
+                                                              const unsigned char *__restrict__ w,
+                                                              uint32_t in_dim,
+                                                              uint32_t out_dim,
+                                                              uint64_t row_bytes) {
+    const uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t total = (uint64_t)in_dim * out_dim;
+    if (idx >= total) return;
+    const uint32_t k = (uint32_t)(idx / out_dim);
+    const uint32_t row = (uint32_t)(idx - (uint64_t)k * out_dim);
+    const unsigned char *blk = w + (uint64_t)row * row_bytes + (uint64_t)(k >> 5) * 34ull;
+    const uint16_t d_bits = (uint16_t)blk[0] | ((uint16_t)blk[1] << 8);
+    const float d = __half2float(__ushort_as_half((unsigned short)d_bits));
+    const int8_t q = reinterpret_cast<const int8_t *>(blk + 2u)[k & 31u];
+    bhalf_kn[idx] = __float2half(d * (float)q);
+}
+
+static const ds4_hip_repacked_q8_wmma_tensor *ds4_hip_q8_wmma_lookup(const void *model_map,
+                                                                      uint64_t model_size,
+                                                                      uint64_t offset,
+                                                                      uint64_t in_dim,
+                                                                      uint64_t out_dim) {
+    if (!model_map || offset > model_size) return nullptr;
+    const uint64_t n_blocks = (in_dim + 31u) >> 5;
+    const uint64_t weight_bytes = out_dim * n_blocks * 34ull;
+    if (weight_bytes > model_size - offset) return nullptr;
+    const unsigned char *host = static_cast<const unsigned char *>(model_map) + offset;
+    for (const auto &c : g_q8_wmma_cache) {
+        if (c.host_ptr == host && c.bytes == weight_bytes && c.in_dim == in_dim && c.out_dim == out_dim) return &c;
+    }
+    return nullptr;
+}
+
+static const ds4_hip_repacked_q8_wmma_tensor *ds4_hip_q8_wmma_repack_create(const void *model_map,
+                                                                             uint64_t model_size,
+                                                                             uint64_t offset,
+                                                                             uint64_t in_dim,
+                                                                             uint64_t out_dim,
+                                                                             const char *what) {
+    if (std::getenv("DS4_HIP_Q8_WMMA_FAST") == nullptr) return nullptr;
+    if (!model_map || in_dim == 0 || out_dim == 0 || (in_dim & 15ull) != 0 || out_dim > UINT32_MAX) return nullptr;
+    const uint64_t n_blocks = (in_dim + 31u) >> 5;
+    if ((in_dim & 31ull) != 0) return nullptr; // Q8_0 tensors in DS4 hot path are block-aligned.
+    const uint64_t row_bytes = n_blocks * 34ull;
+    const uint64_t weight_bytes = out_dim * row_bytes;
+    if (offset > model_size || weight_bytes > model_size - offset) return nullptr;
+    if (const auto *hit = ds4_hip_q8_wmma_lookup(model_map, model_size, offset, in_dim, out_dim)) return hit;
+
+    const uint64_t half_elems = in_dim * out_dim;
+    const uint64_t half_bytes = half_elems * sizeof(half);
+    if (half_elems == 0 || half_elems > (uint64_t)SIZE_MAX / sizeof(half)) return nullptr;
+
+    const double t0 = ds4_hip_now_sec();
+    const unsigned char *host = static_cast<const unsigned char *>(model_map) + offset;
+    const unsigned char *src_dev = ds4_hip_model_ptr(model_map, model_size, offset, weight_bytes, "Q8_0 WMMA repack source");
+    if (!src_dev) return nullptr;
+
+    half *db = nullptr;
+    hipError_t e = hipMalloc(reinterpret_cast<void **>(&db), (size_t)half_bytes);
+    if (e != hipSuccess) {
+        std::fprintf(stderr, "ds4: HIP Q8 WMMA repack skipped for %s: allocation %.2f MiB failed: %s\n",
+                     what ? what : "Q8_0", (double)half_bytes / 1048576.0, ds4_hip_err(e));
+        return nullptr;
+    }
+    ds4_hip_q8_wmma_repack_half_kn_kernel<<<(unsigned)((half_elems + 255ull) / 256ull), 256, 0, g_stream>>>(
+            db, src_dev, (uint32_t)in_dim, (uint32_t)out_dim, row_bytes);
+    e = hipGetLastError();
+    if (e == hipSuccess) e = hipStreamSynchronize(g_stream);
+    if (e != hipSuccess) {
+        std::fprintf(stderr, "ds4: HIP Q8 WMMA repack kernel failed for %s: %s\n", what ? what : "Q8_0", ds4_hip_err(e));
+        (void)hipFree(db);
+        return nullptr;
+    }
+
+    g_q8_wmma_cache.push_back({host, weight_bytes, in_dim, out_dim, db, half_bytes});
+    g_q8_wmma_repacked_bytes += half_bytes;
+    if (std::getenv("DS4_HIP_Q8_REPACK_LOG") != nullptr || std::getenv("DS4_HIP_Q8_WMMA_LOG") != nullptr) {
+        const double dt = std::max(1e-9, ds4_hip_now_sec() - t0);
+        std::fprintf(stderr,
+                     "ds4: HIP Q8 WMMA repacked %s in=%.0f out=%.0f raw %.2f MiB -> half %.2f MiB in %.3f s\n",
+                     what ? what : "Q8_0", (double)in_dim, (double)out_dim,
+                     (double)weight_bytes / 1048576.0, (double)half_bytes / 1048576.0, dt);
+    }
+    return &g_q8_wmma_cache.back();
+}
+
 static void ds4_hip_gguf_skip_value(const unsigned char *p, uint64_t &pos, uint32_t type) {
     switch (type) {
         case 0: case 1: case 7: pos += 1; break;
@@ -1174,8 +1280,10 @@ static void ds4_hip_q8_repack_eager_from_gguf(const void *model_map, uint64_t mo
     struct q8_info { std::string name; uint64_t in_dim; uint64_t out_dim; uint64_t rel; };
     std::vector<q8_info> hot;
     std::vector<q8_info> split16_hot;
+    std::vector<q8_info> wmma_hot;
     hot.reserve(64);
     split16_hot.reserve(160);
+    wmma_hot.reserve(256);
     for (uint64_t i = 0; i < n_tensors && pos < model_size; i++) {
         const std::string name = ds4_hip_gguf_string(p, pos);
         const uint32_t nd = ds4_hip_gguf_u32(p, pos);
@@ -1188,11 +1296,15 @@ static void ds4_hip_q8_repack_eager_from_gguf(const void *model_map, uint64_t mo
             const bool is_q_b = name.find(".attn_q_b.weight") != std::string::npos;
             const bool allow_all = std::getenv("DS4_HIP_Q8_REPACK_EAGER_ALL") != nullptr;
             if ((std::getenv("DS4_HIP_Q8_REPACK") != nullptr) && (is_q_b || allow_all)) hot.push_back({name, dims[0], dims[1], rel});
+            const bool is_out_a = name.find(".attn_output_a.weight") != std::string::npos;
+            const bool is_out_b = name.find(".attn_output_b.weight") != std::string::npos;
             if (std::getenv("DS4_HIP_Q8_REPACK_SPLIT16") != nullptr) {
-                const bool is_out_a = name.find(".attn_output_a.weight") != std::string::npos;
-                const bool is_out_b = name.find(".attn_output_b.weight") != std::string::npos;
                 const bool is_shared_down = name.find(".ffn_down_shexp.weight") != std::string::npos;
                 if (is_out_a || is_out_b || is_shared_down) split16_hot.push_back({name, dims[0], dims[1], rel});
+            }
+            if (std::getenv("DS4_HIP_Q8_WMMA_FAST") != nullptr) {
+                const bool is_q_a = name.find(".attn_q_a.weight") != std::string::npos;
+                if (is_q_a || is_q_b || is_out_a || is_out_b) wmma_hot.push_back({name, dims[0], dims[1], rel});
             }
         }
     }
@@ -1214,12 +1326,20 @@ static void ds4_hip_q8_repack_eager_from_gguf(const void *model_map, uint64_t mo
         if (abs >= model_size) continue;
         if (ds4_hip_q8_split16_repack_get(model_map, model_size, abs, t.in_dim, t.out_dim, t.name.c_str())) split16_done++;
     }
-    if (done != 0 || split16_done != 0 || std::getenv("DS4_HIP_Q8_REPACK_LOG") != nullptr) {
+    uint32_t wmma_done = 0;
+    uint64_t wmma_before = g_q8_wmma_repacked_bytes;
+    for (const auto &t : wmma_hot) {
+        const uint64_t abs = data_pos + t.rel;
+        if (abs >= model_size) continue;
+        if (ds4_hip_q8_wmma_repack_create(model_map, model_size, abs, t.in_dim, t.out_dim, t.name.c_str())) wmma_done++;
+    }
+    if (done != 0 || split16_done != 0 || wmma_done != 0 || std::getenv("DS4_HIP_Q8_REPACK_LOG") != nullptr || std::getenv("DS4_HIP_Q8_WMMA_LOG") != nullptr) {
         const double dt = ds4_hip_now_sec() - t0;
         std::fprintf(stderr,
-                     "ds4: HIP Q8 eager repack q_b=%u/%zu bytes=%.2f GiB split16=%u/%zu bytes=%.2f GiB in %.3f s\n",
+                     "ds4: HIP Q8 eager repack q_b=%u/%zu bytes=%.2f GiB split16=%u/%zu bytes=%.2f GiB wmma=%u/%zu bytes=%.2f GiB in %.3f s\n",
                      done, hot.size(), (double)(g_q8_repacked_bytes - before) / 1073741824.0,
                      split16_done, split16_hot.size(), (double)(g_q8_split16_repacked_bytes - split16_before) / 1073741824.0,
+                     wmma_done, wmma_hot.size(), (double)(g_q8_wmma_repacked_bytes - wmma_before) / 1073741824.0,
                      dt);
     }
 }
@@ -1698,6 +1818,69 @@ static inline void ds4_hip_launch_q8_0_batch_sharedx(float *out,
         ds4_hip_matmul_q8_0_warp_rows_w32_toktile_sharedx_kernel<32, BLOCKS_TILE><<<grid, threads, shmem, g_stream>>>(out, w, x, n_blocks, out_dim, n_tok, row_bytes);
     } else {
         ds4_hip_matmul_q8_0_warp_rows_w32_toktile_sharedx_kernel<4, BLOCKS_TILE><<<grid, threads, shmem, g_stream>>>(out, w, x, n_blocks, out_dim, n_tok, row_bytes);
+    }
+}
+
+template <int TILES_N, int BM = 16, int BN = 16, int BK = 16>
+__global__ static void ds4_hip_matmul_q8_wmma_packed_multin_kernel(float *__restrict__ out,
+                                                                   const half *__restrict__ bhalf_kn,
+                                                                   const float *__restrict__ x,
+                                                                   uint32_t n_tok,
+                                                                   uint32_t in_dim,
+                                                                   uint32_t out_dim) {
+    extern __shared__ unsigned char shmem_raw[];
+    half *shA = reinterpret_cast<half *>(shmem_raw);
+    half *shB = shA + BM * BK;
+    float *shC = reinterpret_cast<float *>(shB + TILES_N * BK * BN);
+    const uint32_t tid = threadIdx.x;
+    const uint32_t wave = tid >> 5;
+    const uint32_t m0 = blockIdx.y * BM;
+    const uint32_t n0 = blockIdx.x * (TILES_N * BN);
+    const uint32_t n_wave = n0 + wave * BN;
+
+    using frag_a = rocwmma::fragment<rocwmma::matrix_a, BM, BN, BK, half, rocwmma::row_major>;
+    using frag_b = rocwmma::fragment<rocwmma::matrix_b, BM, BN, BK, half, rocwmma::row_major>;
+    using frag_c = rocwmma::fragment<rocwmma::accumulator, BM, BN, BK, float>;
+
+    frag_a a;
+    frag_b b;
+    frag_c acc;
+    if (wave < TILES_N) rocwmma::fill_fragment(acc, 0.0f);
+
+    for (uint32_t k0 = 0; k0 < in_dim; k0 += BK) {
+        for (uint32_t j = tid; j < BM * BK; j += blockDim.x) {
+            const uint32_t mm = j / BK;
+            const uint32_t kk = j - mm * BK;
+            const uint32_t m = m0 + mm;
+            shA[j] = (m < n_tok) ? __float2half(x[(uint64_t)m * in_dim + k0 + kk]) : __float2half(0.0f);
+        }
+        for (uint32_t j = tid; j < TILES_N * BK * BN; j += blockDim.x) {
+            const uint32_t tile = j / (BK * BN);
+            const uint32_t r = j - tile * (BK * BN);
+            const uint32_t kk = r / BN;
+            const uint32_t nn = r - kk * BN;
+            const uint32_t n = n0 + tile * BN + nn;
+            shB[j] = (n < out_dim) ? bhalf_kn[(uint64_t)(k0 + kk) * out_dim + n] : __float2half(0.0f);
+        }
+        __syncthreads();
+        if (wave < TILES_N) {
+            rocwmma::load_matrix_sync(a, shA, BK);
+            rocwmma::load_matrix_sync(b, shB + wave * BK * BN, BN);
+            rocwmma::mma_sync(acc, a, b, acc);
+        }
+        __syncthreads();
+    }
+
+    if (wave < TILES_N) rocwmma::store_matrix_sync(shC + wave * BM * BN, acc, BN, rocwmma::mem_row_major);
+    __syncthreads();
+    for (uint32_t j = tid; j < TILES_N * BM * BN; j += blockDim.x) {
+        const uint32_t tile = j / (BM * BN);
+        const uint32_t r = j - tile * (BM * BN);
+        const uint32_t mm = r / BN;
+        const uint32_t nn = r - mm * BN;
+        const uint32_t m = m0 + mm;
+        const uint32_t n = n0 + tile * BN + nn;
+        if (m < n_tok && n < out_dim) out[(uint64_t)m * out_dim + n] = shC[j];
     }
 }
 
@@ -5414,6 +5597,30 @@ extern "C" int ds4_metal_matmul_q8_0_tensor(
             return ok ? 1 : 0;
         }
     }
+    if (std::getenv("DS4_HIP_Q8_WMMA_FAST") != nullptr &&
+        warp_threads_top == 32u && n_tok >= 16u && (in_dim & 15u) == 0u && out_dim >= 1024u) {
+        const ds4_hip_repacked_q8_wmma_tensor *rw = ds4_hip_q8_wmma_lookup(model_map, model_size, weight_offset, in_dim, out_dim);
+        if (rw) {
+            hipEvent_t prof_start{}, prof_stop{};
+            const bool prof = ds4_hip_profile_begin("DS4_HIP_Q8_MATMUL_PROFILE", &prof_start, &prof_stop);
+            constexpr int tiles_n = 8;
+            constexpr int bm = 16;
+            constexpr int bn = 16;
+            constexpr int bk = 16;
+            const dim3 grid((unsigned)((out_dim + (tiles_n * bn) - 1u) / (tiles_n * bn)),
+                            (unsigned)((n_tok + bm - 1u) / bm), 1u);
+            const unsigned threads = 256u;
+            const size_t shmem = (size_t)(bm * bk + tiles_n * bk * bn) * sizeof(half) +
+                                 (size_t)(tiles_n * bm * bn) * sizeof(float);
+            ds4_hip_matmul_q8_wmma_packed_multin_kernel<tiles_n, bm, bn, bk><<<grid, threads, shmem, g_stream>>>(
+                    (float *)out->ptr, rw->bhalf_kn, (const float *)x->ptr,
+                    (uint32_t)n_tok, (uint32_t)in_dim, (uint32_t)out_dim);
+            const bool ok = ds4_hip_launch_ok("Q8_0 WMMA packed matmul launch");
+            ds4_hip_profile_end(prof, prof_start, prof_stop, "q8_matmul_wmma_packed_multin", in_dim, out_dim, n_tok);
+            return ok ? 1 : 0;
+        }
+    }
+
     const unsigned char *w = ds4_hip_model_ptr(model_map, model_size, weight_offset, weight_bytes, "Q8_0 matmul");
     if (!w) return 0;
     hipEvent_t prof_start{}, prof_stop{};
