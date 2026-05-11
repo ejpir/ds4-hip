@@ -4165,8 +4165,8 @@ __global__ static void ds4_hip_attention_decode_mixed_batch_warprows_kernel(
             acc = ds4_hip_warp_reduce_sum(acc);
             if (lane == 0) scores[row] = skip ? -1.0e30f : (acc * scale + mask);
         }
-        __syncthreads();
     }
+    __syncthreads();
 
     float lmax = tid == 0 ? sinks[h] : -3.4e38f;
     for (uint32_t i = tid; i < n_scores; i += blockDim.x) lmax = fmaxf(lmax, scores[i]);
@@ -4265,8 +4265,8 @@ __global__ static void ds4_hip_attention_indexed_mixed_batch_warprows_kernel(
             acc = ds4_hip_warp_reduce_sum(acc);
             if (lane == 0) scores[row] = skip ? -1.0e30f : (acc * scale);
         }
-        __syncthreads();
     }
+    __syncthreads();
 
     float lmax = tid == 0 ? sinks[h] : -3.4e38f;
     for (uint32_t i = tid; i < n_scores; i += blockDim.x) lmax = fmaxf(lmax, scores[i]);
@@ -4503,8 +4503,8 @@ __global__ static void ds4_hip_attention_prefill_static_mixed_warprows_kernel(
             acc = ds4_hip_warp_reduce_sum(acc);
             if (lane == 0) scores[row] = skip ? -1.0e30f : (acc * scale + mask);
         }
-        __syncthreads();
     }
+    __syncthreads();
 
     float lmax = tid == 0 ? sinks[h] : -3.4e38f;
     for (uint32_t i = tid; i < n_scores; i += blockDim.x) lmax = fmaxf(lmax, scores[i]);
