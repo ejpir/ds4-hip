@@ -118,10 +118,15 @@ because it is still an experimental opt-in correctness/perf path.
 
 | Machine | Backend | Quant | Prompt | Prefill | Generation |
 | --- | --- | ---: | ---: | ---: | ---: |
+| AMD Radeon 8060S / ROCm HIP | HIP zero-copy fast | Q2_K | 4180 tokens | 49.59 t/s | n/a (`-n 1`) |
 | AMD Radeon 8060S / ROCm HIP | HIP zero-copy fast | Q2_K | 1003 tokens | 33.21 t/s | 7.17 t/s |
 | AMD Radeon 8060S / ROCm HIP | HIP zero-copy fast | Q2_K | 1905 tokens | 32.61 t/s | 8.88 t/s |
 | AMD Radeon 8060S / ROCm HIP | HIP full-copy | Q2_K | 1003 tokens | 33.72 t/s | 9.37 t/s |
 | AMD Radeon 8060S / ROCm HIP | HIP full-copy | Q2_K | 1905 tokens | 33.46 t/s | 9.20 t/s |
+
+The 4180-token row is a prefill-only `--tokens 1 --temp 0` check; its generation
+number is intentionally omitted because the first sampled token performs no
+decode evaluation.
 
 The HIP zero-copy fast profile keeps the 92 GiB GGUF tensor payload mapped from
 host memory and avoids the full model copy, while still using the fast prefill
@@ -170,6 +175,7 @@ DS4_SERVER_PREFILL_RAW_FAST=1
 DS4_SERVER_PREFILL_MIXED_FAST=1
 DS4_SERVER_Q8_BATCH_FAST=1
 DS4_SERVER_Q8_BATCH_SHARED_X=1
+DS4_SERVER_Q8_BATCH_TILE=32
 DS4_SERVER_Q8_BATCH_RPB=32
 DS4_SERVER_Q8_BATCH_SHARED_X_BLOCKS=16
 DS4_SERVER_MOE_EXPERT_BATCH=1
@@ -182,6 +188,11 @@ DS4_SERVER_Q8_REPACK=1
 DS4_SERVER_Q8_REPACK_SPLIT16=1
 ```
 
+The HIP Q8 shared-X batched prefill matmul is now default-on (tile32 for normal
+Q8 batch matmuls, tile16 for grouped `attn_output_a` low projection). The Q8
+server variables above are kept for reproducible presets and overrides; set
+`DS4_SERVER_Q8_BATCH_FAST=0` or `DS4_HIP_Q8_BATCH_FAST=0` to disable that path.
+
 For one-shot CLI benchmarking with the same core settings, use the server preset
 above or set the corresponding `DS4_HIP_*` variables directly. The server script
 is recommended because it also handles model path, KV cache, pid/log files, and
@@ -191,9 +202,10 @@ safe restart behavior.
 
 The HIP backend is now at the first stable fast path: zero-copy and full-copy
 loading both work, the non-winning experiments have been removed, and the
-current best prefill/decode flags are exposed through `DS4_SERVER_FAST_FULL=1`.
-The next work is kernel quality, then decode/inference behavior, then KV/cache
-work. After the first Q2_K WMMA microbench, dense Q8 is the Phase 1 target:
+winning Q8 batched prefill path is enabled by default. The remaining best
+prefill/decode knobs are exposed through `DS4_SERVER_FAST_FULL=1`. The next work
+is kernel quality, then decode/inference behavior, then KV/cache work. After the
+first Q2_K WMMA microbench, dense Q8 is the Phase 1 target:
 
 1. **rocWMMA on dense Q8 projections**
    - The production opt-in path is currently restricted to the q-side
@@ -230,10 +242,11 @@ work. After the first Q2_K WMMA microbench, dense Q8 is the Phase 1 target:
      better understood. This includes live KV memory layout, disk KV reuse,
      long-context cache movement, and cache/server ergonomics.
 
-Realistic prefill trajectory for the HIP fast path is roughly: current ~32 tok/s;
-q-side dense Q8 WMMA gives a smaller opt-in gain on long prompts; Q2_K MoE WMMA
-after a validated repack design is the next larger compute target; then fusion,
-attention work, and polish for a possible ~42-50 tok/s.
+Realistic prefill trajectory for the HIP fast path is roughly: current measured
+long-prompt zero-copy fast path ~48-50 tok/s; attention and Q2_K routed MoE are
+now the main remaining bottlenecks for pushing toward ~80 tok/s. Q8 WMMA and
+hipBLASLt remain opt-in diagnostics until they beat the custom fast path without
+quality drift.
 
 ## CLI
 

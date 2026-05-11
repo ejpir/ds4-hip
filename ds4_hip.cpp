@@ -138,6 +138,15 @@ static uint64_t ds4_hip_round_up_u64(uint64_t x, uint64_t a) {
     return a ? ((x + a - 1u) / a) * a : x;
 }
 
+static bool ds4_hip_env_bool(const char *name, bool default_value) {
+    const char *s = std::getenv(name);
+    if (!s || !s[0]) return default_value;
+    if ((s[0] == '0' && s[1] == '\0') ||
+        s[0] == 'n' || s[0] == 'N' ||
+        s[0] == 'f' || s[0] == 'F') return false;
+    return true;
+}
+
 static double ds4_hip_now_sec(void) {
     using clock = std::chrono::steady_clock;
     static const clock::time_point t0 = clock::now();
@@ -4706,6 +4715,94 @@ __global__ static void ds4_hip_q8_grouped_sharedx_rows_w32_toktile_kernel(float 
     }
 }
 
+template <uint32_t TOK_TILE, uint32_t BLOCKS_TILE>
+__global__ static void ds4_hip_q8_grouped_sharedx_rows_w32_toktile_chunked_kernel(float *__restrict__ low,
+                                                                                  const unsigned char *__restrict__ w,
+                                                                                  const float *__restrict__ heads,
+                                                                                  uint32_t n_tokens,
+                                                                                  uint32_t n_groups,
+                                                                                  uint32_t n_blocks,
+                                                                                  uint32_t rank,
+                                                                                  uint64_t row_bytes) {
+    extern __shared__ float shx[];
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t wave = tid >> 5;
+    const uint32_t rows_per_block = blockDim.x >> 5;
+    const uint32_t row_blocks = (rank + rows_per_block - 1u) / rows_per_block;
+    const uint32_t g = blockIdx.x / row_blocks;
+    const uint32_t row0 = (blockIdx.x - g * row_blocks) * rows_per_block + wave;
+    const uint32_t t0 = blockIdx.y * TOK_TILE;
+    if (g >= n_groups || t0 >= n_tokens) return;
+
+    const uint32_t group_dim = n_blocks << 5;
+    const bool row_valid = row0 < rank;
+    const unsigned char *wr = w + ((uint64_t)g * rank + (row_valid ? row0 : 0u)) * row_bytes;
+    float acc[TOK_TILE];
+#pragma unroll
+    for (uint32_t u = 0; u < TOK_TILE; u++) acc[u] = 0.0f;
+
+    for (uint32_t b0 = 0; b0 < n_blocks; b0 += BLOCKS_TILE) {
+        const uint32_t b_count = ((b0 + BLOCKS_TILE) <= n_blocks) ? BLOCKS_TILE : (n_blocks - b0);
+        for (uint32_t j = tid; j < TOK_TILE * BLOCKS_TILE * 32u; j += blockDim.x) {
+            const uint32_t u = j / (BLOCKS_TILE * 32u);
+            const uint32_t r = j - u * (BLOCKS_TILE * 32u);
+            const uint32_t bb = r >> 5;
+            const uint32_t k = r & 31u;
+            const uint32_t t = t0 + u;
+            const uint64_t xoff = ((uint64_t)t * n_groups + g) * group_dim + ((uint64_t)(b0 + bb) << 5) + k;
+            shx[j] = (t < n_tokens && bb < b_count) ? heads[xoff] : 0.0f;
+        }
+        __syncthreads();
+        if (row_valid) {
+            for (uint32_t bb = 0; bb < b_count; bb++) {
+                const unsigned char *blk = wr + (uint64_t)(b0 + bb) * 34u;
+                const float d = ds4_hip_q8_0_scale_broadcast_w32(blk);
+                const int8_t qv = ((const int8_t *)(blk + 2u))[lane];
+                const float wv = d * (float)qv;
+#pragma unroll
+                for (uint32_t u = 0; u < TOK_TILE; u++) acc[u] += wv * shx[(u * BLOCKS_TILE + bb) * 32u + lane];
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (uint32_t u = 0; u < TOK_TILE; u++) acc[u] = ds4_hip_warp_reduce_sum(acc[u]);
+    if (lane == 0 && row_valid) {
+#pragma unroll
+        for (uint32_t u = 0; u < TOK_TILE; u++) {
+            const uint32_t t = t0 + u;
+            if (t < n_tokens) low[((uint64_t)t * n_groups + g) * rank + row0] = acc[u];
+        }
+    }
+}
+
+template <uint32_t BLOCKS_TILE>
+static inline void ds4_hip_launch_q8_grouped_batch_sharedx_chunked(float *low,
+                                                                   const unsigned char *w,
+                                                                   const float *heads,
+                                                                   uint32_t n_tokens,
+                                                                   uint32_t n_groups,
+                                                                   uint32_t n_blocks,
+                                                                   uint32_t rank,
+                                                                   uint64_t row_bytes,
+                                                                   dim3 grid,
+                                                                   unsigned threads,
+                                                                   unsigned tile) {
+    const size_t shmem = (size_t)tile * BLOCKS_TILE * 32u * sizeof(float);
+    if (tile == 32u) {
+        ds4_hip_q8_grouped_sharedx_rows_w32_toktile_chunked_kernel<32, BLOCKS_TILE><<<grid, threads, shmem, g_stream>>>(low, w, heads, n_tokens, n_groups, n_blocks, rank, row_bytes);
+    } else if (tile == 16u) {
+        ds4_hip_q8_grouped_sharedx_rows_w32_toktile_chunked_kernel<16, BLOCKS_TILE><<<grid, threads, shmem, g_stream>>>(low, w, heads, n_tokens, n_groups, n_blocks, rank, row_bytes);
+    } else if (tile == 8u) {
+        ds4_hip_q8_grouped_sharedx_rows_w32_toktile_chunked_kernel<8, BLOCKS_TILE><<<grid, threads, shmem, g_stream>>>(low, w, heads, n_tokens, n_groups, n_blocks, rank, row_bytes);
+    } else if (tile == 2u) {
+        ds4_hip_q8_grouped_sharedx_rows_w32_toktile_chunked_kernel<2, BLOCKS_TILE><<<grid, threads, shmem, g_stream>>>(low, w, heads, n_tokens, n_groups, n_blocks, rank, row_bytes);
+    } else {
+        ds4_hip_q8_grouped_sharedx_rows_w32_toktile_chunked_kernel<4, BLOCKS_TILE><<<grid, threads, shmem, g_stream>>>(low, w, heads, n_tokens, n_groups, n_blocks, rank, row_bytes);
+    }
+}
+
 __global__ static void ds4_hip_q8_grouped_partial16_w32_kernel(float *__restrict__ partial, const unsigned char *__restrict__ w, const float *__restrict__ heads,
                                                                uint32_t n_groups, uint32_t rank, uint64_t row_bytes) {
     extern __shared__ float shx[];
@@ -5974,20 +6071,21 @@ extern "C" int ds4_metal_matmul_q8_0_tensor(
     hipEvent_t prof_start{}, prof_stop{};
     const bool prof = ds4_hip_profile_begin("DS4_HIP_Q8_MATMUL_PROFILE", &prof_start, &prof_stop);
     const char *profile_label = "q8_matmul";
-    if (out_dim >= 1024u) {
+    const bool q8_batch_fast = ds4_hip_env_bool("DS4_HIP_Q8_BATCH_FAST", true);
+    if ((q8_batch_fast && n_tok > 1u) || out_dim >= 1024u) {
         const unsigned warp_threads = ds4_hip_warp_threads();
-        if (std::getenv("DS4_HIP_Q8_BATCH_FAST") != nullptr && warp_threads == 32u && n_tok > 1u && (in_dim & 31u) == 0u) {
-            unsigned rows_per_block = 16u;
+        if (q8_batch_fast && warp_threads == 32u && n_tok > 1u && (in_dim & 31u) == 0u) {
+            unsigned rows_per_block = 32u;
             if (const char *rpb_env = std::getenv("DS4_HIP_Q8_BATCH_RPB")) {
                 const unsigned v = (unsigned)std::strtoul(rpb_env, nullptr, 10);
                 if (v >= 1u && v <= 32u) rows_per_block = v;
             }
-            unsigned tile = 8u;
+            unsigned tile = 32u;
             if (const char *tile_env = std::getenv("DS4_HIP_Q8_BATCH_TILE")) {
                 const unsigned v = (unsigned)std::strtoul(tile_env, nullptr, 10);
                 if (v == 2u || v == 4u || v == 8u || v == 16u || v == 32u) tile = v;
             }
-            const bool use_sharedx_batch = std::getenv("DS4_HIP_Q8_BATCH_SHARED_X") != nullptr;
+            const bool use_sharedx_batch = ds4_hip_env_bool("DS4_HIP_Q8_BATCH_SHARED_X", true);
             const bool use_2row = !use_sharedx_batch && std::getenv("DS4_HIP_Q8_BATCH_NO_2ROW") == nullptr && tile <= 16u;
             const unsigned out_rows_per_block = rows_per_block * (use_2row ? 2u : 1u);
             const dim3 grid((unsigned)((out_dim + out_rows_per_block - 1u) / out_rows_per_block),
@@ -5999,6 +6097,9 @@ extern "C" int ds4_metal_matmul_q8_0_tensor(
                 if (const char *chunk_env = std::getenv("DS4_HIP_Q8_BATCH_SHARED_X_BLOCKS")) {
                     const unsigned v = (unsigned)std::strtoul(chunk_env, nullptr, 10);
                     if (v == 8u || v == 16u || v == 32u) chunk_blocks = v;
+                }
+                while ((size_t)tile * chunk_blocks * 32u * sizeof(float) > 65536u && chunk_blocks > 8u) {
+                    chunk_blocks >>= 1u;
                 }
                 if (chunk_blocks == 8u) {
                     ds4_hip_launch_q8_0_batch_sharedx<8>((float *)out->ptr, w, (const float *)x->ptr,
@@ -7099,12 +7200,14 @@ extern "C" int ds4_metal_attention_output_q8_batch_tensor(
     const unsigned char *wa = ds4_hip_model_ptr(model_map, model_size, out_a_offset, a_bytes, "attention output A Q8_0");
     if (!wa) return 0;
     const unsigned warp_threads = ds4_hip_warp_threads();
-    if ((std::getenv("DS4_HIP_Q8_GROUPED_BATCH_FAST") != nullptr || std::getenv("DS4_HIP_Q8_BATCH_FAST") != nullptr) &&
+    const bool grouped_batch_fast = ds4_hip_env_bool("DS4_HIP_Q8_GROUPED_BATCH_FAST",
+                                                     ds4_hip_env_bool("DS4_HIP_Q8_BATCH_FAST", true));
+    if (grouped_batch_fast &&
         warp_threads == 32u && n_tokens > 1u && (group_dim & 31u) == 0u && rank <= UINT32_MAX && n_groups <= UINT32_MAX) {
-        unsigned tile = 4u;
+        unsigned tile = 16u;
         if (const char *tile_env = std::getenv("DS4_HIP_Q8_GROUPED_BATCH_TILE")) {
             const unsigned v = (unsigned)std::strtoul(tile_env, nullptr, 10);
-            if (v == 2u || v == 4u) tile = v;
+            if (v == 2u || v == 4u || v == 8u || v == 16u || v == 32u) tile = v;
         }
         unsigned rows_per_block = 16u;
         if (const char *rpb_env = std::getenv("DS4_HIP_Q8_GROUPED_BATCH_RPB")) {
@@ -7114,15 +7217,21 @@ extern "C" int ds4_metal_attention_output_q8_batch_tensor(
         const uint32_t row_blocks = (uint32_t)((rank + rows_per_block - 1u) / rows_per_block);
         const dim3 grid((unsigned)(n_groups * row_blocks), (unsigned)((n_tokens + tile - 1u) / tile), 1u);
         const unsigned threads = rows_per_block * 32u;
-        const size_t shmem = (size_t)tile * group_dim * sizeof(float);
-        if (tile == 2u) {
+        const uint32_t n_blocks = (uint32_t)(group_dim >> 5);
+        const bool use_chunked = tile > 4u;
+        if (use_chunked) {
+            ds4_hip_launch_q8_grouped_batch_sharedx_chunked<16>((float *)low->ptr, wa, (const float *)heads->ptr,
+                    n_tokens, n_groups, n_blocks, (uint32_t)rank, row_bytes, grid, threads, tile);
+        } else if (tile == 2u) {
+            const size_t shmem = (size_t)tile * group_dim * sizeof(float);
             ds4_hip_q8_grouped_sharedx_rows_w32_toktile_kernel<2><<<grid, threads, shmem, g_stream>>>(
                     (float *)low->ptr, wa, (const float *)heads->ptr, n_tokens, n_groups,
-                    (uint32_t)(group_dim >> 5), (uint32_t)rank, row_bytes);
+                    n_blocks, (uint32_t)rank, row_bytes);
         } else {
+            const size_t shmem = (size_t)tile * group_dim * sizeof(float);
             ds4_hip_q8_grouped_sharedx_rows_w32_toktile_kernel<4><<<grid, threads, shmem, g_stream>>>(
                     (float *)low->ptr, wa, (const float *)heads->ptr, n_tokens, n_groups,
-                    (uint32_t)(group_dim >> 5), (uint32_t)rank, row_bytes);
+                    n_blocks, (uint32_t)rank, row_bytes);
         }
     } else if (group_dim <= 4096u && (rank % std::max(1u, 1024u / warp_threads)) == 0) {
         const unsigned rows_per_block = std::max(1u, 1024u / warp_threads);

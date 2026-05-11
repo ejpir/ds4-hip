@@ -33,10 +33,10 @@ Environment:
   DS4_SERVER_PREFILL_STAGE_PROFILE=1  Log/sync prefill stages to isolate crashes
   DS4_SERVER_PREFILL_RAW_FAST=1  Experimental FlashAttention-style raw SWA prefill kernel
   DS4_SERVER_PREFILL_MIXED_FAST=1  Experimental fast compressed/mixed prefill attention
-  DS4_SERVER_Q8_BATCH_FAST=1     Experimental batched Q8_0 matmul for faster prefill q/output paths
-  DS4_SERVER_Q8_BATCH_TILE=8     Token tile for Q8 batch fast; passed through when set
-  DS4_SERVER_Q8_BATCH_RPB=N      Rows/block for Q8 batch fast; e.g. 32 with shared-X experiment
-  DS4_SERVER_Q8_BATCH_SHARED_X=1 Experimental LDS shared-X batched Q8 prefill kernel
+  DS4_SERVER_Q8_BATCH_FAST=0|1   Batched Q8_0 prefill matmul is default-on in HIP; set 0 to disable
+  DS4_SERVER_Q8_BATCH_TILE=32    Token tile for Q8 batch fast; passed through when set
+  DS4_SERVER_Q8_BATCH_RPB=N      Rows/block for Q8 batch fast; default 32
+  DS4_SERVER_Q8_BATCH_SHARED_X=0|1  LDS shared-X batched Q8 prefill is default-on; set 0 to disable
   DS4_SERVER_Q8_BATCH_SHARED_X_BLOCKS=16  K-block chunk for Q8 shared-X batch, 8|16|32
   DS4_SERVER_Q8_REPACK=1         Opt-in eager q_b Q8_0 repack for decode; uses ~1.43 GiB VRAM
   DS4_SERVER_Q8_REPACK_SPLIT16=1 Opt-in split-major Q8_0 repack for attn_output/shared-down; uses ~3.2 GiB VRAM
@@ -92,6 +92,7 @@ if [[ "${DS4_SERVER_FAST_FULL:-0}" == "1" ]]; then
   export DS4_SERVER_PREFILL_MIXED_FAST="${DS4_SERVER_PREFILL_MIXED_FAST:-1}"
   export DS4_SERVER_Q8_BATCH_FAST="${DS4_SERVER_Q8_BATCH_FAST:-1}"
   export DS4_SERVER_Q8_BATCH_SHARED_X="${DS4_SERVER_Q8_BATCH_SHARED_X:-1}"
+  export DS4_SERVER_Q8_BATCH_TILE="${DS4_SERVER_Q8_BATCH_TILE:-32}"
   export DS4_SERVER_Q8_BATCH_RPB="${DS4_SERVER_Q8_BATCH_RPB:-32}"
   export DS4_SERVER_Q8_BATCH_SHARED_X_BLOCKS="${DS4_SERVER_Q8_BATCH_SHARED_X_BLOCKS:-16}"
   export DS4_SERVER_MOE_EXPERT_BATCH="${DS4_SERVER_MOE_EXPERT_BATCH:-1}"
