@@ -110,15 +110,15 @@ Q4 requires the larger-memory machine class, so M3 Max Q4 numbers are `N/A`.
 
 The HIP backend is optimized for the CyberNeurova DeepSeek V4 Flash Q2_K GGUF
 on AMD ROCm. The current tested GPU is an AMD Radeon 8060S (`gfx1151`, wave32,
-124 GiB unified/global memory). Numbers below use the max-performance/full-copy
-profile: device tensors, staged full model copy, fast prefill attention, Q8
-shared-X batched prefill, Q2_K expert-batched MoE with LDS reuse, Q8 decode
-repack, and split16 Q8 decode repack. Q8 WMMA prefill is listed separately
-because it is still an experimental opt-in correctness/perf path.
+124 GiB unified/global memory). Numbers below include zero-copy fast and
+full-copy profiles using fast prefill attention, default-on Q8 shared-X batched
+prefill, default-on indexer qmix scoring, Q2_K expert-batched MoE with LDS reuse,
+Q8 decode repack, and split16 Q8 decode repack. Q8 WMMA prefill is listed
+separately because it is still an experimental opt-in correctness/perf path.
 
 | Machine | Backend | Quant | Prompt | Prefill | Generation |
 | --- | --- | ---: | ---: | ---: | ---: |
-| AMD Radeon 8060S / ROCm HIP | HIP zero-copy fast | Q2_K | 4180 tokens | 49.59 t/s | n/a (`-n 1`) |
+| AMD Radeon 8060S / ROCm HIP | HIP zero-copy fast | Q2_K | 4180 tokens | 51.11 t/s | n/a (`-n 1`) |
 | AMD Radeon 8060S / ROCm HIP | HIP zero-copy fast | Q2_K | 1003 tokens | 33.21 t/s | 7.17 t/s |
 | AMD Radeon 8060S / ROCm HIP | HIP zero-copy fast | Q2_K | 1905 tokens | 32.61 t/s | 8.88 t/s |
 | AMD Radeon 8060S / ROCm HIP | HIP full-copy | Q2_K | 1003 tokens | 33.72 t/s | 9.37 t/s |
@@ -192,6 +192,8 @@ The HIP Q8 shared-X batched prefill matmul is now default-on (tile32 for normal
 Q8 batch matmuls, tile16 for grouped `attn_output_a` low projection). The Q8
 server variables above are kept for reproducible presets and overrides; set
 `DS4_SERVER_Q8_BATCH_FAST=0` or `DS4_HIP_Q8_BATCH_FAST=0` to disable that path.
+The HIP indexer score qmix path is also default-on; set
+`DS4_HIP_INDEXER_QMIX_FAST=0` only for regression comparisons.
 
 For one-shot CLI benchmarking with the same core settings, use the server preset
 above or set the corresponding `DS4_HIP_*` variables directly. The server script
@@ -243,10 +245,10 @@ first Q2_K WMMA microbench, dense Q8 is the Phase 1 target:
      long-context cache movement, and cache/server ergonomics.
 
 Realistic prefill trajectory for the HIP fast path is roughly: current measured
-long-prompt zero-copy fast path ~48-50 tok/s; attention and Q2_K routed MoE are
-now the main remaining bottlenecks for pushing toward ~80 tok/s. Q8 WMMA and
-hipBLASLt remain opt-in diagnostics until they beat the custom fast path without
-quality drift.
+long-prompt zero-copy fast path ~51-52 tok/s; indexed mixed attention and Q2_K
+routed MoE are now the main remaining bottlenecks for pushing toward ~80 tok/s.
+Q8 WMMA and hipBLASLt remain opt-in diagnostics until they beat the custom fast
+path without quality drift.
 
 ## CLI
 

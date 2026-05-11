@@ -104,6 +104,8 @@ static uint64_t g_q8_wmma_repacked_bytes;
 static bool g_unsupported_warned;
 static float *g_q8_partial_scratch;
 static uint64_t g_q8_partial_scratch_floats;
+static float *g_indexer_qmix_scratch;
+static uint64_t g_indexer_qmix_scratch_floats;
 static half *g_q8_blaslt_xhalf_scratch;
 static uint64_t g_q8_blaslt_xhalf_scratch_halfs;
 static void *g_q8_blaslt_workspace;
@@ -323,6 +325,9 @@ extern "C" void ds4_metal_cleanup(void) {
     if (g_q8_partial_scratch) (void)hipFree(g_q8_partial_scratch);
     g_q8_partial_scratch = nullptr;
     g_q8_partial_scratch_floats = 0;
+    if (g_indexer_qmix_scratch) (void)hipFree(g_indexer_qmix_scratch);
+    g_indexer_qmix_scratch = nullptr;
+    g_indexer_qmix_scratch_floats = 0;
     if (g_q8_blaslt_xhalf_scratch) (void)hipFree(g_q8_blaslt_xhalf_scratch);
     g_q8_blaslt_xhalf_scratch = nullptr;
     g_q8_blaslt_xhalf_scratch_halfs = 0;
@@ -959,6 +964,23 @@ static float *ds4_hip_q8_partial_scratch(uint64_t floats) {
     if (!ds4_hip_check(e, "Q8 partial scratch allocation")) return nullptr;
     g_q8_partial_scratch = p;
     g_q8_partial_scratch_floats = floats;
+    return p;
+}
+
+static float *ds4_hip_indexer_qmix_scratch(uint64_t floats) {
+    if (floats == 0) return nullptr;
+    if (g_indexer_qmix_scratch && g_indexer_qmix_scratch_floats >= floats) return g_indexer_qmix_scratch;
+    if (g_indexer_qmix_scratch) {
+        (void)hipStreamSynchronize(g_stream);
+        (void)hipFree(g_indexer_qmix_scratch);
+        g_indexer_qmix_scratch = nullptr;
+        g_indexer_qmix_scratch_floats = 0;
+    }
+    float *p = nullptr;
+    hipError_t e = hipMalloc(reinterpret_cast<void **>(&p), (size_t)(floats * sizeof(float)));
+    if (!ds4_hip_check(e, "indexer qmix scratch allocation")) return nullptr;
+    g_indexer_qmix_scratch = p;
+    g_indexer_qmix_scratch_floats = floats;
     return p;
 }
 
@@ -3687,6 +3709,67 @@ __global__ static void ds4_hip_indexer_scores_kernel(float *scores, const float 
     ds4_hip_block_reduce_store(scores, acc * scale, (uint64_t)t * n_comp + c);
 }
 
+__global__ static void ds4_hip_indexer_qmix_kernel(float *__restrict__ qmix,
+                                                   const float *__restrict__ q,
+                                                   const float *__restrict__ weights,
+                                                   uint32_t n_tokens,
+                                                   uint32_t n_head,
+                                                   uint32_t head_dim) {
+    const uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t total = (uint64_t)n_tokens * head_dim;
+    if (idx >= total) return;
+    const uint32_t d = (uint32_t)(idx % head_dim);
+    const uint32_t t = (uint32_t)(idx / head_dim);
+    const float *qt = q + (uint64_t)t * n_head * head_dim + d;
+    const float *wt = weights + (uint64_t)t * n_head;
+    float acc = 0.0f;
+    for (uint32_t h = 0; h < n_head; h++) acc += qt[(uint64_t)h * head_dim] * wt[h];
+    qmix[(uint64_t)t * head_dim + d] = acc;
+}
+
+template <uint32_t TILE_T, uint32_t TILE_C>
+__global__ static void ds4_hip_indexer_scores_qmix_tiled_kernel(float *__restrict__ scores,
+                                                                const float *__restrict__ qmix,
+                                                                const float *__restrict__ index_comp,
+                                                                uint32_t n_comp,
+                                                                uint32_t n_tokens,
+                                                                uint32_t head_dim,
+                                                                float scale) {
+    extern __shared__ float sh[];
+    float *shq = sh;
+    float *shc = sh + TILE_T * head_dim;
+    const uint32_t lx = threadIdx.x;
+    const uint32_t ly = threadIdx.y;
+    const uint32_t tid = ly * blockDim.x + lx;
+    const uint32_t nthreads = blockDim.x * blockDim.y;
+    const uint32_t t0 = blockIdx.y * TILE_T;
+    const uint32_t c0 = blockIdx.x * TILE_C;
+
+    for (uint32_t i = tid; i < TILE_T * head_dim; i += nthreads) {
+        const uint32_t tr = i / head_dim;
+        const uint32_t k = i - tr * head_dim;
+        const uint32_t t = t0 + tr;
+        shq[i] = (t < n_tokens) ? qmix[(uint64_t)t * head_dim + k] : 0.0f;
+    }
+    for (uint32_t i = tid; i < TILE_C * head_dim; i += nthreads) {
+        const uint32_t cr = i / head_dim;
+        const uint32_t k = i - cr * head_dim;
+        const uint32_t c = c0 + cr;
+        shc[i] = (c < n_comp) ? index_comp[(uint64_t)c * head_dim + k] : 0.0f;
+    }
+    __syncthreads();
+
+    const uint32_t t = t0 + ly;
+    const uint32_t c = c0 + lx;
+    if (t < n_tokens && c < n_comp) {
+        float acc = 0.0f;
+        const float *qr = shq + ly * head_dim;
+        const float *cr = shc + lx * head_dim;
+        for (uint32_t k = 0; k < head_dim; k++) acc += qr[k] * cr[k];
+        scores[(uint64_t)t * n_comp + c] = acc * scale;
+    }
+}
+
 __global__ static void ds4_hip_indexer_select_all_kernel(int *selected, uint32_t n_comp,
                                                          uint32_t n_tokens, uint32_t top_k) {
     const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -5874,6 +5957,29 @@ extern "C" int ds4_metal_indexer_scores_prefill_tensor(
     const uint64_t comp_bytes = (uint64_t)n_comp * head_dim * sizeof(float);
     const uint64_t score_bytes = (uint64_t)n_tokens * n_comp * sizeof(float);
     if (q->bytes < q_bytes || weights->bytes < weight_bytes || index_comp->bytes < comp_bytes || scores->bytes < score_bytes) return 0;
+    const bool qmix_fast = ds4_hip_env_bool("DS4_HIP_INDEXER_QMIX_FAST", true);
+    if (qmix_fast && n_tokens > 1u && n_head > 1u && head_dim <= 512u) {
+        float *qmix = ds4_hip_indexer_qmix_scratch((uint64_t)n_tokens * head_dim);
+        if (qmix) {
+            const uint64_t qmix_elems = (uint64_t)n_tokens * head_dim;
+            ds4_hip_indexer_qmix_kernel<<<(unsigned)((qmix_elems + 255u) / 256u), 256u, 0, g_stream>>>(
+                    qmix, (const float *)q->ptr, (const float *)weights->ptr, n_tokens, n_head, head_dim);
+            bool ok = ds4_hip_launch_ok("indexer qmix launch");
+            if (ok) {
+                constexpr uint32_t tile_t = 16u;
+                constexpr uint32_t tile_c = 16u;
+                const dim3 grid((unsigned)((n_comp + tile_c - 1u) / tile_c),
+                                (unsigned)((n_tokens + tile_t - 1u) / tile_t), 1u);
+                const dim3 block(tile_c, tile_t, 1u);
+                const size_t shmem = (size_t)(tile_t + tile_c) * head_dim * sizeof(float);
+                ds4_hip_indexer_scores_qmix_tiled_kernel<tile_t, tile_c><<<grid, block, shmem, g_stream>>>(
+                        (float *)scores->ptr, qmix, (const float *)index_comp->ptr,
+                        n_comp, n_tokens, head_dim, scale);
+                ok = ds4_hip_launch_ok("indexer qmix scores launch");
+            }
+            if (ok) return 1;
+        }
+    }
     ds4_hip_indexer_scores_kernel<<<dim3(n_comp, n_tokens), 256, 0, g_stream>>>(
             (float *)scores->ptr, (const float *)q->ptr, (const float *)weights->ptr,
             (const float *)index_comp->ptr, n_comp, n_tokens, n_head, head_dim, scale);
