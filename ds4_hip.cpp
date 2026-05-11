@@ -7315,7 +7315,7 @@ extern "C" int ds4_metal_attention_output_q8_batch_tensor(
             const unsigned v = (unsigned)std::strtoul(tile_env, nullptr, 10);
             if (v == 2u || v == 4u || v == 8u || v == 16u || v == 32u) tile = v;
         }
-        unsigned rows_per_block = 16u;
+        unsigned rows_per_block = 32u;
         if (const char *rpb_env = std::getenv("DS4_HIP_Q8_GROUPED_BATCH_RPB")) {
             const unsigned v = (unsigned)std::strtoul(rpb_env, nullptr, 10);
             if (v >= 1u && v <= 32u) rows_per_block = v;

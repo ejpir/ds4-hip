@@ -118,7 +118,7 @@ separately because it is still an experimental opt-in correctness/perf path.
 
 | Machine | Backend | Quant | Prompt | Prefill | Generation |
 | --- | --- | ---: | ---: | ---: | ---: |
-| AMD Radeon 8060S / ROCm HIP | HIP zero-copy fast | Q2_K | 4180 tokens | 51.11 t/s | n/a (`-n 1`) |
+| AMD Radeon 8060S / ROCm HIP | HIP zero-copy fast | Q2_K | 4180 tokens | 53.07 t/s | n/a (`-n 1`) |
 | AMD Radeon 8060S / ROCm HIP | HIP zero-copy fast | Q2_K | 1003 tokens | 33.21 t/s | 7.17 t/s |
 | AMD Radeon 8060S / ROCm HIP | HIP zero-copy fast | Q2_K | 1905 tokens | 32.61 t/s | 8.88 t/s |
 | AMD Radeon 8060S / ROCm HIP | HIP full-copy | Q2_K | 1003 tokens | 33.72 t/s | 9.37 t/s |
@@ -189,7 +189,7 @@ DS4_SERVER_Q8_REPACK_SPLIT16=1
 ```
 
 The HIP Q8 shared-X batched prefill matmul is now default-on (tile32 for normal
-Q8 batch matmuls, tile16 for grouped `attn_output_a` low projection). The Q8
+Q8 batch matmuls, tile16/RPB32 for grouped `attn_output_a` low projection). The Q8
 server variables above are kept for reproducible presets and overrides; set
 `DS4_SERVER_Q8_BATCH_FAST=0` or `DS4_HIP_Q8_BATCH_FAST=0` to disable that path.
 The HIP indexer score qmix path is also default-on; set
@@ -245,7 +245,7 @@ first Q2_K WMMA microbench, dense Q8 is the Phase 1 target:
      long-context cache movement, and cache/server ergonomics.
 
 Realistic prefill trajectory for the HIP fast path is roughly: current measured
-long-prompt zero-copy fast path ~51-52 tok/s; indexed mixed attention and Q2_K
+long-prompt zero-copy fast path ~52-53 tok/s; indexed mixed attention and Q2_K
 routed MoE are now the main remaining bottlenecks for pushing toward ~80 tok/s.
 Q8 WMMA and hipBLASLt remain opt-in diagnostics until they beat the custom fast
 path without quality drift.
