@@ -22,7 +22,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <random>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -1482,6 +1484,624 @@ static int run_gate_up_bench(const std::vector<unsigned char>& hGate,
     return 0;
 }
 
+template <unsigned PAIR_TILE>
+__global__ void q2_gate_up_all_current_sharedx_kernel(float* __restrict__ mid,
+                                                       const unsigned char* __restrict__ gate_w,
+                                                       const unsigned char* __restrict__ up_w,
+                                                       const float* __restrict__ x,
+                                                       const int* __restrict__ counts,
+                                                       const int* __restrict__ buckets,
+                                                       unsigned stride,
+                                                       unsigned min_count,
+                                                       unsigned max_count,
+                                                       unsigned K,
+                                                       unsigned N,
+                                                       unsigned row_bytes,
+                                                       uint64_t expert_bytes) {
+    extern __shared__ float shx[];
+    const unsigned tid = threadIdx.x;
+    const unsigned lane = tid & 31u;
+    const unsigned wave = tid >> 5;
+    const unsigned rows_per_block = blockDim.x >> 5;
+    const unsigned row = blockIdx.x * rows_per_block + wave;
+    const unsigned expert = blockIdx.y;
+    if (expert >= 256u) return;
+    const bool row_valid = row < N;
+    const unsigned count = (unsigned)counts[expert];
+    if (count == 0u || count < min_count || (max_count != 0u && count >= max_count)) return;
+    const unsigned char* grow = gate_w + (uint64_t)expert * expert_bytes + (uint64_t)(row_valid ? row : 0u) * row_bytes;
+    const unsigned char* urow = up_w + (uint64_t)expert * expert_bytes + (uint64_t)(row_valid ? row : 0u) * row_bytes;
+    const unsigned nb = K >> 8;
+    for (unsigned p0 = 0; p0 < count; p0 += PAIR_TILE) {
+        int pair[PAIR_TILE];
+        float g_acc[PAIR_TILE];
+        float u_acc[PAIR_TILE];
+#pragma unroll
+        for (unsigned u = 0; u < PAIR_TILE; ++u) {
+            pair[u] = (p0 + u < count) ? buckets[(uint64_t)expert * stride + p0 + u] : -1;
+            g_acc[u] = 0.0f;
+            u_acc[u] = 0.0f;
+        }
+        for (unsigned b = 0; b < nb; ++b) {
+            const uint64_t xbase = (uint64_t)b * QK_K;
+            for (unsigned j = tid; j < PAIR_TILE * QK_K; j += blockDim.x) {
+                const unsigned u = j >> 8;
+                const unsigned k = j & 255u;
+                shx[j] = (pair[u] >= 0) ? x[(uint64_t)((unsigned)pair[u] / 6u) * K + xbase + k] : 0.0f;
+            }
+            __syncthreads();
+            if (row_valid) {
+                const unsigned char* gblk = grow + (uint64_t)b * Q2K_BYTES;
+                const unsigned char* ublk = urow + (uint64_t)b * Q2K_BYTES;
+#pragma unroll
+                for (unsigned kk = 0; kk < 8u; ++kk) {
+                    const unsigned i = lane + (kk << 5);
+                    const float gwv = q2_k_dequant(gblk, i);
+                    const float uwv = q2_k_dequant(ublk, i);
+#pragma unroll
+                    for (unsigned u = 0; u < PAIR_TILE; ++u) {
+                        const float xv = shx[(u << 8) + i];
+                        g_acc[u] += gwv * xv;
+                        u_acc[u] += uwv * xv;
+                    }
+                }
+            }
+            __syncthreads();
+        }
+#pragma unroll
+        for (unsigned u = 0; u < PAIR_TILE; ++u) {
+            g_acc[u] = warp_reduce_sum(g_acc[u]);
+            u_acc[u] = warp_reduce_sum(u_acc[u]);
+        }
+        if (lane == 0 && row_valid) {
+#pragma unroll
+            for (unsigned u = 0; u < PAIR_TILE; ++u) {
+                if (pair[u] >= 0) mid[(uint64_t)(unsigned)pair[u] * N + row] = silu_dev(g_acc[u]) * u_acc[u];
+            }
+        }
+    }
+}
+
+
+template <unsigned PAIR_TILE>
+__global__ void q2_down_all_current_sharedmid_kernel(float* __restrict__ out,
+                                                     const unsigned char* __restrict__ w,
+                                                     const float* __restrict__ mid,
+                                                     const int* __restrict__ counts,
+                                                     const int* __restrict__ buckets,
+                                                     unsigned stride,
+                                                     unsigned min_count,
+                                                     unsigned max_count,
+                                                     unsigned K,
+                                                     unsigned N,
+                                                     unsigned row_bytes,
+                                                     uint64_t expert_bytes) {
+    extern __shared__ float shmid[];
+    const unsigned tid = threadIdx.x;
+    const unsigned lane = tid & 31u;
+    const unsigned wave = tid >> 5;
+    const unsigned rows_per_block = blockDim.x >> 5;
+    const unsigned row = blockIdx.x * rows_per_block + wave;
+    const unsigned expert = blockIdx.y;
+    if (expert >= 256u) return;
+    const bool row_valid = row < N;
+    const unsigned count = (unsigned)counts[expert];
+    if (count == 0u || count < min_count || (max_count != 0u && count >= max_count)) return;
+    const unsigned char* wrow = w + (uint64_t)expert * expert_bytes + (uint64_t)(row_valid ? row : 0u) * row_bytes;
+    const unsigned nb = K >> 8;
+    for (unsigned p0 = 0; p0 < count; p0 += PAIR_TILE) {
+        int pair[PAIR_TILE];
+        float acc[PAIR_TILE];
+#pragma unroll
+        for (unsigned u = 0; u < PAIR_TILE; ++u) {
+            pair[u] = (p0 + u < count) ? buckets[(uint64_t)expert * stride + p0 + u] : -1;
+            acc[u] = 0.0f;
+        }
+        for (unsigned b = 0; b < nb; ++b) {
+            const uint64_t mbase = (uint64_t)b * QK_K;
+            for (unsigned j = tid; j < PAIR_TILE * QK_K; j += blockDim.x) {
+                const unsigned u = j >> 8;
+                const unsigned k = j & 255u;
+                shmid[j] = (pair[u] >= 0) ? mid[(uint64_t)(unsigned)pair[u] * K + mbase + k] : 0.0f;
+            }
+            __syncthreads();
+            if (row_valid) {
+                const unsigned char* blk = wrow + (uint64_t)b * Q2K_BYTES;
+#pragma unroll
+                for (unsigned kk = 0; kk < 8u; ++kk) {
+                    const unsigned i = lane + (kk << 5);
+                    const float wv = q2_k_dequant(blk, i);
+#pragma unroll
+                    for (unsigned u = 0; u < PAIR_TILE; ++u) acc[u] += wv * shmid[(u << 8) + i];
+                }
+            }
+            __syncthreads();
+        }
+#pragma unroll
+        for (unsigned u = 0; u < PAIR_TILE; ++u) acc[u] = warp_reduce_sum(acc[u]);
+        if (lane == 0 && row_valid) {
+#pragma unroll
+            for (unsigned u = 0; u < PAIR_TILE; ++u) {
+                if (pair[u] >= 0) out[(uint64_t)(unsigned)pair[u] * N + row] = acc[u];
+            }
+        }
+    }
+}
+
+template <int MTILES=8, int BM=16, int BN=16, int BK=16>
+__global__ void q2_gate_up_hotlist_wmma_multim_kernel(float* __restrict__ mid,
+                                                       const unsigned char* __restrict__ gate_w,
+                                                       const unsigned char* __restrict__ up_w,
+                                                       const float* __restrict__ x,
+                                                       const int* __restrict__ counts,
+                                                       const int* __restrict__ buckets,
+                                                       const int* __restrict__ hot_experts,
+                                                       unsigned stride,
+                                                       unsigned K,
+                                                       unsigned N,
+                                                       unsigned row_bytes,
+                                                       uint64_t expert_bytes) {
+    extern __shared__ unsigned char raw_sh[];
+    half* shA = reinterpret_cast<half*>(raw_sh);
+    half* shBg = shA + MTILES * BM * BK;
+    half* shBu = shBg + BK * BN;
+    float* shCg = reinterpret_cast<float*>(shBu + BK * BN);
+    float* shCu = shCg + MTILES * BM * BN;
+    const unsigned expert = (unsigned)hot_experts[blockIdx.z];
+    const unsigned count = (unsigned)counts[expert];
+    const unsigned tile_m_group = blockIdx.y;
+    const unsigned tile_n = blockIdx.x;
+    const unsigned m_group0 = tile_m_group * MTILES * BM;
+    if (m_group0 >= count) return;
+    const unsigned n0 = tile_n * BN;
+    const unsigned tid = threadIdx.x;
+    const unsigned wave = tid >> 5;
+    using frag_a = rocwmma::fragment<rocwmma::matrix_a, BM, BN, BK, half, rocwmma::row_major>;
+    using frag_b = rocwmma::fragment<rocwmma::matrix_b, BM, BN, BK, half, rocwmma::row_major>;
+    using frag_c = rocwmma::fragment<rocwmma::accumulator, BM, BN, BK, float>;
+    frag_a a;
+    frag_b bg;
+    frag_b bu;
+    frag_c accg;
+    frag_c accu;
+    if (wave < MTILES) {
+        rocwmma::fill_fragment(accg, 0.0f);
+        rocwmma::fill_fragment(accu, 0.0f);
+    }
+    const unsigned char* gew = gate_w + (uint64_t)expert * expert_bytes;
+    const unsigned char* uew = up_w + (uint64_t)expert * expert_bytes;
+    for (unsigned k0 = 0; k0 < K; k0 += BK) {
+        for (unsigned j = tid; j < MTILES * BM * BK; j += blockDim.x) {
+            const unsigned mt = j / (BM * BK);
+            const unsigned rem = j - mt * BM * BK;
+            const unsigned mm = rem / BK;
+            const unsigned kk = rem - mm * BK;
+            const unsigned bucket_row = m_group0 + mt * BM + mm;
+            if (bucket_row < count) {
+                const unsigned pair = (unsigned)buckets[(uint64_t)expert * stride + bucket_row];
+                const unsigned token = pair / 6u;
+                shA[j] = __float2half(x[(uint64_t)token * K + k0 + kk]);
+            } else {
+                shA[j] = __float2half(0.0f);
+            }
+        }
+        for (unsigned j = tid; j < BK * BN; j += blockDim.x) {
+            const unsigned kk = j / BN;
+            const unsigned nn = j - kk * BN;
+            const unsigned row = n0 + nn;
+            const unsigned k = k0 + kk;
+            const uint64_t off = (uint64_t)row * row_bytes + (uint64_t)(k >> 8) * Q2K_BYTES;
+            shBg[j] = __float2half(q2_k_dequant(gew + off, k & 255u));
+            shBu[j] = __float2half(q2_k_dequant(uew + off, k & 255u));
+        }
+        __syncthreads();
+        if (wave < MTILES) {
+            rocwmma::load_matrix_sync(a, shA + wave * BM * BK, BK);
+            rocwmma::load_matrix_sync(bg, shBg, BN);
+            rocwmma::load_matrix_sync(bu, shBu, BN);
+            rocwmma::mma_sync(accg, a, bg, accg);
+            rocwmma::mma_sync(accu, a, bu, accu);
+        }
+        __syncthreads();
+    }
+    if (wave < MTILES) {
+        rocwmma::store_matrix_sync(shCg + wave * BM * BN, accg, BN, rocwmma::mem_row_major);
+        rocwmma::store_matrix_sync(shCu + wave * BM * BN, accu, BN, rocwmma::mem_row_major);
+    }
+    __syncthreads();
+    for (unsigned j = tid; j < MTILES * BM * BN; j += blockDim.x) {
+        const unsigned mt = j / (BM * BN);
+        const unsigned rem = j - mt * BM * BN;
+        const unsigned mm = rem / BN;
+        const unsigned nn = rem - mm * BN;
+        const unsigned bucket_row = m_group0 + mt * BM + mm;
+        const unsigned row_n = n0 + nn;
+        if (bucket_row < count && row_n < N) {
+            const unsigned pair = (unsigned)buckets[(uint64_t)expert * stride + bucket_row];
+            mid[(uint64_t)pair * N + row_n] = silu_dev(shCg[j]) * shCu[j];
+        }
+    }
+}
+
+
+template <int MTILES=8, int BM=16, int BN=16, int BK=16>
+__global__ void q2_down_hotlist_wmma_multim_kernel(float* __restrict__ out,
+                                                   const unsigned char* __restrict__ w,
+                                                   const float* __restrict__ mid,
+                                                   const int* __restrict__ counts,
+                                                   const int* __restrict__ buckets,
+                                                   const int* __restrict__ hot_experts,
+                                                   unsigned stride,
+                                                   unsigned K,
+                                                   unsigned N,
+                                                   unsigned row_bytes,
+                                                   uint64_t expert_bytes) {
+    extern __shared__ unsigned char raw_sh[];
+    half* shA = reinterpret_cast<half*>(raw_sh);
+    half* shB = shA + MTILES * BM * BK;
+    float* shC = reinterpret_cast<float*>(shB + BK * BN);
+    const unsigned expert = (unsigned)hot_experts[blockIdx.z];
+    const unsigned count = (unsigned)counts[expert];
+    const unsigned tile_m_group = blockIdx.y;
+    const unsigned tile_n = blockIdx.x;
+    const unsigned m_group0 = tile_m_group * MTILES * BM;
+    if (m_group0 >= count) return;
+    const unsigned n0 = tile_n * BN;
+    const unsigned tid = threadIdx.x;
+    const unsigned wave = tid >> 5;
+    using frag_a = rocwmma::fragment<rocwmma::matrix_a, BM, BN, BK, half, rocwmma::row_major>;
+    using frag_b = rocwmma::fragment<rocwmma::matrix_b, BM, BN, BK, half, rocwmma::row_major>;
+    using frag_c = rocwmma::fragment<rocwmma::accumulator, BM, BN, BK, float>;
+    frag_a a;
+    frag_b b;
+    frag_c acc;
+    if (wave < MTILES) rocwmma::fill_fragment(acc, 0.0f);
+    const unsigned char* ew = w + (uint64_t)expert * expert_bytes;
+    for (unsigned k0 = 0; k0 < K; k0 += BK) {
+        for (unsigned j = tid; j < MTILES * BM * BK; j += blockDim.x) {
+            const unsigned mt = j / (BM * BK);
+            const unsigned rem = j - mt * BM * BK;
+            const unsigned mm = rem / BK;
+            const unsigned kk = rem - mm * BK;
+            const unsigned bucket_row = m_group0 + mt * BM + mm;
+            if (bucket_row < count) {
+                const unsigned pair = (unsigned)buckets[(uint64_t)expert * stride + bucket_row];
+                shA[j] = __float2half(mid[(uint64_t)pair * K + k0 + kk]);
+            } else {
+                shA[j] = __float2half(0.0f);
+            }
+        }
+        for (unsigned j = tid; j < BK * BN; j += blockDim.x) {
+            const unsigned kk = j / BN;
+            const unsigned nn = j - kk * BN;
+            const unsigned row = n0 + nn;
+            const unsigned k = k0 + kk;
+            const unsigned char* blk = ew + (uint64_t)row * row_bytes + (uint64_t)(k >> 8) * Q2K_BYTES;
+            shB[j] = __float2half(q2_k_dequant(blk, k & 255u));
+        }
+        __syncthreads();
+        if (wave < MTILES) {
+            rocwmma::load_matrix_sync(a, shA + wave * BM * BK, BK);
+            rocwmma::load_matrix_sync(b, shB, BN);
+            rocwmma::mma_sync(acc, a, b, acc);
+        }
+        __syncthreads();
+    }
+    if (wave < MTILES) rocwmma::store_matrix_sync(shC + wave * BM * BN, acc, BN, rocwmma::mem_row_major);
+    __syncthreads();
+    for (unsigned j = tid; j < MTILES * BM * BN; j += blockDim.x) {
+        const unsigned mt = j / (BM * BN);
+        const unsigned rem = j - mt * BM * BN;
+        const unsigned mm = rem / BN;
+        const unsigned nn = rem - mm * BN;
+        const unsigned bucket_row = m_group0 + mt * BM + mm;
+        const unsigned row_n = n0 + nn;
+        if (bucket_row < count && row_n < N) {
+            const unsigned pair = (unsigned)buckets[(uint64_t)expert * stride + bucket_row];
+            out[(uint64_t)pair * N + row_n] = shC[j];
+        }
+    }
+}
+
+struct ReplayRoutingDump {
+    unsigned idx = 0;
+    unsigned tokens = 0;
+    std::vector<unsigned> counts;
+};
+
+static std::vector<ReplayRoutingDump> parse_routing_dumps_file(const char* path) {
+    std::ifstream in(path);
+    if (!in) throw std::runtime_error(std::string("open routing log failed: ") + path);
+    std::vector<ReplayRoutingDump> dumps;
+    ReplayRoutingDump cur;
+    bool have = false;
+    std::string line;
+    while (std::getline(in, line)) {
+        const size_t dump_pos = line.find("HIP MoE routing dump #");
+        if (dump_pos != std::string::npos) {
+            if (have && cur.counts.size() == 256) dumps.push_back(cur);
+            cur = ReplayRoutingDump{};
+            have = true;
+            const char* s = line.c_str() + dump_pos;
+            (void)std::sscanf(s, "HIP MoE routing dump #%u tokens=%u", &cur.idx, &cur.tokens);
+            continue;
+        }
+        if (!have) continue;
+        const size_t epos = line.find("ds4:   e");
+        if (epos == std::string::npos) continue;
+        const size_t colon = line.find(':', epos + 7);
+        if (colon == std::string::npos) continue;
+        std::istringstream iss(line.substr(colon + 1));
+        unsigned v = 0;
+        while (iss >> v) cur.counts.push_back(v);
+        if (cur.counts.size() == 256) {
+            dumps.push_back(cur);
+            cur = ReplayRoutingDump{};
+            have = false;
+        }
+    }
+    if (have && cur.counts.size() == 256) dumps.push_back(cur);
+    return dumps;
+}
+
+static std::string replay_tensor_name(unsigned layer, const char* suffix) {
+    return std::string("blk.") + std::to_string(layer) + suffix;
+}
+
+static void fill_random(std::vector<float>& v, unsigned seed) {
+    std::mt19937 rng(seed);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    for (float& x : v) x = dist(rng);
+}
+
+static void compare_device_vectors(const char* name, const float* dRef, const float* dGot, uint64_t elems) {
+    std::vector<float> hRef(elems), hGot(elems);
+    HIP_CHECK(hipMemcpy(hRef.data(), dRef, elems * sizeof(float), hipMemcpyDeviceToHost));
+    HIP_CHECK(hipMemcpy(hGot.data(), dGot, elems * sizeof(float), hipMemcpyDeviceToHost));
+    compare_vectors(name, hRef, hGot);
+}
+
+static int run_replay_routing_layer(const char* model_path,
+                                    unsigned layer,
+                                    const char* routing_path,
+                                    unsigned dump_index,
+                                    int iters,
+                                    unsigned gate_hot_threshold,
+                                    unsigned down_hot_threshold) {
+    if (iters <= 0) iters = 1;
+    std::vector<ReplayRoutingDump> dumps = parse_routing_dumps_file(routing_path);
+    if (dumps.empty()) throw std::runtime_error("no complete routing dumps found");
+    const ReplayRoutingDump* chosen = nullptr;
+    for (const ReplayRoutingDump& d : dumps) {
+        if (d.idx == dump_index) { chosen = &d; break; }
+    }
+    if (!chosen && dump_index > 0 && dump_index <= dumps.size()) chosen = &dumps[dump_index - 1];
+    if (!chosen) throw std::runtime_error("requested routing dump not found");
+
+    uint64_t pair_stride64 = 0;
+    unsigned active = 0, hot_gate = 0, hot_down = 0;
+    uint64_t gate_hot_work = 0, down_hot_work = 0;
+    for (unsigned c : chosen->counts) {
+        pair_stride64 += c;
+        active += c ? 1u : 0u;
+        if (c >= gate_hot_threshold) { ++hot_gate; gate_hot_work += c; }
+        if (c >= down_hot_threshold) { ++hot_down; down_hot_work += c; }
+    }
+    if (pair_stride64 == 0 || pair_stride64 > UINT32_MAX) throw std::runtime_error("bad routing assignment count");
+    if ((pair_stride64 % 6u) != 0u) throw std::runtime_error("routing assignment count is not divisible by top-k=6");
+    const unsigned pair_stride = (unsigned)pair_stride64;
+    const unsigned tokens = pair_stride / 6u;
+
+    GgufView gguf(model_path);
+    const std::string gate_name = replay_tensor_name(layer, ".ffn_gate_exps.weight");
+    const std::string up_name = replay_tensor_name(layer, ".ffn_up_exps.weight");
+    const std::string down_name = replay_tensor_name(layer, ".ffn_down_exps.weight");
+    const GgufView::Tensor* tg = gguf.find(gate_name);
+    const GgufView::Tensor* tu = gguf.find(up_name);
+    const GgufView::Tensor* td = gguf.find(down_name);
+    if (!tg || !tu || !td) throw std::runtime_error("layer routed MoE tensors not found");
+    if (tg->type != 10u || tu->type != 10u || td->type != 10u || tg->ndim != 3 || tu->ndim != 3 || td->ndim != 3) {
+        throw std::runtime_error("replay expects rank-3 Q2_K gate/up/down expert tensors");
+    }
+    if (tg->dims[2] != chosen->counts.size() || tu->dims[2] != chosen->counts.size() || td->dims[2] != chosen->counts.size()) {
+        throw std::runtime_error("routing expert count does not match tensor expert dimension");
+    }
+    if (tg->dims[0] > UINT32_MAX || tg->dims[1] > UINT32_MAX || td->dims[0] > UINT32_MAX || td->dims[1] > UINT32_MAX) {
+        throw std::runtime_error("tensor dims too large for replay");
+    }
+    const unsigned Kgate = (unsigned)tg->dims[0];
+    const unsigned Ngate = (unsigned)tg->dims[1];
+    const unsigned Kdown = (unsigned)td->dims[0];
+    const unsigned Ndown = (unsigned)td->dims[1];
+    if (tg->dims[0] != tu->dims[0] || tg->dims[1] != tu->dims[1] || tg->dims[2] != tu->dims[2] || Kdown != Ngate) {
+        throw std::runtime_error("unexpected gate/up/down tensor geometry");
+    }
+    if ((Kgate % QK_K) != 0 || (Kdown % QK_K) != 0 || (Ngate % 16u) != 0 || (Ndown % 16u) != 0) {
+        throw std::runtime_error("unsupported replay tensor alignment");
+    }
+    const uint64_t gate_row_bytes = (uint64_t)(Kgate / QK_K) * Q2K_BYTES;
+    const uint64_t down_row_bytes = (uint64_t)(Kdown / QK_K) * Q2K_BYTES;
+    const uint64_t gate_expert_bytes = (uint64_t)Ngate * gate_row_bytes;
+    const uint64_t down_expert_bytes = (uint64_t)Ndown * down_row_bytes;
+
+    HIP_CHECK(hipSetDevice(0));
+    hipDeviceProp_t prop{};
+    HIP_CHECK(hipGetDeviceProperties(&prop, 0));
+    std::printf("rocWMMA version: %s\n", rocwmma_get_version().c_str());
+    std::printf("device: %s arch=%s warpSize=%d\n", prop.name, prop.gcnArchName, prop.warpSize);
+    std::printf("Q2_K whole-layer routing replay: layer=%u dump=%u tokens=%u pairs=%u active=%u iters=%d\n",
+                layer, chosen->idx, tokens, pair_stride, active, iters);
+    std::printf("gate tensor: "); print_gguf_tensor(*tg);
+    std::printf("up tensor:   "); print_gguf_tensor(*tu);
+    std::printf("down tensor: "); print_gguf_tensor(*td);
+    std::printf("hybrid thresholds: gate>=%u experts=%u work=%.2f%%, down>=%u experts=%u work=%.2f%%\n",
+                gate_hot_threshold, hot_gate, 100.0 * (double)gate_hot_work / (double)pair_stride64,
+                down_hot_threshold, hot_down, 100.0 * (double)down_hot_work / (double)pair_stride64);
+
+    std::vector<int> hCounts(chosen->counts.begin(), chosen->counts.end());
+    std::vector<int> hBuckets(pair_stride);
+    std::vector<int> hBucketsStride((uint64_t)chosen->counts.size() * pair_stride, 0);
+    std::vector<unsigned> offsets(chosen->counts.size());
+    std::vector<int> ids(pair_stride);
+    for (unsigned i = 0; i < pair_stride; ++i) ids[i] = (int)i;
+    std::mt19937 rng(1234);
+    std::shuffle(ids.begin(), ids.end(), rng);
+    unsigned p = 0;
+    std::vector<int> hGateHot;
+    std::vector<int> hDownHot;
+    unsigned max_gate_hot_count = 0;
+    unsigned max_down_hot_count = 0;
+    for (unsigned e = 0; e < chosen->counts.size(); ++e) {
+        offsets[e] = p;
+        const unsigned c = chosen->counts[e];
+        for (unsigned j = 0; j < c; ++j) hBuckets[p + j] = ids[p + j];
+        std::sort(hBuckets.begin() + p, hBuckets.begin() + p + c);
+        for (unsigned j = 0; j < c; ++j) hBucketsStride[(uint64_t)e * pair_stride + j] = hBuckets[p + j];
+        if (c >= gate_hot_threshold && c != 0u) {
+            hGateHot.push_back((int)e);
+            max_gate_hot_count = std::max(max_gate_hot_count, c);
+        }
+        if (c >= down_hot_threshold && c != 0u) {
+            hDownHot.push_back((int)e);
+            max_down_hot_count = std::max(max_down_hot_count, c);
+        }
+        p += c;
+    }
+
+    std::vector<float> hX((uint64_t)tokens * Kgate);
+    std::vector<float> hDownIn((uint64_t)pair_stride * Kdown);
+    fill_random(hX, 7);
+    fill_random(hDownIn, 11);
+
+    unsigned char *dGate = nullptr, *dUp = nullptr, *dDown = nullptr;
+    int *dCounts = nullptr, *dBuckets = nullptr, *dBucketsStride = nullptr, *dGateHot = nullptr, *dDownHot = nullptr;
+    float *dX = nullptr, *dMidCur = nullptr, *dMidHybrid = nullptr, *dDownIn = nullptr, *dOutCur = nullptr, *dOutHybrid = nullptr;
+    HIP_CHECK(hipMalloc(&dGate, tg->bytes));
+    HIP_CHECK(hipMalloc(&dUp, tu->bytes));
+    HIP_CHECK(hipMalloc(&dDown, td->bytes));
+    HIP_CHECK(hipMalloc(&dCounts, hCounts.size() * sizeof(int)));
+    HIP_CHECK(hipMalloc(&dBuckets, hBuckets.size() * sizeof(int)));
+    HIP_CHECK(hipMalloc(&dBucketsStride, hBucketsStride.size() * sizeof(int)));
+    if (!hGateHot.empty()) HIP_CHECK(hipMalloc(&dGateHot, hGateHot.size() * sizeof(int)));
+    if (!hDownHot.empty()) HIP_CHECK(hipMalloc(&dDownHot, hDownHot.size() * sizeof(int)));
+    HIP_CHECK(hipMalloc(&dX, hX.size() * sizeof(float)));
+    HIP_CHECK(hipMalloc(&dMidCur, (uint64_t)pair_stride * Ngate * sizeof(float)));
+    HIP_CHECK(hipMalloc(&dMidHybrid, (uint64_t)pair_stride * Ngate * sizeof(float)));
+    HIP_CHECK(hipMalloc(&dDownIn, hDownIn.size() * sizeof(float)));
+    HIP_CHECK(hipMalloc(&dOutCur, (uint64_t)pair_stride * Ndown * sizeof(float)));
+    HIP_CHECK(hipMalloc(&dOutHybrid, (uint64_t)pair_stride * Ndown * sizeof(float)));
+    HIP_CHECK(hipMemcpy(dGate, gguf.data() + tg->abs_offset, tg->bytes, hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(dUp, gguf.data() + tu->abs_offset, tu->bytes, hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(dDown, gguf.data() + td->abs_offset, td->bytes, hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(dCounts, hCounts.data(), hCounts.size() * sizeof(int), hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(dBuckets, hBuckets.data(), hBuckets.size() * sizeof(int), hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(dBucketsStride, hBucketsStride.data(), hBucketsStride.size() * sizeof(int), hipMemcpyHostToDevice));
+    if (dGateHot) HIP_CHECK(hipMemcpy(dGateHot, hGateHot.data(), hGateHot.size() * sizeof(int), hipMemcpyHostToDevice));
+    if (dDownHot) HIP_CHECK(hipMemcpy(dDownHot, hDownHot.data(), hDownHot.size() * sizeof(int), hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(dX, hX.data(), hX.size() * sizeof(float), hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(dDownIn, hDownIn.data(), hDownIn.size() * sizeof(float), hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemset(dMidCur, 0, (uint64_t)pair_stride * Ngate * sizeof(float)));
+    HIP_CHECK(hipMemset(dMidHybrid, 0, (uint64_t)pair_stride * Ngate * sizeof(float)));
+    HIP_CHECK(hipMemset(dOutCur, 0, (uint64_t)pair_stride * Ndown * sizeof(float)));
+    HIP_CHECK(hipMemset(dOutHybrid, 0, (uint64_t)pair_stride * Ndown * sizeof(float)));
+
+    constexpr unsigned PAIR_TILE = 8;
+    const dim3 gate_cur_block(32 * 16, 1, 1);
+    const dim3 gate_cur_grid((Ngate + 15u) / 16u, 256u, 1);
+    const size_t gate_cur_shmem = PAIR_TILE * QK_K * sizeof(float);
+    const size_t gate_m8_shmem = (8 * 16 * 16 + 2 * 16 * 16) * sizeof(half) + (2 * 8 * 16 * 16) * sizeof(float);
+    auto launch_gate_current = [&](float* dst) {
+        hipLaunchKernelGGL((q2_gate_up_all_current_sharedx_kernel<PAIR_TILE>), gate_cur_grid, gate_cur_block, gate_cur_shmem, 0,
+                           dst, dGate, dUp, dX, dCounts, dBucketsStride, pair_stride,
+                           1u, 0u, Kgate, Ngate, (unsigned)gate_row_bytes, gate_expert_bytes);
+    };
+    auto launch_gate_cold = [&](float* dst) {
+        if (gate_hot_threshold == 0u) return;
+        hipLaunchKernelGGL((q2_gate_up_all_current_sharedx_kernel<PAIR_TILE>), gate_cur_grid, gate_cur_block, gate_cur_shmem, 0,
+                           dst, dGate, dUp, dX, dCounts, dBucketsStride, pair_stride,
+                           1u, gate_hot_threshold, Kgate, Ngate, (unsigned)gate_row_bytes, gate_expert_bytes);
+    };
+    auto launch_gate_hybrid = [&](float* dst) {
+        launch_gate_cold(dst);
+        if (dGateHot) {
+            dim3 block(32 * 8, 1, 1);
+            dim3 grid(Ngate / 16u, (max_gate_hot_count + 8u * 16u - 1u) / (8u * 16u), (unsigned)hGateHot.size());
+            hipLaunchKernelGGL((q2_gate_up_hotlist_wmma_multim_kernel<8,16,16,16>), grid, block, gate_m8_shmem, 0,
+                               dst, dGate, dUp, dX, dCounts, dBucketsStride, dGateHot, pair_stride,
+                               Kgate, Ngate, (unsigned)gate_row_bytes, gate_expert_bytes);
+        }
+    };
+
+    const dim3 down_cur_block(32 * 16, 1, 1);
+    const dim3 down_cur_grid((Ndown + 15u) / 16u, 256u, 1);
+    const size_t down_cur_shmem = PAIR_TILE * QK_K * sizeof(float);
+    const size_t down_m8_shmem = (8 * 16 * 16 + 16 * 16) * sizeof(half) + (8 * 16 * 16) * sizeof(float);
+    auto launch_down_current = [&](float* dst) {
+        hipLaunchKernelGGL((q2_down_all_current_sharedmid_kernel<PAIR_TILE>), down_cur_grid, down_cur_block, down_cur_shmem, 0,
+                           dst, dDown, dDownIn, dCounts, dBucketsStride, pair_stride,
+                           1u, 0u, Kdown, Ndown, (unsigned)down_row_bytes, down_expert_bytes);
+    };
+    auto launch_down_cold = [&](float* dst) {
+        if (down_hot_threshold == 0u) return;
+        hipLaunchKernelGGL((q2_down_all_current_sharedmid_kernel<PAIR_TILE>), down_cur_grid, down_cur_block, down_cur_shmem, 0,
+                           dst, dDown, dDownIn, dCounts, dBucketsStride, pair_stride,
+                           1u, down_hot_threshold, Kdown, Ndown, (unsigned)down_row_bytes, down_expert_bytes);
+    };
+    auto launch_down_hybrid = [&](float* dst) {
+        launch_down_cold(dst);
+        if (dDownHot) {
+            dim3 block(32 * 8, 1, 1);
+            dim3 grid(Ndown / 16u, (max_down_hot_count + 8u * 16u - 1u) / (8u * 16u), (unsigned)hDownHot.size());
+            hipLaunchKernelGGL((q2_down_hotlist_wmma_multim_kernel<8,16,16,16>), grid, block, down_m8_shmem, 0,
+                               dst, dDown, dDownIn, dCounts, dBucketsStride, dDownHot, pair_stride,
+                               Kdown, Ndown, (unsigned)down_row_bytes, down_expert_bytes);
+        }
+    };
+
+    launch_gate_current(dMidCur); HIP_CHECK(hipGetLastError());
+    launch_gate_hybrid(dMidHybrid); HIP_CHECK(hipGetLastError());
+    launch_down_current(dOutCur); HIP_CHECK(hipGetLastError());
+    launch_down_hybrid(dOutHybrid); HIP_CHECK(hipGetLastError());
+    HIP_CHECK(hipDeviceSynchronize());
+    compare_device_vectors("replay_gate_hybrid", dMidCur, dMidHybrid, (uint64_t)pair_stride * Ngate);
+    compare_device_vectors("replay_down_hybrid", dOutCur, dOutHybrid, (uint64_t)pair_stride * Ndown);
+
+    const float gate_cur_ms = time_kernel([&]() { launch_gate_current(dMidCur); }, iters);
+    HIP_CHECK(hipGetLastError());
+    const float gate_hybrid_ms = time_kernel([&]() { launch_gate_hybrid(dMidHybrid); }, iters);
+    HIP_CHECK(hipGetLastError());
+    const float down_cur_ms = time_kernel([&]() { launch_down_current(dOutCur); }, iters);
+    HIP_CHECK(hipGetLastError());
+    const float down_hybrid_ms = time_kernel([&]() { launch_down_hybrid(dOutHybrid); }, iters);
+    HIP_CHECK(hipGetLastError());
+    const double gate_flops = 4.0 * (double)pair_stride * (double)Kgate * (double)Ngate;
+    const double down_flops = 2.0 * (double)pair_stride * (double)Kdown * (double)Ndown;
+    std::printf("replay gate current: %.4f ms  %.2f logical TFLOP/s\n", gate_cur_ms, gate_flops / (gate_cur_ms * 1.0e-3) / 1.0e12);
+    std::printf("replay gate hybrid:  %.4f ms  %.2f logical TFLOP/s  speedup %.3fx\n", gate_hybrid_ms, gate_flops / (gate_hybrid_ms * 1.0e-3) / 1.0e12, gate_cur_ms / gate_hybrid_ms);
+    std::printf("replay down current: %.4f ms  %.2f logical TFLOP/s\n", down_cur_ms, down_flops / (down_cur_ms * 1.0e-3) / 1.0e12);
+    std::printf("replay down hybrid:  %.4f ms  %.2f logical TFLOP/s  speedup %.3fx\n", down_hybrid_ms, down_flops / (down_hybrid_ms * 1.0e-3) / 1.0e12, down_cur_ms / down_hybrid_ms);
+    std::printf("replay routed total: current %.4f ms, hybrid %.4f ms, speedup %.3fx, save %.4f ms\n",
+                gate_cur_ms + down_cur_ms, gate_hybrid_ms + down_hybrid_ms,
+                (gate_cur_ms + down_cur_ms) / (gate_hybrid_ms + down_hybrid_ms),
+                (gate_cur_ms + down_cur_ms) - (gate_hybrid_ms + down_hybrid_ms));
+
+    HIP_CHECK(hipFree(dGate));
+    HIP_CHECK(hipFree(dUp));
+    HIP_CHECK(hipFree(dDown));
+    HIP_CHECK(hipFree(dCounts));
+    HIP_CHECK(hipFree(dBuckets));
+    HIP_CHECK(hipFree(dBucketsStride));
+    if (dGateHot) HIP_CHECK(hipFree(dGateHot));
+    if (dDownHot) HIP_CHECK(hipFree(dDownHot));
+    HIP_CHECK(hipFree(dX));
+    HIP_CHECK(hipFree(dMidCur));
+    HIP_CHECK(hipFree(dMidHybrid));
+    HIP_CHECK(hipFree(dDownIn));
+    HIP_CHECK(hipFree(dOutCur));
+    HIP_CHECK(hipFree(dOutHybrid));
+    return 0;
+}
+
 int main(int argc, char** argv) {
     unsigned M = 64;    // routed (token,slot) pairs for one expert bucket
     unsigned K = 2048;  // input dim for the selected expert matrix
@@ -1496,6 +2116,23 @@ int main(int argc, char** argv) {
     bool down_bucket_mode = false;
 
     try {
+        if (argc >= 2 && std::strcmp(argv[1], "--gguf-replay-routing") == 0) {
+            if (argc < 5) {
+                std::fprintf(stderr,
+                             "usage: %s --gguf-replay-routing MODEL.gguf LAYER ROUTING_LOG [DUMP_INDEX=1] [iters=3] [GATE_HOT=64] [DOWN_HOT=32]\n",
+                             argv[0]);
+                return 2;
+            }
+            const char* path = argv[2];
+            const unsigned layer = (unsigned)std::strtoul(argv[3], nullptr, 10);
+            const char* routing = argv[4];
+            const unsigned dump_idx = (argc >= 6) ? (unsigned)std::strtoul(argv[5], nullptr, 10) : 1u;
+            const int replay_iters = (argc >= 7) ? std::atoi(argv[6]) : 3;
+            const unsigned gate_hot = (argc >= 8) ? (unsigned)std::strtoul(argv[7], nullptr, 10) : 64u;
+            const unsigned down_hot = (argc >= 9) ? (unsigned)std::strtoul(argv[8], nullptr, 10) : 32u;
+            return run_replay_routing_layer(path, layer, routing, dump_idx, replay_iters, gate_hot, down_hot);
+        }
+
         if (argc >= 2 && std::strcmp(argv[1], "--gguf-find") == 0) {
             if (argc < 4) {
                 std::fprintf(stderr, "usage: %s --gguf-find MODEL.gguf SUBSTRING\n", argv[0]);

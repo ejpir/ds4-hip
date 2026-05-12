@@ -113,20 +113,21 @@ on AMD ROCm. The current tested GPU is an AMD Radeon 8060S (`gfx1151`, wave32,
 124 GiB unified/global memory). Numbers below include zero-copy fast and
 full-copy profiles using fast prefill attention, default-on Q8 shared-X batched
 prefill, default-on indexer qmix scoring, Q2_K expert-batched MoE with LDS reuse,
-Q8 decode repack, and split16 Q8 decode repack. Q8 WMMA prefill is listed
-separately because it is still an experimental opt-in correctness/perf path.
+Q8 decode repack, and split16 Q8 decode repack. WMMA prefill paths are listed
+separately because they are still experimental opt-in correctness/perf paths.
 
 | Machine | Backend | Quant | Prompt | Prefill | Generation |
 | --- | --- | ---: | ---: | ---: | ---: |
-| AMD Radeon 8060S / ROCm HIP | HIP zero-copy fast | Q2_K | 4180 tokens | 53.07 t/s | n/a (`-n 1`) |
+| AMD Radeon 8060S / ROCm HIP | HIP zero-copy fast | Q2_K | 5707 tokens | 53.59 t/s | n/a (`-n 1`) |
+| AMD Radeon 8060S / ROCm HIP | HIP zero-copy + hot MoE WMMA | Q2_K | 5707 tokens | 58.65 t/s | n/a (`-n 1`) |
 | AMD Radeon 8060S / ROCm HIP | HIP zero-copy fast | Q2_K | 1003 tokens | 33.21 t/s | 7.17 t/s |
 | AMD Radeon 8060S / ROCm HIP | HIP zero-copy fast | Q2_K | 1905 tokens | 32.61 t/s | 8.88 t/s |
 | AMD Radeon 8060S / ROCm HIP | HIP full-copy | Q2_K | 1003 tokens | 33.72 t/s | 9.37 t/s |
 | AMD Radeon 8060S / ROCm HIP | HIP full-copy | Q2_K | 1905 tokens | 33.46 t/s | 9.20 t/s |
 
-The 4180-token row is a prefill-only `--tokens 1 --temp 0` check; its generation
-number is intentionally omitted because the first sampled token performs no
-decode evaluation.
+The 5707-token rows are prefill-only `--tokens 1 --temp 0` checks; their
+generation numbers are intentionally omitted because the first sampled token
+performs no decode evaluation.
 
 The HIP zero-copy fast profile keeps the 92 GiB GGUF tensor payload mapped from
 host memory and avoids the full model copy, while still using the fast prefill
@@ -136,10 +137,12 @@ uses FP32 WMMA accumulation, skips small batches by default, and builds about
 3.35 GiB of FP16 Q8 WMMA prefill weights. `DS4_HIP_Q8_HIPBLASLT=1` is a separate
 experimental q-side path that uses hipBLASLt for small prefill batches
 (default `DS4_HIP_Q8_HIPBLASLT_MAX_TOKENS=256`) and falls back to the custom
-path for larger chunks. Full-copy copies the GGUF tensor payload into GPU memory
-at startup and eagerly builds about 4.6 GiB of Q8 decode repacks. Full-copy is
-therefore opt-in. Conservative HIP server mode keeps zero-copy mapped GGUF
-weights and avoids the full copy.
+path for larger chunks. The Q2_K hot-bucket MoE WMMA path is also opt-in; it
+keeps scalar/shared-X kernels for small expert buckets and applies WMMA only to
+large routed expert buckets. Full-copy copies the GGUF tensor payload into GPU
+memory at startup and eagerly builds about 4.6 GiB of Q8 decode repacks.
+Full-copy is therefore opt-in. Conservative HIP server mode keeps zero-copy
+mapped GGUF weights and avoids the full copy.
 
 ## ROCm/HIP quick start and max performance
 
@@ -188,6 +191,23 @@ DS4_SERVER_Q8_REPACK=1
 DS4_SERVER_Q8_REPACK_SPLIT16=1
 ```
 
+For the fastest currently measured long-prompt prefill, add the experimental
+hot-bucket Q2_K MoE WMMA path on top of the fast profile:
+
+```sh
+DS4_SERVER_FAST_FULL=1 \
+DS4_SERVER_MOE_WMMA_HOT=1 \
+DS4_SERVER_MOE_WMMA_GATE_HOT=64 \
+DS4_SERVER_MOE_WMMA_DOWN_HOT=32 \
+  scripts/start_ds4_server.sh
+```
+
+The same CLI-only knobs are `DS4_HIP_MOE_WMMA_HOT=1`,
+`DS4_HIP_MOE_WMMA_GATE_HOT=N`, and `DS4_HIP_MOE_WMMA_DOWN_HOT=N`. This path is
+not part of `DS4_SERVER_FAST_FULL` yet because it uses FP16 WMMA inputs for Q2_K
+expert tiles and still needs broader greedy-logprob drift testing; the strict
+first-token smoke above stayed `We` on the long-prompt gate.
+
 The HIP Q8 shared-X batched prefill matmul is now default-on (tile32 for normal
 Q8 batch matmuls, tile16/RPB32 for grouped `attn_output_a` low projection). The Q8
 server variables above are kept for reproducible presets and overrides; set
@@ -204,10 +224,11 @@ safe restart behavior.
 
 The HIP backend is now at the first stable fast path: zero-copy and full-copy
 loading both work, the non-winning experiments have been removed, and the
-winning Q8 batched prefill path is enabled by default. The remaining best
-prefill/decode knobs are exposed through `DS4_SERVER_FAST_FULL=1`. The next work
-is kernel quality, then decode/inference behavior, then KV/cache work. After the
-first Q2_K WMMA microbench, dense Q8 is the Phase 1 target:
+winning Q8 batched prefill path is enabled by default. The remaining safe
+prefill/decode knobs are exposed through `DS4_SERVER_FAST_FULL=1`; the new Q2_K
+hot-bucket MoE WMMA path is opt-in separately while correctness drift is tested.
+The next work is kernel quality, then decode/inference behavior, then KV/cache
+work:
 
 1. **rocWMMA on dense Q8 projections**
    - The production opt-in path is currently restricted to the q-side
@@ -220,11 +241,14 @@ first Q2_K WMMA microbench, dense Q8 is the Phase 1 target:
      row layout, and keep greedy correctness gates on by default.
 
 2. **rocWMMA on Q2_K routed experts**
-   - The first down-projection microbench shows direct dequant-to-LDS WMMA is
-     slower, while pre-repacked half `KxN` WMMA can win. Do not integrate the
-     direct path.
-   - Revisit Q2_K after dense Q8 WMMA with refined repack assumptions, and keep
-     scalar fallbacks for small expert buckets and correctness.
+   - The current opt-in hot-bucket path uses a compact hot-expert list and WMMA
+     only for large routed buckets, leaving scalar/shared-X expert kernels for
+     small buckets. It improved the 5707-token prefill smoke from ~53.6 t/s to
+     ~58.7 t/s with the same first token, but remains off by default until wider
+     greedy-logprob checks are done.
+   - Keep thresholds conservative for serving experiments (`GATE_HOT=128` or
+     down-only first) and keep scalar fallbacks for small expert buckets and
+     correctness.
 
 3. **hipBLASLt-quality custom kernels**
    - The goal is not merely “use WMMA”, but kernels with hipBLASLt-like quality:
@@ -244,11 +268,12 @@ first Q2_K WMMA microbench, dense Q8 is the Phase 1 target:
      better understood. This includes live KV memory layout, disk KV reuse,
      long-context cache movement, and cache/server ergonomics.
 
-Realistic prefill trajectory for the HIP fast path is roughly: current measured
-long-prompt zero-copy fast path ~52-53 tok/s; indexed mixed attention and Q2_K
-routed MoE are now the main remaining bottlenecks for pushing toward ~80 tok/s.
-Q8 WMMA and hipBLASLt remain opt-in diagnostics until they beat the custom fast
-path without quality drift.
+Realistic prefill trajectory for the HIP fast path is roughly: default measured
+long-prompt zero-copy fast path ~53-54 tok/s, opt-in hot-MoE WMMA ~58-59 tok/s;
+indexed mixed attention and Q2_K routed MoE are still the main remaining
+bottlenecks for pushing toward ~80 tok/s. Q8 WMMA, Q2_K hot-bucket WMMA, and
+hipBLASLt remain opt-in diagnostics until they beat the custom fast path without
+quality drift.
 
 ## CLI
 

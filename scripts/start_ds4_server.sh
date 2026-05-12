@@ -49,6 +49,9 @@ Environment:
   DS4_SERVER_MOE_DOWN_RPB=N      Rows/block for expert-bucketed down; e.g. 16 with shared-mid experiment
   DS4_SERVER_MOE_EXPERT_SHARED_X=1    Experimental LDS x tile reuse for gate/up; use with GATE_RPB>1
   DS4_SERVER_MOE_EXPERT_SHARED_MID=1  Experimental LDS mid tile reuse for down; use with DOWN_RPB>1
+  DS4_SERVER_MOE_WMMA_HOT=1      Opt-in hot-bucket Q2_K WMMA MoE path
+  DS4_SERVER_MOE_WMMA_GATE_HOT=N Gate/up WMMA bucket threshold; default 128
+  DS4_SERVER_MOE_WMMA_DOWN_HOT=N Down WMMA bucket threshold; default 64
   DS4_SERVER_COPY_MODEL=1        Copy GGUF tensor payload to HIP allocation using staged chunks
   DS4_SERVER_COPY_MODEL_CHUNK_MB=256  Staged full-copy chunk size
   DS4_SESSION_PROGRESS_RAW_MAX_TOKENS=512  Use cancellable layer-by-layer prefill above this
@@ -238,6 +241,15 @@ if [[ "${DS4_SERVER_MOE_EXPERT_SHARED_X:-0}" == "1" ]]; then
 fi
 if [[ "${DS4_SERVER_MOE_EXPERT_SHARED_MID:-0}" == "1" ]]; then
   export DS4_HIP_MOE_EXPERT_SHARED_MID=1
+fi
+if [[ "${DS4_SERVER_MOE_WMMA_HOT:-0}" == "1" ]]; then
+  export DS4_HIP_MOE_WMMA_HOT=1
+fi
+if [[ -n "${DS4_SERVER_MOE_WMMA_GATE_HOT:-}" ]]; then
+  export DS4_HIP_MOE_WMMA_GATE_HOT="$DS4_SERVER_MOE_WMMA_GATE_HOT"
+fi
+if [[ -n "${DS4_SERVER_MOE_WMMA_DOWN_HOT:-}" ]]; then
+  export DS4_HIP_MOE_WMMA_DOWN_HOT="$DS4_SERVER_MOE_WMMA_DOWN_HOT"
 fi
 if [[ "${DS4_SERVER_COPY_MODEL:-0}" == "1" ]]; then
   export DS4_HIP_COPY_MODEL=1

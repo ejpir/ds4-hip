@@ -5170,6 +5170,12 @@ __device__ static inline float ds4_hip_q2_k_dequant_256_scaled(const unsigned ch
     return d * scale * q - dmin * mn;
 }
 
+__device__ static inline float ds4_hip_q2_k_dequant_256_direct(const unsigned char *blk, uint32_t i) {
+    const uint16_t d_bits = (uint16_t)blk[80] | ((uint16_t)blk[81] << 8);
+    const uint16_t dmin_bits = (uint16_t)blk[82] | ((uint16_t)blk[83] << 8);
+    return ds4_hip_q2_k_dequant_256_scaled(blk, i, ds4_hip_f16_to_f32(d_bits), ds4_hip_f16_to_f32(dmin_bits));
+}
+
 __device__ static inline float ds4_hip_q2_k_dequant_256_scaled_w32(const unsigned char *blk, uint32_t lane,
                                                                    uint32_t kk, float d, float dmin) {
     const unsigned char *sc = blk;
@@ -5620,6 +5626,203 @@ __global__ static void ds4_hip_moe_q2_down_expert_batch_sharedmid_kernel(float *
             for (uint32_t u = 0; u < PAIR_TILE; u++) {
                 if (pair[u] >= 0) experts[(uint64_t)(uint32_t)pair[u] * out_dim + row] = acc[u];
             }
+        }
+    }
+}
+
+template <int MTILES=8, int BM=16, int BN=16, int BK=16>
+__global__ static void ds4_hip_moe_q2_gate_up_hotlist_wmma_kernel(float *__restrict__ mid,
+                                                                  const unsigned char *__restrict__ gate_w,
+                                                                  const unsigned char *__restrict__ up_w,
+                                                                  const float *__restrict__ x,
+                                                                  const float *__restrict__ weights,
+                                                                  const int *__restrict__ counts,
+                                                                  const int *__restrict__ buckets,
+                                                                  const int *__restrict__ hot_experts,
+                                                                  uint32_t hot_count,
+                                                                  uint32_t stride,
+                                                                  uint32_t in_dim,
+                                                                  uint32_t mid_dim,
+                                                                  uint64_t gate_expert_bytes,
+                                                                  uint64_t gate_row_bytes,
+                                                                  uint64_t up_expert_bytes,
+                                                                  uint64_t up_row_bytes,
+                                                                  float clamp) {
+    extern __shared__ unsigned char raw_sh[];
+    half *shA = reinterpret_cast<half *>(raw_sh);
+    half *shBg = shA + MTILES * BM * BK;
+    half *shBu = shBg + BK * BN;
+    float *shCg = reinterpret_cast<float *>(shBu + BK * BN);
+    float *shCu = shCg + MTILES * BM * BN;
+    const uint32_t hot_idx = (uint32_t)blockIdx.z;
+    if (hot_idx >= hot_count) return;
+    const uint32_t expert = (uint32_t)hot_experts[hot_idx];
+    if (expert >= 256u) return;
+    const uint32_t count = (uint32_t)counts[expert];
+    const uint32_t m_group0 = (uint32_t)blockIdx.y * MTILES * BM;
+    if (m_group0 >= count) return;
+    const uint32_t n0 = (uint32_t)blockIdx.x * BN;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t wave = tid >> 5;
+
+    using frag_a = rocwmma::fragment<rocwmma::matrix_a, BM, BN, BK, half, rocwmma::row_major>;
+    using frag_b = rocwmma::fragment<rocwmma::matrix_b, BM, BN, BK, half, rocwmma::row_major>;
+    using frag_c = rocwmma::fragment<rocwmma::accumulator, BM, BN, BK, float>;
+    frag_a a;
+    frag_b bg;
+    frag_b bu;
+    frag_c accg;
+    frag_c accu;
+    if (wave < MTILES) {
+        rocwmma::fill_fragment(accg, 0.0f);
+        rocwmma::fill_fragment(accu, 0.0f);
+    }
+
+    const unsigned char *gew = gate_w + (uint64_t)expert * gate_expert_bytes;
+    const unsigned char *uew = up_w + (uint64_t)expert * up_expert_bytes;
+    for (uint32_t k0 = 0; k0 < in_dim; k0 += BK) {
+        for (uint32_t j = tid; j < MTILES * BM * BK; j += blockDim.x) {
+            const uint32_t mt = j / (BM * BK);
+            const uint32_t rem = j - mt * BM * BK;
+            const uint32_t mm = rem / BK;
+            const uint32_t kk = rem - mm * BK;
+            const uint32_t bucket_row = m_group0 + mt * BM + mm;
+            if (bucket_row < count) {
+                const uint32_t pair = (uint32_t)buckets[(uint64_t)expert * stride + bucket_row];
+                const uint32_t token = pair / 6u;
+                shA[j] = __float2half(x[(uint64_t)token * in_dim + k0 + kk]);
+            } else {
+                shA[j] = __float2half(0.0f);
+            }
+        }
+        for (uint32_t j = tid; j < BK * BN; j += blockDim.x) {
+            const uint32_t kk = j / BN;
+            const uint32_t nn = j - kk * BN;
+            const uint32_t row = n0 + nn;
+            const uint32_t k = k0 + kk;
+            const uint64_t goff = (uint64_t)row * gate_row_bytes + (uint64_t)(k >> 8) * 84u;
+            const uint64_t uoff = (uint64_t)row * up_row_bytes + (uint64_t)(k >> 8) * 84u;
+            shBg[j] = __float2half(ds4_hip_q2_k_dequant_256_direct(gew + goff, k & 255u));
+            shBu[j] = __float2half(ds4_hip_q2_k_dequant_256_direct(uew + uoff, k & 255u));
+        }
+        __syncthreads();
+        if (wave < MTILES) {
+            rocwmma::load_matrix_sync(a, shA + wave * BM * BK, BK);
+            rocwmma::load_matrix_sync(bg, shBg, BN);
+            rocwmma::load_matrix_sync(bu, shBu, BN);
+            rocwmma::mma_sync(accg, a, bg, accg);
+            rocwmma::mma_sync(accu, a, bu, accu);
+        }
+        __syncthreads();
+    }
+
+    if (wave < MTILES) {
+        rocwmma::store_matrix_sync(shCg + wave * BM * BN, accg, BN, rocwmma::mem_row_major);
+        rocwmma::store_matrix_sync(shCu + wave * BM * BN, accu, BN, rocwmma::mem_row_major);
+    }
+    __syncthreads();
+
+    for (uint32_t j = tid; j < MTILES * BM * BN; j += blockDim.x) {
+        const uint32_t mt = j / (BM * BN);
+        const uint32_t rem = j - mt * BM * BN;
+        const uint32_t mm = rem / BN;
+        const uint32_t nn = rem - mm * BN;
+        const uint32_t bucket_row = m_group0 + mt * BM + mm;
+        const uint32_t row = n0 + nn;
+        if (bucket_row < count && row < mid_dim) {
+            const uint32_t pair = (uint32_t)buckets[(uint64_t)expert * stride + bucket_row];
+            float g = shCg[j];
+            float u = shCu[j];
+            if (clamp > 1.0e-6f) {
+                if (g > clamp) g = clamp;
+                if (u > clamp) u = clamp;
+                if (u < -clamp) u = -clamp;
+            }
+            mid[(uint64_t)pair * mid_dim + row] = ds4_hip_silu(g) * u * weights[pair];
+        }
+    }
+}
+
+template <int MTILES=8, int BM=16, int BN=16, int BK=16>
+__global__ static void ds4_hip_moe_q2_down_hotlist_wmma_kernel(float *__restrict__ experts,
+                                                               const unsigned char *__restrict__ down_w,
+                                                               const float *__restrict__ mid,
+                                                               const int *__restrict__ counts,
+                                                               const int *__restrict__ buckets,
+                                                               const int *__restrict__ hot_experts,
+                                                               uint32_t hot_count,
+                                                               uint32_t stride,
+                                                               uint32_t mid_dim,
+                                                               uint32_t out_dim,
+                                                               uint64_t down_expert_bytes,
+                                                               uint64_t down_row_bytes) {
+    extern __shared__ unsigned char raw_sh[];
+    half *shA = reinterpret_cast<half *>(raw_sh);
+    half *shB = shA + MTILES * BM * BK;
+    float *shC = reinterpret_cast<float *>(shB + BK * BN);
+    const uint32_t hot_idx = (uint32_t)blockIdx.z;
+    if (hot_idx >= hot_count) return;
+    const uint32_t expert = (uint32_t)hot_experts[hot_idx];
+    if (expert >= 256u) return;
+    const uint32_t count = (uint32_t)counts[expert];
+    const uint32_t m_group0 = (uint32_t)blockIdx.y * MTILES * BM;
+    if (m_group0 >= count) return;
+    const uint32_t n0 = (uint32_t)blockIdx.x * BN;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t wave = tid >> 5;
+
+    using frag_a = rocwmma::fragment<rocwmma::matrix_a, BM, BN, BK, half, rocwmma::row_major>;
+    using frag_b = rocwmma::fragment<rocwmma::matrix_b, BM, BN, BK, half, rocwmma::row_major>;
+    using frag_c = rocwmma::fragment<rocwmma::accumulator, BM, BN, BK, float>;
+    frag_a a;
+    frag_b b;
+    frag_c acc;
+    if (wave < MTILES) rocwmma::fill_fragment(acc, 0.0f);
+
+    const unsigned char *dew = down_w + (uint64_t)expert * down_expert_bytes;
+    for (uint32_t k0 = 0; k0 < mid_dim; k0 += BK) {
+        for (uint32_t j = tid; j < MTILES * BM * BK; j += blockDim.x) {
+            const uint32_t mt = j / (BM * BK);
+            const uint32_t rem = j - mt * BM * BK;
+            const uint32_t mm = rem / BK;
+            const uint32_t kk = rem - mm * BK;
+            const uint32_t bucket_row = m_group0 + mt * BM + mm;
+            if (bucket_row < count) {
+                const uint32_t pair = (uint32_t)buckets[(uint64_t)expert * stride + bucket_row];
+                shA[j] = __float2half(mid[(uint64_t)pair * mid_dim + k0 + kk]);
+            } else {
+                shA[j] = __float2half(0.0f);
+            }
+        }
+        for (uint32_t j = tid; j < BK * BN; j += blockDim.x) {
+            const uint32_t kk = j / BN;
+            const uint32_t nn = j - kk * BN;
+            const uint32_t row = n0 + nn;
+            const uint32_t k = k0 + kk;
+            const uint64_t off = (uint64_t)row * down_row_bytes + (uint64_t)(k >> 8) * 84u;
+            shB[j] = __float2half(ds4_hip_q2_k_dequant_256_direct(dew + off, k & 255u));
+        }
+        __syncthreads();
+        if (wave < MTILES) {
+            rocwmma::load_matrix_sync(a, shA + wave * BM * BK, BK);
+            rocwmma::load_matrix_sync(b, shB, BN);
+            rocwmma::mma_sync(acc, a, b, acc);
+        }
+        __syncthreads();
+    }
+
+    if (wave < MTILES) rocwmma::store_matrix_sync(shC + wave * BM * BN, acc, BN, rocwmma::mem_row_major);
+    __syncthreads();
+    for (uint32_t j = tid; j < MTILES * BM * BN; j += blockDim.x) {
+        const uint32_t mt = j / (BM * BN);
+        const uint32_t rem = j - mt * BM * BN;
+        const uint32_t mm = rem / BN;
+        const uint32_t nn = rem - mm * BN;
+        const uint32_t bucket_row = m_group0 + mt * BM + mm;
+        const uint32_t row = n0 + nn;
+        if (bucket_row < count && row < out_dim) {
+            const uint32_t pair = (uint32_t)buckets[(uint64_t)expert * stride + bucket_row];
+            experts[(uint64_t)pair * out_dim + row] = shC[j];
         }
     }
 }
@@ -7647,7 +7850,7 @@ extern "C" int ds4_metal_routed_moe_batch_tensor(
         const uint32_t v = (uint32_t)std::strtoul(min_env, nullptr, 10);
         if (v >= 1u) expert_batch_min_tokens = v;
     }
-    const uint64_t expert_scratch_bytes = (256ull + 256ull * pair_stride) * sizeof(int);
+    const uint64_t expert_scratch_bytes = (256ull + 256ull * pair_stride + 512ull) * sizeof(int);
     const uint64_t experts_bytes = (uint64_t)n_tokens * 6u * out_dim * sizeof(float);
     const bool expert_batch = std::getenv("DS4_HIP_MOE_EXPERT_BATCH") != nullptr && n_tokens >= expert_batch_min_tokens &&
                               warp_threads == 32u && !store_gate_up && experts &&
@@ -7674,6 +7877,51 @@ extern "C" int ds4_metal_routed_moe_batch_tensor(
                                     routed_expert_count, 1u);
         const bool moe_shared_x = std::getenv("DS4_HIP_MOE_EXPERT_SHARED_X") != nullptr && moe_gate_rows_per_block > 1u;
         const bool moe_shared_mid = std::getenv("DS4_HIP_MOE_EXPERT_SHARED_MID") != nullptr && moe_down_rows_per_block > 1u;
+
+        uint32_t wmma_gate_hot_threshold = 128u;
+        uint32_t wmma_down_hot_threshold = 64u;
+        if (const char *env = std::getenv("DS4_HIP_MOE_WMMA_GATE_HOT")) {
+            const uint32_t v = (uint32_t)std::strtoul(env, nullptr, 10);
+            if (v > 0u) wmma_gate_hot_threshold = v;
+        }
+        if (const char *env = std::getenv("DS4_HIP_MOE_WMMA_DOWN_HOT")) {
+            const uint32_t v = (uint32_t)std::strtoul(env, nullptr, 10);
+            if (v > 0u) wmma_down_hot_threshold = v;
+        }
+        const bool moe_wmma_hot = std::getenv("DS4_HIP_MOE_WMMA_HOT") != nullptr && warp_threads == 32u &&
+                                  expert_in_dim % 16u == 0u && expert_mid_dim % 16u == 0u && out_dim % 16u == 0u;
+        int *wmma_gate_hot_dev = buckets + (uint64_t)routed_expert_count * pair_stride;
+        int *wmma_down_hot_dev = wmma_gate_hot_dev + routed_expert_count;
+        uint32_t wmma_gate_hot_count = 0u, wmma_down_hot_count = 0u;
+        uint32_t wmma_gate_hot_max = 0u, wmma_down_hot_max = 0u;
+        if (moe_wmma_hot) {
+            int h_counts[256];
+            int h_gate_hot[256];
+            int h_down_hot[256];
+            if (!ds4_hip_check(hipMemcpyAsync(h_counts, counts, routed_expert_count * sizeof(int), hipMemcpyDeviceToHost, g_stream),
+                               "routed MoE WMMA counts copy")) return 0;
+            if (!ds4_hip_check(hipStreamSynchronize(g_stream), "routed MoE WMMA counts sync")) return 0;
+            for (uint32_t e = 0; e < routed_expert_count; e++) {
+                const uint32_t c = h_counts[e] > 0 ? (uint32_t)h_counts[e] : 0u;
+                if (c >= wmma_gate_hot_threshold) {
+                    h_gate_hot[wmma_gate_hot_count++] = (int)e;
+                    if (c > wmma_gate_hot_max) wmma_gate_hot_max = c;
+                }
+                if (c >= wmma_down_hot_threshold) {
+                    h_down_hot[wmma_down_hot_count++] = (int)e;
+                    if (c > wmma_down_hot_max) wmma_down_hot_max = c;
+                }
+            }
+            if (wmma_gate_hot_count != 0u) {
+                if (!ds4_hip_check(hipMemcpyAsync(wmma_gate_hot_dev, h_gate_hot, wmma_gate_hot_count * sizeof(int), hipMemcpyHostToDevice, g_stream),
+                                   "routed MoE WMMA gate hot list copy")) return 0;
+            }
+            if (wmma_down_hot_count != 0u) {
+                if (!ds4_hip_check(hipMemcpyAsync(wmma_down_hot_dev, h_down_hot, wmma_down_hot_count * sizeof(int), hipMemcpyHostToDevice, g_stream),
+                                   "routed MoE WMMA down hot list copy")) return 0;
+            }
+        }
+
         auto launch_gate_range = [&](const char *label, uint32_t min_count, uint32_t max_count, unsigned tile) -> bool {
             hipEvent_t prof_start{}, prof_stop{};
             const bool prof = ds4_hip_profile_begin("DS4_HIP_MOE_PROFILE", &prof_start, &prof_stop);
@@ -7750,8 +7998,50 @@ extern "C" int ds4_metal_routed_moe_batch_tensor(
             ds4_hip_profile_end(prof, prof_start, prof_stop, label, expert_mid_dim, out_dim, n_tokens);
             return true;
         };
-        if (!launch_gate_range("moe_q2_gate_up_expert", 1u, 0u, pair_tile)) return 0;
-        if (!launch_down_range("moe_q2_down_expert", 1u, 0u, pair_tile)) return 0;
+        auto launch_gate_wmma_hot = [&]() -> bool {
+            if (wmma_gate_hot_count == 0u) return true;
+            hipEvent_t prof_start{}, prof_stop{};
+            const bool prof = ds4_hip_profile_begin("DS4_HIP_MOE_PROFILE", &prof_start, &prof_stop);
+            constexpr uint32_t mt = 8u, bm = 16u, bn = 16u, bk = 16u;
+            const dim3 block(32u * mt, 1u, 1u);
+            const dim3 grid(expert_mid_dim / bn, (wmma_gate_hot_max + mt * bm - 1u) / (mt * bm), wmma_gate_hot_count);
+            const size_t shmem = (mt * bm * bk + 2u * bk * bn) * sizeof(half) + (2u * mt * bm * bn) * sizeof(float);
+            ds4_hip_moe_q2_gate_up_hotlist_wmma_kernel<8,16,16,16><<<grid, block, shmem, g_stream>>>(
+                    (float *)mid->ptr, gw, uw, (const float *)x->ptr, (const float *)weights->ptr,
+                    counts, buckets, wmma_gate_hot_dev, wmma_gate_hot_count, pair_stride,
+                    expert_in_dim, expert_mid_dim, gate_expert_bytes, gate_row_bytes,
+                    gate_expert_bytes, gate_row_bytes, clamp);
+            if (!ds4_hip_launch_ok("routed MoE Q2_K WMMA hot gate/up launch")) return false;
+            ds4_hip_profile_end(prof, prof_start, prof_stop, "moe_q2_gate_up_wmma_hot", expert_in_dim, expert_mid_dim, n_tokens);
+            return true;
+        };
+        auto launch_down_wmma_hot = [&]() -> bool {
+            if (wmma_down_hot_count == 0u) return true;
+            hipEvent_t prof_start{}, prof_stop{};
+            const bool prof = ds4_hip_profile_begin("DS4_HIP_MOE_PROFILE", &prof_start, &prof_stop);
+            constexpr uint32_t mt = 8u, bm = 16u, bn = 16u, bk = 16u;
+            const dim3 block(32u * mt, 1u, 1u);
+            const dim3 grid(out_dim / bn, (wmma_down_hot_max + mt * bm - 1u) / (mt * bm), wmma_down_hot_count);
+            const size_t shmem = (mt * bm * bk + bk * bn) * sizeof(half) + (mt * bm * bn) * sizeof(float);
+            ds4_hip_moe_q2_down_hotlist_wmma_kernel<8,16,16,16><<<grid, block, shmem, g_stream>>>(
+                    (float *)experts->ptr, dw, (const float *)mid->ptr, counts, buckets, wmma_down_hot_dev,
+                    wmma_down_hot_count, pair_stride, expert_mid_dim, out_dim, down_expert_bytes, down_row_bytes);
+            if (!ds4_hip_launch_ok("routed MoE Q2_K WMMA hot down launch")) return false;
+            ds4_hip_profile_end(prof, prof_start, prof_stop, "moe_q2_down_wmma_hot", expert_mid_dim, out_dim, n_tokens);
+            return true;
+        };
+        if (moe_wmma_hot && wmma_gate_hot_count != 0u) {
+            if (!launch_gate_range("moe_q2_gate_up_expert_cold", 1u, wmma_gate_hot_threshold, pair_tile)) return 0;
+            if (!launch_gate_wmma_hot()) return 0;
+        } else {
+            if (!launch_gate_range("moe_q2_gate_up_expert", 1u, 0u, pair_tile)) return 0;
+        }
+        if (moe_wmma_hot && wmma_down_hot_count != 0u) {
+            if (!launch_down_range("moe_q2_down_expert_cold", 1u, wmma_down_hot_threshold, pair_tile)) return 0;
+            if (!launch_down_wmma_hot()) return 0;
+        } else {
+            if (!launch_down_range("moe_q2_down_expert", 1u, 0u, pair_tile)) return 0;
+        }
         ds4_hip_moe_experts_reduce_kernel<<<(unsigned)(((uint64_t)n_tokens * out_dim + 255u) / 256u), 256, 0, g_stream>>>(
                 (float *)out->ptr, (const float *)experts->ptr, n_tokens, out_dim);
         const bool ok = ds4_hip_launch_ok("routed MoE expert reduce launch");

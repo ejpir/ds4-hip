@@ -17,6 +17,8 @@ import statistics
 from pathlib import Path
 from typing import Iterable
 
+CurveWhatIf = tuple[str, float, list[tuple[int, float]]]
+
 
 def percentile(sorted_vals: list[int], pct: float) -> int:
     if not sorted_vals:
@@ -74,7 +76,30 @@ def parse_what_if(specs: list[str]) -> list[tuple[int, float]]:
     return out
 
 
-def summarize_routing(dumps: list[dict], title: str, thresholds: Iterable[int], what_ifs: list[tuple[int, float]]) -> None:
+def parse_curve_what_if(specs: list[str]) -> list[CurveWhatIf]:
+    """Parse NAME:BASE_MS:THRESHOLD:SPEEDUP[,THRESHOLD:SPEEDUP...]."""
+    out: list[CurveWhatIf] = []
+    for spec in specs:
+        fields = spec.split(":", 2)
+        if len(fields) != 3:
+            raise SystemExit(
+                f"bad --curve-what-if {spec!r}; expected NAME:BASE_MS:THRESHOLD:SPEEDUP[,THRESHOLD:SPEEDUP...]"
+            )
+        name, base_ms_s, curve_s = fields
+        curve = parse_what_if([curve_s])
+        if not name or not curve:
+            raise SystemExit(f"bad --curve-what-if {spec!r}; empty name or curve")
+        out.append((name, float(base_ms_s), sorted(curve)))
+    return out
+
+
+def summarize_routing(
+    dumps: list[dict],
+    title: str,
+    thresholds: Iterable[int],
+    what_ifs: list[tuple[int, float]],
+    curve_what_ifs: list[CurveWhatIf],
+) -> None:
     print(f"== routing: {title} ==")
     if not dumps:
         print("no complete routing count dumps found\n")
@@ -132,6 +157,25 @@ def summarize_routing(dumps: list[dict], title: str, thresholds: Iterable[int], 
                 f"hot>={threshold:<4d} hot_share={100.0 * hot_share:6.2f}% "
                 f"hot_speedup={speedup:5.2f}x ideal_total={total_speedup:5.3f}x"
             )
+    if curve_what_ifs:
+        print("curve what-if assignment-weighted stage time")
+        all_counts = [c for d in dumps for c in d["counts"]]
+        for name, base_ms, curve in curve_what_ifs:
+            def speed_for(c: int) -> float:
+                s = 1.0
+                for threshold, speedup in curve:
+                    if c >= threshold:
+                        s = speedup
+                    else:
+                        break
+                return s
+            new_frac = sum(c / speed_for(c) for c in all_counts) / max(1, total_assign)
+            new_ms = base_ms * new_frac
+            curve_desc = ",".join(f">={t}:{s:g}x" for t, s in curve)
+            print(
+                f"{name:16s} base={base_ms:8.2f} ms new={new_ms:8.2f} ms "
+                f"save={base_ms - new_ms:8.2f} ms frac={new_frac:6.3f} curve={curve_desc}"
+            )
     print()
 
 
@@ -175,17 +219,24 @@ def main() -> int:
     ap.add_argument("--skip", type=int, default=0, help="skip the first N complete routing dumps before summarizing")
     ap.add_argument("--thresholds", default="1,8,16,32,64,128,256,512", help="comma-separated bucket thresholds")
     ap.add_argument("--what-if", action="append", default=[], help="assignment-weighted speedup estimate, e.g. 64:1.3,128:2.0")
+    ap.add_argument(
+        "--curve-what-if",
+        action="append",
+        default=[],
+        help="stage what-if using bucket-size speed curve: NAME:BASE_MS:THRESHOLD:SPEEDUP[,THRESHOLD:SPEEDUP...]",
+    )
     args = ap.parse_args()
 
     thresholds = [int(x) for x in args.thresholds.split(",") if x]
     what_ifs = parse_what_if(args.what_if)
+    curve_what_ifs = parse_curve_what_if(args.curve_what_if)
     for name in args.routing:
         dumps = parse_routing(Path(name))
         if args.skip:
             dumps = dumps[args.skip:]
         if args.first:
             dumps = dumps[:args.first]
-        summarize_routing(dumps, name, thresholds, what_ifs)
+        summarize_routing(dumps, name, thresholds, what_ifs, curve_what_ifs)
     for name in args.profile:
         summarize_profile(Path(name))
     if not args.routing and not args.profile:
