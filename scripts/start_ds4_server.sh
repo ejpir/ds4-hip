@@ -49,7 +49,7 @@ Environment:
   DS4_SERVER_MOE_DOWN_RPB=N      Rows/block for expert-bucketed down; e.g. 16 with shared-mid experiment
   DS4_SERVER_MOE_EXPERT_SHARED_X=1    Experimental LDS x tile reuse for gate/up; use with GATE_RPB>1
   DS4_SERVER_MOE_EXPERT_SHARED_MID=1  Experimental LDS mid tile reuse for down; use with DOWN_RPB>1
-  DS4_SERVER_MOE_WMMA_HOT=1      Opt-in hot-bucket Q2_K WMMA MoE path
+  DS4_SERVER_MOE_WMMA_HOT=1      Opt-in hot-bucket Q2_K WMMA MoE path; first-token/perf experimental, multi-token greedy drift observed
   DS4_SERVER_MOE_WMMA_GATE_HOT=N Gate/up WMMA bucket threshold; default 128
   DS4_SERVER_MOE_WMMA_DOWN_HOT=N Down WMMA bucket threshold; default 64
   DS4_SERVER_COPY_MODEL=1        Copy GGUF tensor payload to HIP allocation using staged chunks

@@ -137,10 +137,12 @@ uses FP32 WMMA accumulation, skips small batches by default, and builds about
 3.35 GiB of FP16 Q8 WMMA prefill weights. `DS4_HIP_Q8_HIPBLASLT=1` is a separate
 experimental q-side path that uses hipBLASLt for small prefill batches
 (default `DS4_HIP_Q8_HIPBLASLT_MAX_TOKENS=256`) and falls back to the custom
-path for larger chunks. The Q2_K hot-bucket MoE WMMA path is also opt-in; it
-keeps scalar/shared-X kernels for small expert buckets and applies WMMA only to
-large routed expert buckets. Full-copy copies the GGUF tensor payload into GPU
-memory at startup and eagerly builds about 4.6 GiB of Q8 decode repacks.
+path for larger chunks. The Q2_K hot-bucket MoE WMMA path is also opt-in and
+first-token/perf experimental only; it keeps scalar/shared-X kernels for small
+expert buckets and applies WMMA only to large routed expert buckets, but broader
+32-token greedy-logprob checks have shown continuation drift. Full-copy copies
+the GGUF tensor payload into GPU memory at startup and eagerly builds about 4.6
+GiB of Q8 decode repacks.
 Full-copy is therefore opt-in. Conservative HIP server mode keeps zero-copy
 mapped GGUF weights and avoids the full copy.
 
@@ -191,8 +193,8 @@ DS4_SERVER_Q8_REPACK=1
 DS4_SERVER_Q8_REPACK_SPLIT16=1
 ```
 
-For the fastest currently measured long-prompt prefill, add the experimental
-hot-bucket Q2_K MoE WMMA path on top of the fast profile:
+For the fastest currently measured long-prompt prefill smoke test, add the
+experimental hot-bucket Q2_K MoE WMMA path on top of the fast profile:
 
 ```sh
 DS4_SERVER_FAST_FULL=1 \
@@ -204,9 +206,11 @@ DS4_SERVER_MOE_WMMA_DOWN_HOT=32 \
 
 The same CLI-only knobs are `DS4_HIP_MOE_WMMA_HOT=1`,
 `DS4_HIP_MOE_WMMA_GATE_HOT=N`, and `DS4_HIP_MOE_WMMA_DOWN_HOT=N`. This path is
-not part of `DS4_SERVER_FAST_FULL` yet because it uses FP16 WMMA inputs for Q2_K
-expert tiles and still needs broader greedy-logprob drift testing; the strict
-first-token smoke above stayed `We` on the long-prompt gate.
+not part of `DS4_SERVER_FAST_FULL` because it uses FP16 WMMA inputs for Q2_K
+expert tiles. The strict first-token smoke above stayed `We`, but 32-token
+greedy-logprob comparisons against the scalar/shared-X MoE path drifted (for
+example ` prompt` -> ` text` on the 5707-token prompt), so leave it off when
+exact continuation matching matters.
 
 The HIP Q8 shared-X batched prefill matmul is now default-on (tile32 for normal
 Q8 batch matmuls, tile16/RPB32 for grouped `attn_output_a` low projection). The Q8
@@ -225,10 +229,10 @@ safe restart behavior.
 The HIP backend is now at the first stable fast path: zero-copy and full-copy
 loading both work, the non-winning experiments have been removed, and the
 winning Q8 batched prefill path is enabled by default. The remaining safe
-prefill/decode knobs are exposed through `DS4_SERVER_FAST_FULL=1`; the new Q2_K
-hot-bucket MoE WMMA path is opt-in separately while correctness drift is tested.
-The next work is kernel quality, then decode/inference behavior, then KV/cache
-work:
+prefill/decode knobs are exposed through `DS4_SERVER_FAST_FULL=1`; the Q2_K
+hot-bucket MoE WMMA path is opt-in separately and currently blocked from
+promotion by multi-token greedy drift. The next work is kernel quality, then
+decode/inference behavior, then KV/cache work:
 
 1. **rocWMMA on dense Q8 projections**
    - The production opt-in path is currently restricted to the q-side
@@ -244,11 +248,11 @@ work:
    - The current opt-in hot-bucket path uses a compact hot-expert list and WMMA
      only for large routed buckets, leaving scalar/shared-X expert kernels for
      small buckets. It improved the 5707-token prefill smoke from ~53.6 t/s to
-     ~58.7 t/s with the same first token, but remains off by default until wider
-     greedy-logprob checks are done.
-   - Keep thresholds conservative for serving experiments (`GATE_HOT=128` or
-     down-only first) and keep scalar fallbacks for small expert buckets and
-     correctness.
+     ~58.7 t/s with the same first token, but 32-token greedy-logprob checks now
+     show drift even for down-only/high-threshold variants.
+   - Keep it first-token/perf experimental only. Promotion needs either a
+     precision-neutral Q2_K WMMA formulation or exact-token acceptance criteria
+     that tolerate these continuation changes.
 
 3. **hipBLASLt-quality custom kernels**
    - The goal is not merely “use WMMA”, but kernels with hipBLASLt-like quality:
@@ -269,11 +273,12 @@ work:
      long-context cache movement, and cache/server ergonomics.
 
 Realistic prefill trajectory for the HIP fast path is roughly: default measured
-long-prompt zero-copy fast path ~53-54 tok/s, opt-in hot-MoE WMMA ~58-59 tok/s;
-indexed mixed attention and Q2_K routed MoE are still the main remaining
-bottlenecks for pushing toward ~80 tok/s. Q8 WMMA, Q2_K hot-bucket WMMA, and
-hipBLASLt remain opt-in diagnostics until they beat the custom fast path without
-quality drift.
+long-prompt zero-copy fast path ~53-54 tok/s. Opt-in hot-MoE WMMA reaches
+~58-59 tok/s in first-token smoke tests but is not exact-greedy-safe over longer
+continuations. Indexed mixed attention and Q2_K routed MoE are still the main
+remaining bottlenecks for pushing toward ~80 tok/s. Q8 WMMA, Q2_K hot-bucket
+WMMA, and hipBLASLt remain opt-in diagnostics until they beat the custom fast
+path without quality drift.
 
 ## CLI
 
