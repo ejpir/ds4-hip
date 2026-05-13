@@ -770,6 +770,7 @@ first answer:
 ```sh
 ./ds4 --dump-tokens -p "..."
 ./ds4 --dump-logprobs /tmp/out.json --logprobs-top-k 20 --temp 0 -p "..."
+tools/compare_logprobs.py /tmp/base.json /tmp/candidate.json --show-text
 ./ds4-server --trace /tmp/ds4-trace.txt ...
 ```
 
@@ -779,6 +780,7 @@ first answer:
   and `｜DSML｜`.
 - `--dump-logprobs` stores a greedy continuation with the top local
   alternatives at each step, which helps separate sampling choices from
-  logit/model issues.
+  logit/model issues. `tools/compare_logprobs.py` compares two such dumps by
+  selected token id and reports the first divergent step.
 - `ds4-server --trace` writes the rendered prompts, cache decisions, generated
   text, and tool-parser events for a whole agent session.
