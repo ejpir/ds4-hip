@@ -205,12 +205,18 @@ DS4_SERVER_MOE_WMMA_DOWN_HOT=32 \
 ```
 
 The same CLI-only knobs are `DS4_HIP_MOE_WMMA_HOT=1`,
-`DS4_HIP_MOE_WMMA_GATE_HOT=N`, and `DS4_HIP_MOE_WMMA_DOWN_HOT=N`. This path is
-not part of `DS4_SERVER_FAST_FULL` because it uses FP16 WMMA inputs for Q2_K
-expert tiles. The strict first-token smoke above stayed `We`, but 32-token
-greedy-logprob comparisons against the scalar/shared-X MoE path drifted (for
-example ` prompt` -> ` text` on the 5707-token prompt), so leave it off when
-exact continuation matching matters.
+`DS4_HIP_MOE_WMMA_GATE_HOT=N`, `DS4_HIP_MOE_WMMA_DOWN_HOT=N`, and optional
+`DS4_HIP_MOE_WMMA_LAYERS=LIST` (`14-42`, `7-13,29-42`, etc.). The layer filter
+is a diagnostic mitigation for drift experiments, not a promotion to default.
+A 5707-token/32-token greedy check matched the scalar path with `14-42` and gave
+about a 7% relative prefill win in a throttled run, but broader validation is
+still required.
+
+This path is not part of `DS4_SERVER_FAST_FULL` because it uses FP16 WMMA inputs
+for Q2_K expert tiles. The strict first-token smoke above stayed `We`, but
+full-layer 32-token greedy-logprob comparisons against the scalar/shared-X MoE
+path drifted (for example ` prompt` -> ` text` on the 5707-token prompt), so
+leave it off when exact continuation matching matters.
 
 The HIP Q8 shared-X batched prefill matmul is now default-on (tile32 for normal
 Q8 batch matmuls, tile16/RPB32 for grouped `attn_output_a` low projection). The Q8

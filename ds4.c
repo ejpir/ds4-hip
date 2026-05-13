@@ -9433,7 +9433,7 @@ static bool metal_graph_encode_decode_layer(
                                                  (uint32_t)down_in_dim,
                                                  (uint32_t)routed_out_dim,
                                                  g->router_selected, g->router_weights,
-                                                 DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, g->ffn_norm) != 0;
+                                                 DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, g->ffn_norm, il) != 0;
     DS4_METAL_PROFILE_DECODE_STAGE("routed_moe");
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_moe_gate_clamped", g->routed_gate,
@@ -12157,7 +12157,8 @@ static bool metal_graph_encode_layer_ffn_batch(
                                                    DS4_N_EXPERT_USED,
                                                    DS4_SWIGLU_CLAMP_EXP,
                                                    g->batch_ffn_norm,
-                                                   n_tokens) != 0;
+                                                   n_tokens,
+                                                   il) != 0;
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_moe_gate_clamped", g->batch_routed_gate,
                                       (uint64_t)n_tokens * DS4_N_EXPERT_USED * down_in_dim, il, pos0);

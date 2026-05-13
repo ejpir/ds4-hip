@@ -627,7 +627,8 @@ int ds4_metal_routed_moe_one_tensor(
         const ds4_metal_tensor *weights,
         uint32_t                n_expert,
         float                   clamp,
-        const ds4_metal_tensor *x);
+        const ds4_metal_tensor *x,
+        uint32_t                layer_index);
 
 int ds4_metal_routed_moe_batch_tensor(
         ds4_metal_tensor       *out,
@@ -654,7 +655,8 @@ int ds4_metal_routed_moe_batch_tensor(
         uint32_t                n_expert,
         float                   clamp,
         const ds4_metal_tensor *x,
-        uint32_t                n_tokens);
+        uint32_t                n_tokens,
+        uint32_t                layer_index);
 
 /* =========================================================================
  * Hyper-Connection Kernels.

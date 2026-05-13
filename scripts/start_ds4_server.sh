@@ -52,6 +52,7 @@ Environment:
   DS4_SERVER_MOE_WMMA_HOT=1      Opt-in hot-bucket Q2_K WMMA MoE path; first-token/perf experimental, multi-token greedy drift observed
   DS4_SERVER_MOE_WMMA_GATE_HOT=N Gate/up WMMA bucket threshold; default 128
   DS4_SERVER_MOE_WMMA_DOWN_HOT=N Down WMMA bucket threshold; default 64
+  DS4_SERVER_MOE_WMMA_LAYERS=LIST Restrict WMMA to layers/ranges, e.g. 14-42; diagnostic/experimental
   DS4_SERVER_COPY_MODEL=1        Copy GGUF tensor payload to HIP allocation using staged chunks
   DS4_SERVER_COPY_MODEL_CHUNK_MB=256  Staged full-copy chunk size
   DS4_SESSION_PROGRESS_RAW_MAX_TOKENS=512  Use cancellable layer-by-layer prefill above this
@@ -250,6 +251,9 @@ if [[ -n "${DS4_SERVER_MOE_WMMA_GATE_HOT:-}" ]]; then
 fi
 if [[ -n "${DS4_SERVER_MOE_WMMA_DOWN_HOT:-}" ]]; then
   export DS4_HIP_MOE_WMMA_DOWN_HOT="$DS4_SERVER_MOE_WMMA_DOWN_HOT"
+fi
+if [[ -n "${DS4_SERVER_MOE_WMMA_LAYERS:-}" ]]; then
+  export DS4_HIP_MOE_WMMA_LAYERS="$DS4_SERVER_MOE_WMMA_LAYERS"
 fi
 if [[ "${DS4_SERVER_COPY_MODEL:-0}" == "1" ]]; then
   export DS4_HIP_COPY_MODEL=1

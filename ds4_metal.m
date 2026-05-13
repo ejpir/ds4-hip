@@ -12682,7 +12682,9 @@ int ds4_metal_routed_moe_one_tensor(
         const ds4_metal_tensor *weights,
         uint32_t                n_expert,
         float                   clamp,
-        const ds4_metal_tensor *x) {
+        const ds4_metal_tensor *x,
+        uint32_t                layer_index) {
+    (void)layer_index;
     if (!g_initialized && !ds4_metal_init()) return 0;
     if (!out || !gate || !up || !mid || !x || !model_map || !selected || !weights ||
         n_expert == 0 || n_expert > 6) {
@@ -12989,7 +12991,9 @@ int ds4_metal_routed_moe_batch_tensor(
         uint32_t                n_expert,
         float                   clamp,
         const ds4_metal_tensor *x,
-        uint32_t                n_tokens) {
+        uint32_t                n_tokens,
+        uint32_t                layer_index) {
+    (void)layer_index;
     if (!g_initialized && !ds4_metal_init()) return 0;
     if (!out || !gate || !up || !mid || !x || !model_map || !selected || !weights ||
         n_tokens == 0 || n_expert == 0 || n_expert > 6) {

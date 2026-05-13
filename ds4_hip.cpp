@@ -5968,6 +5968,27 @@ static void ds4_hip_profile_end(bool enabled, hipEvent_t start, hipEvent_t stop,
     (void)hipEventDestroy(stop);
 }
 
+static bool ds4_hip_moe_wmma_layer_allowed(uint32_t layer) {
+    const char *spec = std::getenv("DS4_HIP_MOE_WMMA_LAYERS");
+    if (!spec || !spec[0]) return true;
+    const char *p = spec;
+    while (*p) {
+        while (*p == ',' || *p == ' ' || *p == '\t') p++;
+        if (!*p) break;
+        char *end = nullptr;
+        unsigned long a = std::strtoul(p, &end, 10);
+        if (end == p) break;
+        unsigned long b = a;
+        if (*end == '-') {
+            p = end + 1;
+            b = std::strtoul(p, &end, 10);
+        }
+        if (a <= layer && layer <= b) return true;
+        p = end;
+    }
+    return false;
+}
+
 static void ds4_hip_moe_maybe_dump_routing_counts(const int *counts_dev,
                                                    uint32_t n_tokens,
                                                    uint32_t n_expert) {
@@ -7773,12 +7794,13 @@ extern "C" int ds4_metal_routed_moe_one_tensor(
         const ds4_metal_tensor *weights,
         uint32_t                n_expert,
         float                   clamp,
-        const ds4_metal_tensor *x) {
+        const ds4_metal_tensor *x,
+        uint32_t                layer_index) {
     return ds4_metal_routed_moe_batch_tensor(out, gate, up, mid, experts, model_map, model_size,
                                              gate_offset, up_offset, down_offset, gate_type, down_type,
                                              gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
                                              expert_in_dim, expert_mid_dim, out_dim, selected, weights, n_expert,
-                                             clamp, x, 1);
+                                             clamp, x, 1, layer_index);
 }
 
 extern "C" int ds4_metal_routed_moe_batch_tensor(
@@ -7806,7 +7828,8 @@ extern "C" int ds4_metal_routed_moe_batch_tensor(
         uint32_t                n_expert,
         float                   clamp,
         const ds4_metal_tensor *x,
-        uint32_t                n_tokens) {
+        uint32_t                n_tokens,
+        uint32_t                layer_index) {
     (void)experts;
     if (gate_type != 10u || down_type != 10u) {
         std::fprintf(stderr, "ds4: HIP routed MoE currently supports Q2_K experts only\n");
@@ -7889,6 +7912,7 @@ extern "C" int ds4_metal_routed_moe_batch_tensor(
             if (v > 0u) wmma_down_hot_threshold = v;
         }
         const bool moe_wmma_hot = std::getenv("DS4_HIP_MOE_WMMA_HOT") != nullptr && warp_threads == 32u &&
+                                  ds4_hip_moe_wmma_layer_allowed(layer_index) &&
                                   expert_in_dim % 16u == 0u && expert_mid_dim % 16u == 0u && out_dim % 16u == 0u;
         int *wmma_gate_hot_dev = buckets + (uint64_t)routed_expert_count * pair_stride;
         int *wmma_down_hot_dev = wmma_gate_hot_dev + routed_expert_count;
