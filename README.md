@@ -208,9 +208,11 @@ The same CLI-only knobs are `DS4_HIP_MOE_WMMA_HOT=1`,
 `DS4_HIP_MOE_WMMA_GATE_HOT=N`, `DS4_HIP_MOE_WMMA_DOWN_HOT=N`, and optional
 `DS4_HIP_MOE_WMMA_LAYERS=LIST` (`14-42`, `7-13,29-42`, etc.). The layer filter
 is a diagnostic mitigation for drift experiments, not a promotion to default.
-A 5707-token/32-token greedy check matched the scalar path with `14-42` and gave
-about a 7% relative prefill win in a throttled run, but broader validation is
-still required.
+A 5707-token/32-token greedy check matched the scalar path with `14-42`, but a
+stronger 128-token check drifted at token 82. The narrower `29-42` filter matched
+two 128-token repeats on the same prompt, but its measured prefill gain was only
+small/noisy (~2-4% relative in throttled A/B runs). Treat the layer filter as a
+profiling/diagnostic tool, not a correctness promotion.
 
 This path is not part of `DS4_SERVER_FAST_FULL` because it uses FP16 WMMA inputs
 for Q2_K expert tiles. The strict first-token smoke above stayed `We`, but
