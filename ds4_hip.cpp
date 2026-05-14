@@ -7534,7 +7534,7 @@ extern "C" int ds4_metal_attention_output_q8_batch_tensor(
                                                      ds4_hip_env_bool("DS4_HIP_Q8_BATCH_FAST", true));
     if (grouped_batch_fast &&
         warp_threads == 32u && n_tokens > 1u && (group_dim & 31u) == 0u && rank <= UINT32_MAX && n_groups <= UINT32_MAX) {
-        unsigned tile = 16u;
+        unsigned tile = 32u;
         if (const char *tile_env = std::getenv("DS4_HIP_Q8_GROUPED_BATCH_TILE")) {
             const unsigned v = (unsigned)std::strtoul(tile_env, nullptr, 10);
             if (v == 2u || v == 4u || v == 8u || v == 16u || v == 32u) tile = v;

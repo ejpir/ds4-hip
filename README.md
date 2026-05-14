@@ -183,6 +183,7 @@ DS4_SERVER_Q8_BATCH_SHARED_X=1
 DS4_SERVER_Q8_BATCH_TILE=32
 DS4_SERVER_Q8_BATCH_RPB=32
 DS4_SERVER_Q8_BATCH_SHARED_X_BLOCKS=16
+DS4_SERVER_Q8_GROUPED_BATCH_TILE=32
 DS4_SERVER_MOE_EXPERT_BATCH=1
 DS4_SERVER_MOE_GATE_RPB=16
 DS4_SERVER_MOE_DOWN_RPB=16
@@ -221,8 +222,8 @@ path drifted (for example ` prompt` -> ` text` on the 5707-token prompt), so
 leave it off when exact continuation matching matters.
 
 The HIP Q8 shared-X batched prefill matmul is now default-on (tile32 for normal
-Q8 batch matmuls, tile16/RPB32 for grouped `attn_output_a` low projection). The Q8
-server variables above are kept for reproducible presets and overrides; set
+Q8 batch matmuls and tile32/RPB32 for grouped `attn_output_a` low projection).
+The Q8 server variables above are kept for reproducible presets and overrides; set
 `DS4_SERVER_Q8_BATCH_FAST=0` or `DS4_HIP_Q8_BATCH_FAST=0` to disable that path.
 The HIP indexer score qmix path is also default-on; set
 `DS4_HIP_INDEXER_QMIX_FAST=0` only for regression comparisons.
