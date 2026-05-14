@@ -178,6 +178,7 @@ DS4_SERVER_COPY_MODEL_CHUNK_MB=1024
 
 DS4_SERVER_PREFILL_RAW_FAST=1
 DS4_SERVER_PREFILL_MIXED_FAST=1
+DS4_SERVER_ATTENTION_INDEXED_SPLIT_VALUE_GROUP=4
 DS4_SERVER_Q8_BATCH_FAST=1
 DS4_SERVER_Q8_BATCH_SHARED_X=1
 DS4_SERVER_Q8_BATCH_TILE=32
@@ -229,7 +230,14 @@ The Q8 server variables above are kept for reproducible presets and overrides; s
 `DS4_SERVER_Q8_BATCH_FAST=0` or `DS4_HIP_Q8_BATCH_FAST=0` to disable that path.
 The HIP indexer score qmix path is also default-on; set
 `DS4_HIP_INDEXER_QMIX_FAST=0` only for regression comparisons. The mixed-attention
-warprows kernels also use an exact-safe unrolled 512-dim score dot loop. The scalar/shared-X
+warprows kernels also use an exact-safe unrolled 512-dim score dot loop. In the
+fast-full preset, indexed mixed attention additionally uses
+`DS4_HIP_ATTENTION_INDEXED_SPLIT_VALUE_GROUP=4`: it computes the same softmax
+weights into scratch, then groups four heads in the value pass to reuse KV loads.
+This matched the 5707-token/128-token greedy-logprob gate and reduced the
+profiled indexed-attention stage by roughly 38-42% on the Radeon 8060S, at the
+cost of about 1.3 GiB scratch for a 2048-token prefill chunk. Set the group to
+`0` to disable or `2` for a lower-reuse variant. The scalar/shared-X
 Q2_K routed-MoE path now uses separate exact-safe pair tiles by default
 (`DS4_HIP_MOE_GATE_TILE=16`, `DS4_HIP_MOE_DOWN_TILE=8`) because gate/up benefits
 from tile16 while down stays faster at tile8.
