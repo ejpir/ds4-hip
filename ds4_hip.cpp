@@ -4160,6 +4160,7 @@ __global__ static void ds4_hip_attention_decode_mixed_batch_warprows_kernel(
             }
             float acc = 0.0f;
             if (!skip) {
+#pragma unroll 16
                 for (uint32_t i = lane; i < head_dim; i += (uint32_t)warpSize) acc += qsh[i] * kv[i];
             }
             acc = ds4_hip_warp_reduce_sum(acc);
@@ -4260,6 +4261,7 @@ __global__ static void ds4_hip_attention_indexed_mixed_batch_warprows_kernel(
             }
             float acc = 0.0f;
             if (!skip) {
+#pragma unroll 16
                 for (uint32_t i = lane; i < head_dim; i += (uint32_t)warpSize) acc += qsh[i] * kv[i];
             }
             acc = ds4_hip_warp_reduce_sum(acc);
@@ -4498,6 +4500,7 @@ __global__ static void ds4_hip_attention_prefill_static_mixed_warprows_kernel(
             if (!skip) {
                 const float *kv = is_comp ? (comp_kv + (uint64_t)k * head_dim)
                                           : (raw_kv + (uint64_t)k * head_dim);
+#pragma unroll 16
                 for (uint32_t i = lane; i < head_dim; i += (uint32_t)warpSize) acc += qsh[i] * kv[i];
             }
             acc = ds4_hip_warp_reduce_sum(acc);

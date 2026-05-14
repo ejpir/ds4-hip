@@ -228,7 +228,8 @@ Q8 batch matmuls and tile32/RPB32 for grouped `attn_output_a` low projection).
 The Q8 server variables above are kept for reproducible presets and overrides; set
 `DS4_SERVER_Q8_BATCH_FAST=0` or `DS4_HIP_Q8_BATCH_FAST=0` to disable that path.
 The HIP indexer score qmix path is also default-on; set
-`DS4_HIP_INDEXER_QMIX_FAST=0` only for regression comparisons. The scalar/shared-X
+`DS4_HIP_INDEXER_QMIX_FAST=0` only for regression comparisons. The mixed-attention
+warprows kernels also use an exact-safe unrolled 512-dim score dot loop. The scalar/shared-X
 Q2_K routed-MoE path now uses separate exact-safe pair tiles by default
 (`DS4_HIP_MOE_GATE_TILE=16`, `DS4_HIP_MOE_DOWN_TILE=8`) because gate/up benefits
 from tile16 while down stays faster at tile8.
