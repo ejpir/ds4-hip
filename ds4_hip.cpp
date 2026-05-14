@@ -7893,7 +7893,10 @@ extern "C" int ds4_metal_routed_moe_batch_tensor(
             }
             return fallback;
         };
+        const bool legacy_pair_tile_set = std::getenv("DS4_HIP_MOE_EXPERT_TILE") != nullptr;
         unsigned pair_tile = parse_moe_pair_tile("DS4_HIP_MOE_EXPERT_TILE", 8u);
+        unsigned gate_pair_tile = parse_moe_pair_tile("DS4_HIP_MOE_GATE_TILE", legacy_pair_tile_set ? pair_tile : 16u);
+        unsigned down_pair_tile = parse_moe_pair_tile("DS4_HIP_MOE_DOWN_TILE", pair_tile);
         const dim3 expert_gate_grid((unsigned)((expert_mid_dim + moe_gate_rows_per_block - 1u) / moe_gate_rows_per_block),
                                     routed_expert_count, 1u);
         const dim3 expert_down_grid((unsigned)((out_dim + moe_down_rows_per_block - 1u) / moe_down_rows_per_block),
@@ -8055,16 +8058,16 @@ extern "C" int ds4_metal_routed_moe_batch_tensor(
             return true;
         };
         if (moe_wmma_hot && wmma_gate_hot_count != 0u) {
-            if (!launch_gate_range("moe_q2_gate_up_expert_cold", 1u, wmma_gate_hot_threshold, pair_tile)) return 0;
+            if (!launch_gate_range("moe_q2_gate_up_expert_cold", 1u, wmma_gate_hot_threshold, gate_pair_tile)) return 0;
             if (!launch_gate_wmma_hot()) return 0;
         } else {
-            if (!launch_gate_range("moe_q2_gate_up_expert", 1u, 0u, pair_tile)) return 0;
+            if (!launch_gate_range("moe_q2_gate_up_expert", 1u, 0u, gate_pair_tile)) return 0;
         }
         if (moe_wmma_hot && wmma_down_hot_count != 0u) {
-            if (!launch_down_range("moe_q2_down_expert_cold", 1u, wmma_down_hot_threshold, pair_tile)) return 0;
+            if (!launch_down_range("moe_q2_down_expert_cold", 1u, wmma_down_hot_threshold, down_pair_tile)) return 0;
             if (!launch_down_wmma_hot()) return 0;
         } else {
-            if (!launch_down_range("moe_q2_down_expert", 1u, 0u, pair_tile)) return 0;
+            if (!launch_down_range("moe_q2_down_expert", 1u, 0u, down_pair_tile)) return 0;
         }
         ds4_hip_moe_experts_reduce_kernel<<<(unsigned)(((uint64_t)n_tokens * out_dim + 255u) / 256u), 256, 0, g_stream>>>(
                 (float *)out->ptr, (const float *)experts->ptr, n_tokens, out_dim);

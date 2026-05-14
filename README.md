@@ -185,6 +185,8 @@ DS4_SERVER_Q8_BATCH_RPB=32
 DS4_SERVER_Q8_BATCH_SHARED_X_BLOCKS=16
 DS4_SERVER_Q8_GROUPED_BATCH_TILE=32
 DS4_SERVER_MOE_EXPERT_BATCH=1
+DS4_SERVER_MOE_GATE_TILE=16
+DS4_SERVER_MOE_DOWN_TILE=8
 DS4_SERVER_MOE_GATE_RPB=16
 DS4_SERVER_MOE_DOWN_RPB=16
 DS4_SERVER_MOE_EXPERT_SHARED_X=1
@@ -226,7 +228,10 @@ Q8 batch matmuls and tile32/RPB32 for grouped `attn_output_a` low projection).
 The Q8 server variables above are kept for reproducible presets and overrides; set
 `DS4_SERVER_Q8_BATCH_FAST=0` or `DS4_HIP_Q8_BATCH_FAST=0` to disable that path.
 The HIP indexer score qmix path is also default-on; set
-`DS4_HIP_INDEXER_QMIX_FAST=0` only for regression comparisons.
+`DS4_HIP_INDEXER_QMIX_FAST=0` only for regression comparisons. The scalar/shared-X
+Q2_K routed-MoE path now uses separate exact-safe pair tiles by default
+(`DS4_HIP_MOE_GATE_TILE=16`, `DS4_HIP_MOE_DOWN_TILE=8`) because gate/up benefits
+from tile16 while down stays faster at tile8.
 
 For one-shot CLI benchmarking with the same core settings, use the server preset
 above or set the corresponding `DS4_HIP_*` variables directly. The server script

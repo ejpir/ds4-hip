@@ -45,7 +45,9 @@ Environment:
   DS4_SERVER_Q8_HIPBLASLT=1      Opt-in q-side hipBLASLt xsplit path for small prefill batches
   DS4_SERVER_Q8_HIPBLASLT_MAX_TOKENS=N  Max batch routed to hipBLASLt; default 256
   DS4_SERVER_MOE_EXPERT_BATCH=1  Experimental expert-bucketed Q2_K MoE for faster prefill
-  DS4_SERVER_MOE_EXPERT_TILE=4|8|16  Pair tile for expert-bucketed Q2_K MoE; default 8
+  DS4_SERVER_MOE_EXPERT_TILE=4|8|16  Legacy pair tile fallback for expert-bucketed Q2_K MoE; default 8
+  DS4_SERVER_MOE_GATE_TILE=4|8|16  Gate/up pair tile; default 16 in the scalar/shared-X fast path
+  DS4_SERVER_MOE_DOWN_TILE=4|8|16  Down pair tile; default 8 in the scalar/shared-X fast path
   DS4_SERVER_MOE_GATE_RPB=N      Rows/block for expert-bucketed gate/up; e.g. 16 with shared-x experiment
   DS4_SERVER_MOE_DOWN_RPB=N      Rows/block for expert-bucketed down; e.g. 16 with shared-mid experiment
   DS4_SERVER_MOE_EXPERT_SHARED_X=1    Experimental LDS x tile reuse for gate/up; use with GATE_RPB>1
@@ -102,6 +104,8 @@ if [[ "${DS4_SERVER_FAST_FULL:-0}" == "1" ]]; then
   export DS4_SERVER_Q8_BATCH_SHARED_X_BLOCKS="${DS4_SERVER_Q8_BATCH_SHARED_X_BLOCKS:-16}"
   export DS4_SERVER_Q8_GROUPED_BATCH_TILE="${DS4_SERVER_Q8_GROUPED_BATCH_TILE:-32}"
   export DS4_SERVER_MOE_EXPERT_BATCH="${DS4_SERVER_MOE_EXPERT_BATCH:-1}"
+  export DS4_SERVER_MOE_GATE_TILE="${DS4_SERVER_MOE_GATE_TILE:-16}"
+  export DS4_SERVER_MOE_DOWN_TILE="${DS4_SERVER_MOE_DOWN_TILE:-8}"
   export DS4_SERVER_MOE_GATE_RPB="${DS4_SERVER_MOE_GATE_RPB:-16}"
   export DS4_SERVER_MOE_DOWN_RPB="${DS4_SERVER_MOE_DOWN_RPB:-16}"
   export DS4_SERVER_MOE_EXPERT_SHARED_X="${DS4_SERVER_MOE_EXPERT_SHARED_X:-1}"
@@ -235,6 +239,12 @@ if [[ "${DS4_SERVER_MOE_EXPERT_BATCH:-0}" == "1" ]]; then
 fi
 if [[ -n "${DS4_SERVER_MOE_EXPERT_TILE:-}" ]]; then
   export DS4_HIP_MOE_EXPERT_TILE="$DS4_SERVER_MOE_EXPERT_TILE"
+fi
+if [[ -n "${DS4_SERVER_MOE_GATE_TILE:-}" ]]; then
+  export DS4_HIP_MOE_GATE_TILE="$DS4_SERVER_MOE_GATE_TILE"
+fi
+if [[ -n "${DS4_SERVER_MOE_DOWN_TILE:-}" ]]; then
+  export DS4_HIP_MOE_DOWN_TILE="$DS4_SERVER_MOE_DOWN_TILE"
 fi
 if [[ -n "${DS4_SERVER_MOE_GATE_RPB:-}" ]]; then
   export DS4_HIP_MOE_GATE_RPB="$DS4_SERVER_MOE_GATE_RPB"
