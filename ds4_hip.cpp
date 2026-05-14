@@ -4504,6 +4504,141 @@ __global__ static void ds4_hip_attention_indexed_mixed_value_group_warprows_kern
     }
 }
 
+__global__ static void ds4_hip_attention_indexed_mixed_fused_group4_kernel(
+        float *__restrict__ heads,
+        const float *__restrict__ q,
+        const float *__restrict__ raw_kv,
+        const float *__restrict__ comp_kv,
+        const int *__restrict__ topk,
+        const float *__restrict__ sinks,
+        uint32_t n_tokens,
+        uint32_t pos0,
+        uint32_t n_raw,
+        uint32_t raw_cap,
+        uint32_t raw_start,
+        uint32_t n_comp,
+        uint32_t top_k,
+        uint32_t window,
+        uint32_t ratio,
+        uint32_t n_head,
+        uint32_t head_dim,
+        uint32_t score_cap) {
+    const uint32_t t = blockIdx.x;
+    const uint32_t h0 = blockIdx.y * 4u;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t gh = tid >> 8;
+    const uint32_t local = tid & 255u;
+    const uint32_t lane = local & 31u;
+    const uint32_t wave = local >> 5;
+    if (t >= n_tokens || h0 >= n_head || gh >= 4u || raw_cap == 0 || ratio == 0 || top_k == 0) return;
+
+    extern __shared__ float sh[];
+    float *scores = sh;
+    float *qsh = scores + 4u * score_cap;
+    float *red = qsh;
+
+    const uint32_t qpos = pos0 + t;
+    const uint32_t last_pos = pos0 + n_tokens - 1u;
+    const uint32_t first_raw_pos = last_pos + 1u - n_raw;
+    const uint32_t min_kpos = (window != 0 && qpos + 1u > window) ? qpos + 1u - window : 0u;
+    const uint32_t vis_first = first_raw_pos > min_kpos ? first_raw_pos : min_kpos;
+    const uint32_t raw_offset = vis_first - first_raw_pos;
+    const uint32_t raw_count = qpos >= vis_first ? (qpos - vis_first + 1u) : 0u;
+    uint32_t comp_visible = (qpos + 1u) / ratio;
+    if (comp_visible > n_comp) comp_visible = n_comp;
+    const uint32_t n_scores = raw_count + top_k;
+    if (raw_count > (window ? window : n_raw) || n_scores == 0 || n_scores > score_cap || h0 + 3u >= n_head) return;
+
+    const uint32_t h = h0 + gh;
+    const float *qh = q + ((uint64_t)t * n_head + h) * head_dim;
+    float *qdst = qsh + (uint64_t)gh * head_dim;
+    for (uint32_t i = local; i < head_dim; i += 256u) qdst[i] = qh[i];
+    __syncthreads();
+
+    const float scale = rsqrtf((float)head_dim);
+    float *hscores = scores + (uint64_t)gh * score_cap;
+    for (uint32_t base = 0; base < n_scores; base += 8u) {
+        const uint32_t row = base + wave;
+        if (row < n_scores) {
+            const bool is_comp = row >= raw_count;
+            const uint32_t k = is_comp ? (row - raw_count) : row;
+            const float *kv = nullptr;
+            bool skip = false;
+            if (is_comp) {
+                const int ci = topk[(uint64_t)t * top_k + k];
+                skip = ci < 0 || (uint32_t)ci >= n_comp || (uint32_t)ci >= comp_visible;
+                kv = skip ? nullptr : (comp_kv + (uint64_t)(uint32_t)ci * head_dim);
+            } else {
+                const uint32_t phys = (raw_start + raw_offset + k) % raw_cap;
+                kv = raw_kv + (uint64_t)phys * head_dim;
+            }
+            float acc = 0.0f;
+            if (!skip) {
+#pragma unroll 16
+                for (uint32_t i = lane; i < head_dim; i += 32u) acc += qdst[i] * kv[i];
+            }
+            acc = ds4_hip_warp_reduce_sum(acc);
+            if (lane == 0) hscores[row] = skip ? -1.0e30f : (acc * scale);
+        }
+    }
+    __syncthreads();
+
+    float lmax = local == 0 ? sinks[h] : -3.4e38f;
+    for (uint32_t i = local; i < n_scores; i += 256u) lmax = fmaxf(lmax, hscores[i]);
+    lmax = ds4_hip_warp_reduce_max(lmax);
+    if (lane == 0) red[gh * 8u + wave] = lmax;
+    __syncthreads();
+    float max_score = (local < 8u) ? red[gh * 8u + lane] : -3.4e38f;
+    if ((local >> 5) == 0u) max_score = ds4_hip_warp_reduce_max(max_score);
+    if (local == 0) red[gh * 8u] = max_score;
+    __syncthreads();
+    max_score = red[gh * 8u];
+
+    float lsum = local == 0 ? expf(sinks[h] - max_score) : 0.0f;
+    for (uint32_t i = local; i < n_scores; i += 256u) {
+        const float w = expf(hscores[i] - max_score);
+        hscores[i] = w;
+        lsum += w;
+    }
+    lsum = ds4_hip_warp_reduce_sum(lsum);
+    if (lane == 0) red[gh * 8u + wave] = lsum;
+    __syncthreads();
+    float denom = (local < 8u) ? red[gh * 8u + lane] : 0.0f;
+    if ((local >> 5) == 0u) denom = ds4_hip_warp_reduce_sum(denom);
+    if (local == 0) red[gh * 8u] = denom;
+    __syncthreads();
+
+    if (tid < head_dim) {
+        const uint32_t d = tid;
+        float acc0 = 0.0f;
+        float acc1 = 0.0f;
+        float acc2 = 0.0f;
+        float acc3 = 0.0f;
+        for (uint32_t r = 0; r < raw_count; r++) {
+            const uint32_t phys = (raw_start + raw_offset + r) % raw_cap;
+            const float v = raw_kv[(uint64_t)phys * head_dim + d];
+            acc0 += scores[(uint64_t)0u * score_cap + r] * v;
+            acc1 += scores[(uint64_t)1u * score_cap + r] * v;
+            acc2 += scores[(uint64_t)2u * score_cap + r] * v;
+            acc3 += scores[(uint64_t)3u * score_cap + r] * v;
+        }
+        for (uint32_t u = 0; u < top_k; u++) {
+            const int ci = topk[(uint64_t)t * top_k + u];
+            if (ci < 0 || (uint32_t)ci >= n_comp || (uint32_t)ci >= comp_visible) continue;
+            const float v = comp_kv[(uint64_t)(uint32_t)ci * head_dim + d];
+            const uint32_t si = raw_count + u;
+            acc0 += scores[(uint64_t)0u * score_cap + si] * v;
+            acc1 += scores[(uint64_t)1u * score_cap + si] * v;
+            acc2 += scores[(uint64_t)2u * score_cap + si] * v;
+            acc3 += scores[(uint64_t)3u * score_cap + si] * v;
+        }
+        heads[((uint64_t)t * n_head + h0 + 0u) * head_dim + d] = acc0 / red[0u * 8u];
+        heads[((uint64_t)t * n_head + h0 + 1u) * head_dim + d] = acc1 / red[1u * 8u];
+        heads[((uint64_t)t * n_head + h0 + 2u) * head_dim + d] = acc2 / red[2u * 8u];
+        heads[((uint64_t)t * n_head + h0 + 3u) * head_dim + d] = acc3 / red[3u * 8u];
+    }
+}
+
 __global__ static void ds4_hip_attention_decode_batch_mixed_kernel(
         float *heads, const float *q, const float *raw_kv, const float *comp_kv,
         const float *comp_mask, const int *topk, const float *sinks,
@@ -7605,7 +7740,17 @@ extern "C" int ds4_metal_attention_indexed_mixed_batch_heads_tensor(
         const uint32_t score_cap = (window ? window : n_raw) + top_k;
         const char *split_env = std::getenv("DS4_HIP_ATTENTION_INDEXED_SPLIT_VALUE_GROUP");
         const uint32_t split_group = split_env ? (uint32_t)std::strtoul(split_env, nullptr, 10) : 0u;
-        if (split_group == 2u || split_group == 4u) {
+        const char *fused_env = std::getenv("DS4_HIP_ATTENTION_INDEXED_FUSED_VALUE_GROUP");
+        const uint32_t fused_group = fused_env ? (uint32_t)std::strtoul(fused_env, nullptr, 10) : 0u;
+        if (fused_group == 4u && n_head % 4u == 0u && head_dim == 512u) {
+            const dim3 grid((unsigned)n_tokens, (unsigned)((n_head + 3u) / 4u), 1u);
+            const size_t shmem = ((size_t)4u * score_cap + (size_t)4u * head_dim) * sizeof(float);
+            ds4_hip_attention_indexed_mixed_fused_group4_kernel<<<grid, 1024u, shmem, g_stream>>>(
+                    (float *)heads->ptr, (const float *)q->ptr, (const float *)raw_kv->ptr,
+                    (const float *)comp_kv->ptr, (const int *)topk->ptr, (const float *)sinks,
+                    n_tokens, pos0, n_raw, raw_cap, raw_start, n_comp, top_k,
+                    window, ratio, n_head, head_dim, score_cap);
+        } else if (split_group == 2u || split_group == 4u) {
             const uint64_t weight_floats = (uint64_t)n_tokens * n_head * score_cap;
             const uint64_t denom_floats = (uint64_t)n_tokens * n_head;
             float *scratch = ds4_hip_attention_split_scratch(weight_floats + denom_floats);
