@@ -10571,6 +10571,13 @@ static bool metal_graph_upload_prompt_embeddings_hc(
     }
 
     if (tokens && n_tokens >= gpu_min) {
+#ifdef DS4_USE_GPU_API
+        /* The upstream-shaped CUDA/ROCm embedding kernel is F16-layout only.
+         * CyberNeurova stores token_embd.weight as Q8_0, so keep the existing
+         * CPU upload path for that dialect until the generic GPU API carries
+         * embedding tensor type/layout information. */
+        if (weights->token_embd->type == DS4_TENSOR_F16)
+#endif
         return ds4_metal_embed_tokens_hc_tensor(out_hc,
                                                 tokens,
                                                 model->map,
