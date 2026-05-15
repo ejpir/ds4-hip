@@ -1789,9 +1789,33 @@ __device__ static float warp_sum_f32(float v) {
 
 __device__ static float warp_max_f32(float v) {
     for (int offset = 16; offset > 0; offset >>= 1) {
-        v = fmaxf(v, __shfl_down_sync(FULL_WARP_MASK, v, offset));
+        v = fmaxf(v, __shfl_down_sync(FULL_WARP_MASK, v, offset, 32));
     }
     return v;
+}
+
+__device__ static uint16_t f32_to_f16_bits_hip_round(float f) {
+    union { float f; uint32_t u; } v;
+    v.f = f;
+    uint32_t sign = (v.u >> 16) & 0x8000u;
+    int32_t exp = (int32_t)((v.u >> 23) & 0xffu) - 127 + 15;
+    uint32_t mant = v.u & 0x7fffffu;
+    if (exp <= 0) {
+        if (exp < -10) return (uint16_t)sign;
+        mant |= 0x800000u;
+        uint32_t shift = (uint32_t)(14 - exp);
+        uint32_t half_mant = mant >> shift;
+        if ((mant >> (shift - 1)) & 1u) half_mant++;
+        return (uint16_t)(sign | half_mant);
+    }
+    if (exp >= 31) return (uint16_t)(sign | 0x7c00u);
+    uint32_t half = sign | ((uint32_t)exp << 10) | (mant >> 13);
+    if (mant & 0x1000u) half++;
+    return (uint16_t)half;
+}
+
+__device__ static float f16_bits_to_f32(uint16_t bits) {
+    return __half2float(__ushort_as_half((unsigned short)bits));
 }
 
 __device__ static float dot4_f32(float4 a, float4 b) {
@@ -2094,12 +2118,14 @@ __global__ static void matmul_q8_0_preq_batch_warp8_kernel(
     if (lane == 0) out[tok * out_dim + row] = acc;
 }
 
+__device__ static float q8_0_scale_scalar(const unsigned char *blk) {
+    const uint16_t bits = (uint16_t)blk[0] | ((uint16_t)blk[1] << 8);
+    return __half2float(__ushort_as_half((unsigned short)bits));
+}
+
 __device__ static float q8_0_scale_broadcast_w32(const unsigned char *blk) {
     float d = 0.0f;
-    if ((threadIdx.x & 31u) == 0u) {
-        const uint16_t bits = (uint16_t)blk[0] | ((uint16_t)blk[1] << 8);
-        d = __half2float(__ushort_as_half((unsigned short)bits));
-    }
+    if ((threadIdx.x & 31u) == 0u) d = q8_0_scale_scalar(blk);
     return __shfl_sync(FULL_WARP_MASK, d, 0, 32);
 }
 
@@ -2341,7 +2367,7 @@ __global__ static void dequant_q8_0_to_f32_kernel(
     uint64_t b = i / 32;
     uint64_t j = i - b * 32;
     const unsigned char *blk = w + (row * blocks + b) * 34;
-    const float scale = __half2float(*(const __half *)blk);
+    const float scale = q8_0_scale_scalar(blk);
     const int8_t q = *(const int8_t *)(blk + 2 + j);
     out[gid] = scale * (float)q;
 }
@@ -2656,7 +2682,7 @@ __device__ static float model_ape_value_dev(const void *base, uint64_t offset, u
     if (type == 8u) {
         const uint64_t row_bytes = ((uint64_t)width + 31u) / 32u * 34u;
         const unsigned char *blk = (const unsigned char *)p + (uint64_t)row * row_bytes + (uint64_t)(col >> 5) * 34u;
-        const float d = __half2float(*(const __half *)blk);
+        const float d = q8_0_scale_scalar(blk);
         const int8_t q = ((const int8_t *)(blk + 2u))[col & 31u];
         return d * (float)q;
     }
@@ -2726,7 +2752,8 @@ __global__ static void store_raw_kv_batch_kernel(float *raw, const float *kv, ui
     uint32_t d = gid % head_dim;
     uint32_t t = gid / head_dim;
     uint32_t row = (pos0 + t) % raw_cap;
-    raw[(uint64_t)row * head_dim + d] = __half2float(__float2half(kv[(uint64_t)t * head_dim + d]));
+    const uint16_t hb = f32_to_f16_bits_hip_round(kv[(uint64_t)t * head_dim + d]);
+    raw[(uint64_t)row * head_dim + d] = f16_bits_to_f32(hb);
 }
 
 __global__ static void attention_prefill_raw_kernel(
