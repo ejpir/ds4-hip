@@ -1,6 +1,91 @@
 #ifndef DS4_METAL_H
 #define DS4_METAL_H
 
+#ifdef DS4_USE_GPU_API
+#include "ds4_gpu.h"
+
+#define ds4_metal_tensor ds4_gpu_tensor
+#define ds4_metal_init ds4_gpu_init
+#define ds4_metal_cleanup ds4_gpu_cleanup
+#define ds4_metal_tensor_alloc ds4_gpu_tensor_alloc
+#define ds4_metal_tensor_view ds4_gpu_tensor_view
+#define ds4_metal_tensor_free ds4_gpu_tensor_free
+#define ds4_metal_tensor_bytes ds4_gpu_tensor_bytes
+#define ds4_metal_tensor_contents ds4_gpu_tensor_contents
+#define ds4_metal_tensor_write ds4_gpu_tensor_write
+#define ds4_metal_tensor_read ds4_gpu_tensor_read
+#define ds4_metal_tensor_copy ds4_gpu_tensor_copy
+#define ds4_metal_begin_commands ds4_gpu_begin_commands
+#define ds4_metal_flush_commands ds4_gpu_flush_commands
+#define ds4_metal_end_commands ds4_gpu_end_commands
+#define ds4_metal_synchronize ds4_gpu_synchronize
+#define ds4_metal_set_model_map ds4_gpu_set_model_map
+#define ds4_metal_set_model_map_range ds4_gpu_set_model_map_range
+#define ds4_metal_set_model_map_range_fd(model_map, model_size, model_fd, map_offset, map_size) \
+    (ds4_gpu_set_model_fd((model_fd)) && \
+     ds4_gpu_set_model_map_range((model_map), (model_size), (map_offset), (map_size)))
+#define ds4_metal_set_quality ds4_gpu_set_quality
+#define ds4_metal_print_memory_report ds4_gpu_print_memory_report
+#define ds4_metal_embed_token_hc_tensor ds4_gpu_embed_token_hc_tensor
+#define ds4_metal_embed_tokens_hc_tensor ds4_gpu_embed_tokens_hc_tensor
+#define ds4_metal_indexer_score_one_tensor ds4_gpu_indexer_score_one_tensor
+#define ds4_metal_indexer_scores_prefill_tensor ds4_gpu_indexer_scores_prefill_tensor
+#define ds4_metal_indexer_scores_decode_batch_tensor ds4_gpu_indexer_scores_decode_batch_tensor
+#define ds4_metal_indexer_topk_tensor ds4_gpu_indexer_topk_tensor
+#define ds4_metal_dsv4_topk_mask_tensor ds4_gpu_dsv4_topk_mask_tensor
+#define ds4_metal_matmul_q8_0_tensor ds4_gpu_matmul_q8_0_tensor
+#define ds4_metal_shared_gate_up_swiglu_q8_0_tensor ds4_gpu_shared_gate_up_swiglu_q8_0_tensor
+#define ds4_metal_matmul_f16_tensor ds4_gpu_matmul_f16_tensor
+#define ds4_metal_matmul_f16_pair_tensor ds4_gpu_matmul_f16_pair_tensor
+#define ds4_metal_matmul_f32_tensor ds4_gpu_matmul_f32_tensor
+#define ds4_metal_repeat_hc_tensor ds4_gpu_repeat_hc_tensor
+#define ds4_metal_rms_norm_plain_tensor ds4_gpu_rms_norm_plain_tensor
+#define ds4_metal_rms_norm_plain_rows_tensor ds4_gpu_rms_norm_plain_rows_tensor
+#define ds4_metal_rms_norm_weight_tensor ds4_gpu_rms_norm_weight_tensor
+#define ds4_metal_rms_norm_weight_rows_tensor ds4_gpu_rms_norm_weight_rows_tensor
+#define ds4_metal_dsv4_qkv_rms_norm_rows_tensor ds4_gpu_dsv4_qkv_rms_norm_rows_tensor
+#define ds4_metal_head_rms_norm_tensor ds4_gpu_head_rms_norm_tensor
+#define ds4_metal_dsv4_fp8_kv_quantize_tensor ds4_gpu_dsv4_fp8_kv_quantize_tensor
+#define ds4_metal_rope_tail_tensor ds4_gpu_rope_tail_tensor
+#define ds4_metal_kv_fp8_store_raw_tensor ds4_gpu_kv_fp8_store_raw_tensor
+#define ds4_metal_store_raw_kv_tensor ds4_gpu_store_raw_kv_tensor
+#define ds4_metal_store_raw_kv_batch_tensor ds4_gpu_store_raw_kv_batch_tensor
+#define ds4_metal_compressor_update_tensor ds4_gpu_compressor_update_tensor
+#define ds4_metal_compressor_store_batch_tensor ds4_gpu_compressor_store_batch_tensor
+#define ds4_metal_compressor_prefill_tensor ds4_gpu_compressor_prefill_tensor
+#define ds4_metal_compressor_prefill_ratio4_replay_tensor ds4_gpu_compressor_prefill_ratio4_replay_tensor
+#define ds4_metal_compressor_prefill_state_ratio4_tensor ds4_gpu_compressor_prefill_state_ratio4_tensor
+#define ds4_metal_attention_decode_heads_tensor ds4_gpu_attention_decode_heads_tensor
+#define ds4_metal_attention_prefill_raw_heads_tensor ds4_gpu_attention_prefill_raw_heads_tensor
+#define ds4_metal_attention_decode_raw_batch_heads_tensor ds4_gpu_attention_decode_raw_batch_heads_tensor
+#define ds4_metal_attention_decode_mixed_batch_heads_tensor ds4_gpu_attention_decode_mixed_batch_heads_tensor
+#define ds4_metal_attention_indexed_mixed_batch_heads_tensor ds4_gpu_attention_indexed_mixed_batch_heads_tensor
+#define ds4_metal_attention_prefill_static_mixed_heads_tensor ds4_gpu_attention_prefill_static_mixed_heads_tensor
+#define ds4_metal_attention_prefill_masked_mixed_heads_tensor ds4_gpu_attention_prefill_masked_mixed_heads_tensor
+#define ds4_metal_attention_output_q8_batch_tensor ds4_gpu_attention_output_q8_batch_tensor
+#define ds4_metal_attention_output_low_q8_tensor ds4_gpu_attention_output_low_q8_tensor
+#define ds4_metal_swiglu_tensor ds4_gpu_swiglu_tensor
+#define ds4_metal_add_tensor ds4_gpu_add_tensor
+#define ds4_metal_router_select_tensor ds4_gpu_router_select_tensor
+#define ds4_metal_router_select_batch_tensor ds4_gpu_router_select_batch_tensor
+#define ds4_metal_routed_moe_one_tensor(out, gate, up, mid, experts, model_map, model_size, gate_offset, up_offset, down_offset, gate_type, down_type, gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes, expert_in_dim, expert_mid_dim, out_dim, selected, weights, n_expert, clamp, x, layer_index) \
+    ds4_gpu_routed_moe_one_tensor((out), (gate), (up), (mid), (experts), (model_map), (model_size), (gate_offset), (up_offset), (down_offset), (gate_type), (down_type), (gate_expert_bytes), (gate_row_bytes), (down_expert_bytes), (down_row_bytes), (expert_in_dim), (expert_mid_dim), (out_dim), (selected), (weights), (n_expert), (clamp), (x))
+#define ds4_metal_routed_moe_batch_tensor(out, gate, up, mid, experts, model_map, model_size, gate_offset, up_offset, down_offset, gate_type, down_type, gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes, expert_in_dim, expert_mid_dim, out_dim, selected, weights, n_expert, clamp, x, n_tokens, layer_index) \
+    ds4_gpu_routed_moe_batch_tensor((out), (gate), (up), (mid), (experts), (model_map), (model_size), (gate_offset), (up_offset), (down_offset), (gate_type), (down_type), (gate_expert_bytes), (gate_row_bytes), (down_expert_bytes), (down_row_bytes), (expert_in_dim), (expert_mid_dim), (out_dim), (selected), (weights), (n_expert), (clamp), (x), (n_tokens), NULL)
+#define ds4_metal_hc_split_sinkhorn_tensor ds4_gpu_hc_split_sinkhorn_tensor
+#define ds4_metal_hc_weighted_sum_tensor ds4_gpu_hc_weighted_sum_tensor
+#define ds4_metal_hc_weighted_sum_split_tensor ds4_gpu_hc_weighted_sum_split_tensor
+#define ds4_metal_hc_split_weighted_sum_tensor ds4_gpu_hc_split_weighted_sum_tensor
+#define ds4_metal_hc_split_weighted_sum_norm_tensor ds4_gpu_hc_split_weighted_sum_norm_tensor
+#define ds4_metal_output_hc_weights_tensor ds4_gpu_output_hc_weights_tensor
+#define ds4_metal_hc_expand_tensor ds4_gpu_hc_expand_tensor
+#define ds4_metal_hc_expand_split_tensor ds4_gpu_hc_expand_split_tensor
+#define ds4_metal_hc_expand_add_split_tensor ds4_gpu_hc_expand_add_split_tensor
+#define ds4_metal_shared_down_hc_expand_q8_0_tensor ds4_gpu_shared_down_hc_expand_q8_0_tensor
+#define ds4_metal_matmul_q8_0_hc_expand_tensor ds4_gpu_matmul_q8_0_hc_expand_tensor
+
+#else
+
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -788,5 +873,7 @@ int ds4_metal_matmul_q8_0_hc_expand_tensor(
         const ds4_metal_tensor *split,
         uint32_t                n_embd,
         uint32_t                n_hc);
+
+#endif /* DS4_USE_GPU_API */
 
 #endif

@@ -9,6 +9,12 @@ UNAME_S := $(shell uname -s)
 NATIVE_LDLIBS := $(LDLIBS)
 METAL_SRCS := $(wildcard metal/*.metal)
 
+ROCM_PATH ?= /opt/rocm
+ROCM_ARCH ?= gfx1151
+ROCM_HIPCC ?= $(if $(HIPCC),$(HIPCC),$(ROCM_PATH)/bin/hipcc)
+ROCM_CFLAGS ?= -O3 -fno-finite-math-only -pthread -D__HIP_PLATFORM_AMD__ -Wno-unused-command-line-argument --offload-arch=$(ROCM_ARCH)
+ROCM_LDLIBS ?= -lm -pthread -L$(ROCM_PATH)/lib -lhipblas
+
 ifeq ($(UNAME_S),Darwin)
 METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal
 CORE_OBJS = ds4.o ds4_metal.o
@@ -40,7 +46,7 @@ TEST_LINK = $(CC)
 endif
 endif
 
-.PHONY: all clean test
+.PHONY: all clean test rocm rocm-upstream
 
 all: ds4 ds4-server
 
@@ -62,6 +68,16 @@ ds4-server: ds4_server.o rax.o $(CORE_OBJS)
 
 ds4_native: ds4_cli_native.o linenoise.o $(NATIVE_CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ ds4_cli_native.o linenoise.o $(NATIVE_CORE_OBJS) $(LDLIBS)
+
+rocm rocm-upstream: ds4-rocm-upstream ds4-server-rocm-upstream
+	@echo "ROCm upstream-shaped binaries built with ROCM_ARCH=$(ROCM_ARCH)"
+
+ds4-rocm-upstream: ds4_cli_gpuapi.o linenoise.o ds4_gpuapi.o ds4_cuda.o
+	$(ROCM_HIPCC) -o $@ $^ $(ROCM_LDLIBS)
+
+ds4-server-rocm-upstream: ds4_server_gpuapi.o rax.o ds4_gpuapi.o ds4_cuda.o
+	$(ROCM_HIPCC) -o $@ $^ $(ROCM_LDLIBS)
+
 endif
 
 ds4.o: ds4.c ds4.h ds4_metal.h
@@ -72,6 +88,9 @@ ds4_cli.o: ds4_cli.c ds4.h linenoise.h
 
 ds4_server.o: ds4_server.c ds4.h rax.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_server.c
+
+ds4_bench.o: ds4_bench.c ds4.h
+	$(CC) $(CFLAGS) -c -o $@ ds4_bench.c
 
 ds4_test.o: tests/ds4_test.c ds4_server.c ds4.h rax.h
 	$(CC) $(TEST_CFLAGS) -Wno-unused-function -c -o $@ tests/ds4_test.c
@@ -93,6 +112,21 @@ ds4_metal.o: ds4_metal.m ds4_metal.h $(METAL_SRCS)
 
 ds4_hip.o: ds4_hip.cpp ds4_metal.h
 	$(HIPCC) $(HIPCXXFLAGS) -c -o $@ ds4_hip.cpp
+
+ds4_gpuapi.o: ds4.c ds4.h ds4_metal.h ds4_gpu.h
+	$(CC) $(CFLAGS) -DDS4_USE_GPU_API -DDS4_USE_HIP -c -o $@ ds4.c
+
+ds4_cli_gpuapi.o: ds4_cli.c ds4.h linenoise.h
+	$(CC) $(CFLAGS) -DDS4_USE_GPU_API -DDS4_USE_HIP -c -o $@ ds4_cli.c
+
+ds4_server_gpuapi.o: ds4_server.c ds4.h rax.h
+	$(CC) $(CFLAGS) -DDS4_USE_GPU_API -DDS4_USE_HIP -c -o $@ ds4_server.c
+
+ds4_bench_gpuapi.o: ds4_bench.c ds4.h
+	$(CC) $(CFLAGS) -DDS4_USE_GPU_API -DDS4_USE_HIP -c -o $@ ds4_bench.c
+
+ds4_cuda.o: ds4_cuda.cu ds4_gpu.h ds4_iq2_tables_cuda.inc ds4_rocm.h
+	$(ROCM_HIPCC) $(ROCM_CFLAGS) -c -o $@ ds4_cuda.cu
 
 ifneq ($(HIPCC),)
 hip-rocwmma-smoke: tools/hip_rocwmma_smoke.cpp
@@ -116,4 +150,4 @@ test: ds4_test
 	./ds4_test
 
 clean:
-	rm -f ds4 ds4-server ds4_native ds4_server_test ds4_test hip-rocwmma-smoke hip-q2-moe-wmma-bench hip-q8-wmma-bench *.o
+	rm -f ds4 ds4-server ds4-bench ds4-rocm-upstream ds4-server-rocm-upstream ds4_native ds4_server_test ds4_test hip-rocwmma-smoke hip-q2-moe-wmma-bench hip-q8-wmma-bench *.o
