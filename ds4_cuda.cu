@@ -4992,7 +4992,6 @@ __device__ __forceinline__ static uint64_t topk_pack_key(float v, uint32_t idx) 
     return ((uint64_t)topk_float_ordered_key(v) << 32u) | (uint64_t)(0xffffffffu - idx);
 }
 
-#ifndef __HIP_PLATFORM_AMD__
 __global__ static void indexer_topk_8192_cub_kernel(
         uint32_t *selected,
         const float *scores,
@@ -5032,7 +5031,6 @@ __global__ static void indexer_topk_8192_cub_kernel(
         }
     }
 }
-#endif
 
 __global__ static void indexer_topk_1024_kernel(
         uint32_t *selected,
@@ -5630,7 +5628,6 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
     }
     if (top_k == 512u && n_comp <= 4096u &&
         getenv("DS4_CUDA_NO_TOPK2048") == NULL) {
-#ifndef __HIP_PLATFORM_AMD__
         if (n_comp == 4096u) {
             using TopkCubSort = cub::BlockRadixSort<uint64_t, 512, 16>;
             const int smem = (int)sizeof(typename TopkCubSort::TempStorage);
@@ -5654,7 +5651,6 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
                 }
             }
         }
-#endif
         indexer_topk_pow2_kernel<4096><<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
                                                            (const float *)scores->ptr,
                                                            n_comp, n_tokens, top_k);
@@ -5663,7 +5659,6 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
     if (top_k == 512u && n_comp <= 8192u &&
         getenv("DS4_CUDA_NO_TOPK2048") == NULL &&
         getenv("DS4_CUDA_NO_TOPK8192") == NULL) {
-#ifndef __HIP_PLATFORM_AMD__
         if (n_comp > 4096u) {
             using TopkCubSort = cub::BlockRadixSort<uint64_t, 512, 16>;
             const int smem = (int)sizeof(typename TopkCubSort::TempStorage);
@@ -5687,7 +5682,6 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
                 }
             }
         }
-#endif
         indexer_topk_pow2_u16_kernel<8192><<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
                                                                (const float *)scores->ptr,
                                                                n_comp, n_tokens, top_k);

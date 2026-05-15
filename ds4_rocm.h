@@ -3,6 +3,7 @@
 #include <hip/hip_runtime.h>
 #include <hipblas/hipblas.h>
 #include <hip/hip_fp16.h>
+#include <hipcub/hipcub.hpp>
 #include <rocwmma/rocwmma-version.hpp>
 
 #define cudaError_t hipError_t
@@ -23,6 +24,9 @@
 #define cudaDeviceGetAttribute hipDeviceGetAttribute
 #define cudaGetDeviceProperties hipGetDeviceProperties
 #define cudaDevAttrPageableMemoryAccess hipDeviceAttributePageableMemoryAccess
+#define cudaDevAttrMaxSharedMemoryPerBlockOptin hipDeviceAttributeSharedMemPerBlockOptin
+#define cudaFuncAttributeMaxDynamicSharedMemorySize hipFuncAttributeMaxDynamicSharedMemorySize
+#define cudaFuncSetAttribute(func, attr, value) hipFuncSetAttribute((const void *)(func), (attr), (value))
 #define cudaMemLocationTypeDevice hipMemLocationTypeDevice
 
 #define cudaMalloc hipMalloc
@@ -84,6 +88,8 @@
 #define cublasSgemmStridedBatched hipblasSgemmStridedBatched
 #define cublasGemmEx hipblasGemmEx
 #define cublasGemmStridedBatchedEx hipblasGemmStridedBatchedEx
+
+namespace cub = hipcub;
 
 static __device__ __forceinline__ int32_t __vcmpne4(uint32_t a, uint32_t b) {
     // For each byte: 0xFF if a != b, 0x00 if a == b
