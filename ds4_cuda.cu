@@ -2432,6 +2432,20 @@ __device__ static float model_scalar_dev(const void *base, uint64_t offset, uint
     return ((const float *)p)[idx];
 }
 
+__device__ static float model_ape_value_dev(const void *base, uint64_t offset, uint32_t type,
+                                            uint32_t width, uint32_t row, uint32_t col) {
+    const char *p = (const char *)base + offset;
+    if (type == 1u) return __half2float(((const __half *)p)[(uint64_t)row * width + col]);
+    if (type == 8u) {
+        const uint64_t row_bytes = ((uint64_t)width + 31u) / 32u * 34u;
+        const unsigned char *blk = (const unsigned char *)p + (uint64_t)row * row_bytes + (uint64_t)(col >> 5) * 34u;
+        const float d = __half2float(*(const __half *)blk);
+        const int8_t q = ((const int8_t *)(blk + 2u))[col & 31u];
+        return d * (float)q;
+    }
+    return ((const float *)p)[(uint64_t)row * width + col];
+}
+
 __device__ static float rope_yarn_ramp_cpu_equiv_dev(float low, float high, int i0) {
     float y = ((float)(i0 / 2) - low) / fmaxf(0.001f, high - low);
     return 1.0f - fminf(1.0f, fmaxf(0.0f, y));
@@ -3978,7 +3992,7 @@ __global__ static void compressor_store_kernel(
     uint32_t dst_row = ratio == 4u ? ratio + pos_mod : pos_mod;
     state_kv[(uint64_t)dst_row * width + j] = kv[(uint64_t)t * width + j];
     state_score[(uint64_t)dst_row * width + j] =
-        sc[(uint64_t)t * width + j] + model_scalar_dev(model_map, ape_offset, ape_type, (uint64_t)pos_mod * width + j);
+        sc[(uint64_t)t * width + j] + model_ape_value_dev(model_map, ape_offset, ape_type, width, pos_mod, j);
 }
 
 __global__ static void compressor_set_rows_kernel(
@@ -4005,7 +4019,7 @@ __global__ static void compressor_set_rows_kernel(
     uint32_t phase = (pos0 + src) % ratio;
     state_kv[(uint64_t)dst * width + j] = kv[(uint64_t)src * width + j];
     state_score[(uint64_t)dst * width + j] =
-        sc[(uint64_t)src * width + j] + model_scalar_dev(model_map, ape_offset, ape_type, (uint64_t)phase * width + j);
+        sc[(uint64_t)src * width + j] + model_ape_value_dev(model_map, ape_offset, ape_type, width, phase, j);
 }
 
 __global__ static void compressor_prefill_pool_kernel(
@@ -4042,7 +4056,7 @@ __global__ static void compressor_prefill_pool_kernel(
             uint32_t base = (c - 1u) * ratio;
             for (uint32_t r = 0; r < 4; r++) {
                 uint32_t t = base + r;
-                float ape = model_scalar_dev(model_map, ape_offset, ape_type, (uint64_t)((pos0 + t) % ratio) * width + d);
+                float ape = model_ape_value_dev(model_map, ape_offset, ape_type, width, (pos0 + t) % ratio, d);
                 vals[n_cand] = kv[(uint64_t)t * width + d];
                 scores[n_cand] = sc[(uint64_t)t * width + d] + ape;
                 max_s = fmaxf(max_s, scores[n_cand++]);
@@ -4051,7 +4065,7 @@ __global__ static void compressor_prefill_pool_kernel(
         uint32_t base = c * ratio;
         for (uint32_t r = 0; r < 4; r++) {
             uint32_t t = base + r;
-            float ape = model_scalar_dev(model_map, ape_offset, ape_type, (uint64_t)((pos0 + t) % ratio) * width + head_dim + d);
+            float ape = model_ape_value_dev(model_map, ape_offset, ape_type, width, (pos0 + t) % ratio, head_dim + d);
             vals[n_cand] = kv[(uint64_t)t * width + head_dim + d];
             scores[n_cand] = sc[(uint64_t)t * width + head_dim + d] + ape;
             max_s = fmaxf(max_s, scores[n_cand++]);
@@ -4060,7 +4074,7 @@ __global__ static void compressor_prefill_pool_kernel(
         uint32_t base = c * ratio;
         for (uint32_t r = 0; r < ratio; r++) {
             uint32_t t = base + r;
-            float ape = model_scalar_dev(model_map, ape_offset, ape_type, (uint64_t)((pos0 + t) % ratio) * width + d);
+            float ape = model_ape_value_dev(model_map, ape_offset, ape_type, width, (pos0 + t) % ratio, d);
             vals[n_cand] = kv[(uint64_t)t * width + d];
             scores[n_cand] = sc[(uint64_t)t * width + d] + ape;
             max_s = fmaxf(max_s, scores[n_cand++]);
@@ -6317,6 +6331,17 @@ extern "C" int ds4_gpu_store_raw_kv_batch_tensor(ds4_gpu_tensor *raw_cache, cons
     store_raw_kv_batch_kernel<<<(n + 255) / 256, 256>>>((float *)raw_cache->ptr, (const float *)kv->ptr, raw_cap, pos0, n_tokens, head_dim);
     return cuda_ok(cudaGetLastError(), "store_raw_kv_batch launch");
 }
+static uint64_t cuda_tensor_2d_bytes(uint32_t type, uint64_t width, uint64_t rows) {
+    if (type == 0u) return width * rows * sizeof(float);
+    if (type == 1u) return width * rows * sizeof(uint16_t);
+    if (type == 8u) return rows * (((width + 31u) / 32u) * 34u);
+    return 0;
+}
+
+static int cuda_ape_type_supported(uint32_t type) {
+    return type == 0u || type == 1u || type == 8u;
+}
+
 extern "C" int ds4_gpu_compressor_store_batch_tensor(
         const ds4_gpu_tensor *kv,
         const ds4_gpu_tensor *sc,
@@ -6332,16 +6357,15 @@ extern "C" int ds4_gpu_compressor_store_batch_tensor(
         uint32_t                n_tokens) {
     if (!kv || !sc || !state_kv || !state_score || !model_map ||
         head_dim == 0 || ratio == 0 || n_tokens == 0 ||
-        (ape_type != 0u && ape_type != 1u)) {
+        !cuda_ape_type_supported(ape_type)) {
         return 0;
     }
     const uint32_t coff = ratio == 4u ? 2u : 1u;
     const uint32_t width = coff * head_dim;
     const uint32_t state_rows = coff * ratio;
-    const uint64_t elem_ape = ape_type == 1u ? 2u : 4u;
     const uint64_t kv_bytes = (uint64_t)n_tokens * width * sizeof(float);
     const uint64_t state_bytes = (uint64_t)state_rows * width * sizeof(float);
-    const uint64_t ape_bytes = (uint64_t)width * ratio * elem_ape;
+    const uint64_t ape_bytes = cuda_tensor_2d_bytes(ape_type, width, ratio);
     if (ape_offset > model_size || ape_bytes > model_size - ape_offset ||
         kv->bytes < kv_bytes || sc->bytes < kv_bytes ||
         state_kv->bytes < state_bytes || state_score->bytes < state_bytes) {
@@ -6393,18 +6417,17 @@ extern "C" int ds4_gpu_compressor_update_tensor(
     if (!kv_cur || !sc_cur || !state_kv || !state_score || !comp_cache ||
         !model_map || head_dim == 0 || ratio == 0 ||
         n_rot > head_dim || (n_rot & 1u) != 0 ||
-        (ape_type != 0u && ape_type != 1u) || norm_type != 0u) {
+        !cuda_ape_type_supported(ape_type) || norm_type != 0u) {
         return 0;
     }
     const uint32_t coff = ratio == 4u ? 2u : 1u;
     const uint32_t width = coff * head_dim;
     const uint32_t state_rows = coff * ratio;
     const uint32_t emit = ((pos + 1u) % ratio) == 0u ? 1u : 0u;
-    const uint64_t elem_ape = ape_type == 1u ? 2u : 4u;
     const uint64_t kv_bytes = (uint64_t)width * sizeof(float);
     const uint64_t state_bytes = (uint64_t)state_rows * width * sizeof(float);
     const uint64_t comp_bytes = (uint64_t)(comp_row + (emit ? 1u : 0u)) * head_dim * sizeof(float);
-    const uint64_t ape_bytes = (uint64_t)width * ratio * elem_ape;
+    const uint64_t ape_bytes = cuda_tensor_2d_bytes(ape_type, width, ratio);
     const uint64_t norm_bytes = (uint64_t)head_dim * sizeof(float);
     if (ape_offset > model_size || ape_bytes > model_size - ape_offset ||
         norm_offset > model_size || norm_bytes > model_size - norm_offset ||
@@ -6476,7 +6499,7 @@ extern "C" int ds4_gpu_compressor_prefill_tensor(
     if (!comp_cache || !state_kv || !state_score || !kv || !sc || !model_map ||
         head_dim == 0 || ratio == 0 || n_tokens == 0 ||
         n_rot > head_dim || (n_rot & 1u) != 0 ||
-        (ape_type != 0u && ape_type != 1u) || norm_type != 0u) {
+        !cuda_ape_type_supported(ape_type) || norm_type != 0u) {
         return 0;
     }
 
@@ -6486,11 +6509,10 @@ extern "C" int ds4_gpu_compressor_prefill_tensor(
     const uint32_t n_comp = n_tokens / ratio;
     const uint32_t cutoff = n_comp * ratio;
     const uint32_t rem = n_tokens - cutoff;
-    const uint64_t elem_ape = ape_type == 1u ? 2u : 4u;
     const uint64_t kv_bytes = (uint64_t)n_tokens * width * sizeof(float);
     const uint64_t state_bytes = (uint64_t)state_rows * width * sizeof(float);
     const uint64_t comp_bytes = (uint64_t)n_comp * head_dim * sizeof(float);
-    const uint64_t ape_bytes = (uint64_t)width * ratio * elem_ape;
+    const uint64_t ape_bytes = cuda_tensor_2d_bytes(ape_type, width, ratio);
     const uint64_t norm_bytes = (uint64_t)head_dim * sizeof(float);
 
     if (ape_offset > model_size || ape_bytes > model_size - ape_offset ||
@@ -6587,7 +6609,7 @@ extern "C" int ds4_gpu_compressor_prefill_ratio4_replay_tensor(
     if (!comp_cache || !state_kv || !state_score || !kv || !sc || !model_map ||
         head_dim == 0 || n_tokens == 0 || (n_tokens & 3u) != 0 || (pos0 & 3u) != 0 ||
         n_rot > head_dim || (n_rot & 1u) != 0 ||
-        (ape_type != 0u && ape_type != 1u) || norm_type != 0u) {
+        !cuda_ape_type_supported(ape_type) || norm_type != 0u) {
         return 0;
     }
 
@@ -6595,11 +6617,10 @@ extern "C" int ds4_gpu_compressor_prefill_ratio4_replay_tensor(
     const uint32_t width = 2u * head_dim;
     const uint32_t state_rows = 8u;
     const uint32_t n_comp = n_tokens / ratio;
-    const uint64_t elem_ape = ape_type == 1u ? 2u : 4u;
     const uint64_t kv_bytes = (uint64_t)n_tokens * width * sizeof(float);
     const uint64_t state_bytes = (uint64_t)state_rows * width * sizeof(float);
     const uint64_t comp_bytes = (uint64_t)n_comp * head_dim * sizeof(float);
-    const uint64_t ape_bytes = (uint64_t)width * ratio * elem_ape;
+    const uint64_t ape_bytes = cuda_tensor_2d_bytes(ape_type, width, ratio);
     const uint64_t norm_bytes = (uint64_t)head_dim * sizeof(float);
     if (ape_offset > model_size || ape_bytes > model_size - ape_offset ||
         norm_offset > model_size || norm_bytes > model_size - norm_offset ||
@@ -6654,16 +6675,15 @@ extern "C" int ds4_gpu_compressor_prefill_state_ratio4_tensor(
         uint32_t                head_dim,
         uint32_t                pos0) {
     if (!state_kv || !state_score || !kv_tail || !sc_tail || !model_map ||
-        head_dim == 0 || (ape_type != 0u && ape_type != 1u)) {
+        head_dim == 0 || !cuda_ape_type_supported(ape_type)) {
         return 0;
     }
     const uint32_t ratio = 4u;
     const uint32_t width = 2u * head_dim;
     const uint32_t state_rows = 8u;
-    const uint64_t elem_ape = ape_type == 1u ? 2u : 4u;
     const uint64_t tail_bytes = (uint64_t)ratio * width * sizeof(float);
     const uint64_t state_bytes = (uint64_t)state_rows * width * sizeof(float);
-    const uint64_t ape_bytes = (uint64_t)ratio * width * elem_ape;
+    const uint64_t ape_bytes = cuda_tensor_2d_bytes(ape_type, width, ratio);
     if (ape_offset > model_size || ape_bytes > model_size - ape_offset ||
         kv_tail->bytes < tail_bytes || sc_tail->bytes < tail_bytes ||
         state_kv->bytes < state_bytes || state_score->bytes < state_bytes) {
