@@ -9967,6 +9967,13 @@ static void metal_graph_trace_layer_stages(
     free(cpu_attn_cur);
 }
 
+static bool metal_graph_upload_token_embedding_hc(
+        ds4_metal_tensor   *out_hc,
+        const ds4_model    *model,
+        const ds4_weights  *weights,
+        int                 token,
+        uint32_t            n_hc);
+
 static int metal_graph_decode_test(
         const ds4_model   *model,
         const ds4_weights *weights,
@@ -10084,14 +10091,11 @@ static int metal_graph_decode_test(
     bool ok = metal_graph_alloc(&g, weights, layer);
     g.materialize_ffn_out = true;
     if (ok) ok = ds4_metal_begin_commands() != 0;
-    if (ok) ok = ds4_metal_embed_token_hc_tensor(g.cur_hc,
-                                                 model->map,
-                                                 model->size,
-                                                 weights->token_embd->abs_offset,
-                                                 (uint32_t)weights->token_embd->dim[1],
-                                                 (uint32_t)token,
-                                                     DS4_N_EMBD,
-                                                     DS4_N_HC) != 0;
+    if (ok) ok = metal_graph_upload_token_embedding_hc(g.cur_hc,
+                                                       model,
+                                                       weights,
+                                                       token,
+                                                       DS4_N_HC);
     if (ok) ok = metal_graph_encode_decode_layer(&g,
                                                model,
                                                layer,
@@ -10243,14 +10247,11 @@ static int metal_graph_first_token_full_test(
         embed_token_dense(model, weights, token, plain);
         hc_from_plain_embedding(cpu_cur, plain, DS4_N_EMBD, DS4_N_HC);
         ok = ds4_metal_begin_commands() != 0;
-        if (ok) ok = ds4_metal_embed_token_hc_tensor(g.cur_hc,
-                                                     model->map,
-                                                     model->size,
-                                                     weights->token_embd->abs_offset,
-                                                     (uint32_t)weights->token_embd->dim[1],
-                                                     (uint32_t)token,
-                                                     DS4_N_EMBD,
-                                                     DS4_N_HC) != 0;
+        if (ok) ok = metal_graph_upload_token_embedding_hc(g.cur_hc,
+                                                           model,
+                                                           weights,
+                                                           token,
+                                                           DS4_N_HC);
         if (ok) ok = ds4_metal_end_commands() != 0;
 
         for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
@@ -10292,14 +10293,11 @@ static int metal_graph_first_token_full_test(
         free(plain);
     } else {
         if (ok) ok = ds4_metal_begin_commands() != 0;
-        if (ok) ok = ds4_metal_embed_token_hc_tensor(g.cur_hc,
-                                                     model->map,
-                                                     model->size,
-                                                     weights->token_embd->abs_offset,
-                                                     (uint32_t)weights->token_embd->dim[1],
-                                                     (uint32_t)token,
-                                                     DS4_N_EMBD,
-                                                     DS4_N_HC) != 0;
+        if (ok) ok = metal_graph_upload_token_embedding_hc(g.cur_hc,
+                                                           model,
+                                                           weights,
+                                                           token,
+                                                           DS4_N_HC);
 
         for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
             ok = metal_graph_encode_decode_layer(&g, model, &weights->layer[il],
@@ -10373,14 +10371,11 @@ static bool metal_graph_encode_token_raw_swa(
     const uint32_t raw_row = pos % g->raw_cap;
     const uint32_t n_raw = metal_graph_raw_span_for_batch(g, pos, 1);
 
-    bool ok = ds4_metal_embed_token_hc_tensor(g->cur_hc,
-                                              model->map,
-                                              model->size,
-                                              weights->token_embd->abs_offset,
-                                              (uint32_t)weights->token_embd->dim[1],
-                                              (uint32_t)token,
-                                              DS4_N_EMBD,
-                                              DS4_N_HC) != 0;
+    bool ok = metal_graph_upload_token_embedding_hc(g->cur_hc,
+                                                   model,
+                                                   weights,
+                                                   token,
+                                                   DS4_N_HC);
 
     /*
      * Start executing the prefix of the decode graph while the CPU is still
@@ -10547,6 +10542,38 @@ static bool metal_graph_upload_prompt_embeddings_hc_cpu(
     free(plain);
     free(hc);
     return ok;
+}
+
+static bool metal_graph_upload_token_embedding_hc(
+        ds4_metal_tensor   *out_hc,
+        const ds4_model    *model,
+        const ds4_weights  *weights,
+        int                 token,
+        uint32_t            n_hc) {
+#ifdef DS4_USE_GPU_API
+    /* The upstream-shaped CUDA/ROCm embedding entry point is still F16-layout
+     * only.  CyberNeurova stores token_embd.weight as Q8_0, so decode must use
+     * the same CPU dequant/upload fallback as short-prefill until the generic
+     * GPU API carries embedding tensor type/layout information. */
+    if (weights->token_embd->type != DS4_TENSOR_F16) {
+        float *plain = xmalloc((size_t)DS4_N_EMBD * sizeof(plain[0]));
+        float *hc = xmalloc((size_t)n_hc * DS4_N_EMBD * sizeof(hc[0]));
+        embed_token_dense(model, weights, token, plain);
+        hc_from_plain_embedding(hc, plain, DS4_N_EMBD, n_hc);
+        const bool ok = ds4_metal_tensor_write(out_hc, 0, hc, (uint64_t)n_hc * DS4_N_EMBD * sizeof(hc[0])) != 0;
+        free(hc);
+        free(plain);
+        return ok;
+    }
+#endif
+    return ds4_metal_embed_token_hc_tensor(out_hc,
+                                           model->map,
+                                           model->size,
+                                           weights->token_embd->abs_offset,
+                                           (uint32_t)weights->token_embd->dim[1],
+                                           (uint32_t)token,
+                                           DS4_N_EMBD,
+                                           n_hc) != 0;
 }
 
 /* Seed the batched HC state from token ids: every HC stream starts as the same
@@ -12372,14 +12399,11 @@ static bool metal_graph_eval_mtp_draft_from_hc(
     ds4_metal_tensor *saved_cur = g->cur_hc;
     ds4_metal_tensor *saved_after = g->after_ffn_hc;
     bool ok = ds4_metal_begin_commands() != 0;
-    if (ok) ok = ds4_metal_embed_token_hc_tensor(g->mtp_embed,
-                                                  base_model->map,
-                                                  base_model->size,
-                                                  base_weights->token_embd->abs_offset,
-                                                  (uint32_t)base_weights->token_embd->dim[1],
-                                                  (uint32_t)token,
-                                                  DS4_N_EMBD,
-                                                  1) != 0;
+    if (ok) ok = metal_graph_upload_token_embedding_hc(g->mtp_embed,
+                                                       base_model,
+                                                       base_weights,
+                                                       token,
+                                                       1);
     if (ok) ok = ds4_metal_rms_norm_weight_tensor(g->mtp_enorm,
                                                   g->mtp_embed,
                                                   mtp_model->map,
@@ -13155,22 +13179,16 @@ static bool metal_graph_verify_decode2_exact(
     ds4_metal_tensor *next1 = metal_graph_tensor_row_view(g->batch_next_hc, 1, hc_dim);
     bool ok = cur0 && cur1 && next0 && next1;
 
-    if (ok) ok = ds4_metal_embed_token_hc_tensor(cur0,
-                                                  model->map,
-                                                  model->size,
-                                                  weights->token_embd->abs_offset,
-                                                  (uint32_t)weights->token_embd->dim[1],
-                                                  (uint32_t)token0,
-                                                  DS4_N_EMBD,
-                                                  DS4_N_HC) != 0;
-    if (ok) ok = ds4_metal_embed_token_hc_tensor(cur1,
-                                                  model->map,
-                                                  model->size,
-                                                  weights->token_embd->abs_offset,
-                                                  (uint32_t)weights->token_embd->dim[1],
-                                                  (uint32_t)token1,
-                                                  DS4_N_EMBD,
-                                                  DS4_N_HC) != 0;
+    if (ok) ok = metal_graph_upload_token_embedding_hc(cur0,
+                                                       model,
+                                                       weights,
+                                                       token0,
+                                                       DS4_N_HC);
+    if (ok) ok = metal_graph_upload_token_embedding_hc(cur1,
+                                                       model,
+                                                       weights,
+                                                       token1,
+                                                       DS4_N_HC);
 
     ds4_metal_tensor *saved_cur = g->cur_hc;
     ds4_metal_tensor *saved_after = g->after_ffn_hc;

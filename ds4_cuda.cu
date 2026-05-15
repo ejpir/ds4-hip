@@ -7526,13 +7526,13 @@ extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
                                                  gate_offset, up_offset,
                                                  in_dim, out_dim, out_dim,
                                                  x, 1) &&
-               ds4_gpu_swiglu_tensor(mid, gate, up, (uint32_t)out_dim, 10.0f, 1.0f);
+               ds4_gpu_swiglu_tensor(mid, gate, up, (uint32_t)out_dim, 0.0f, 1.0f);
     }
     return ds4_gpu_matmul_q8_0_tensor(gate, model_map, model_size,
                                         gate_offset, in_dim, out_dim, x, 1) &&
            ds4_gpu_matmul_q8_0_tensor(up, model_map, model_size,
                                         up_offset, in_dim, out_dim, x, 1) &&
-           ds4_gpu_swiglu_tensor(mid, gate, up, (uint32_t)out_dim, 10.0f, 1.0f);
+           ds4_gpu_swiglu_tensor(mid, gate, up, (uint32_t)out_dim, 0.0f, 1.0f);
 }
 extern "C" int ds4_gpu_add_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *a, const ds4_gpu_tensor *b, uint32_t n) {
     if (!out || !a || !b ||
