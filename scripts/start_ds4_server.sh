@@ -54,6 +54,10 @@ Environment:
   DS4_SERVER_MOE_DOWN_RPB=N      Rows/block for expert-bucketed down; e.g. 16 with shared-mid experiment
   DS4_SERVER_MOE_EXPERT_SHARED_X=1    Experimental LDS x tile reuse for gate/up; use with GATE_RPB>1
   DS4_SERVER_MOE_EXPERT_SHARED_MID=1  Experimental LDS mid tile reuse for down; use with DOWN_RPB>1
+  DS4_SERVER_MOE_Q8K_DOWN=1      Opt-in Q8_K mid/down MoE path; exact-gated default layers are >=40
+  DS4_SERVER_MOE_Q8K_DOWN_LAYERS=LIST Restrict Q8_K down to layers/ranges; overrides >=43 default
+  DS4_SERVER_MOE_Q8K_DOWN_DIRECT=1    Use slower direct sum6 Q8_K-down variant instead of expert-batched
+  DS4_SERVER_MOE_Q8K_DOWN_TILE=4|8|16 Expert-batched Q8_K-down pair tile; default 4
   DS4_SERVER_MOE_WMMA_HOT=1      Opt-in hot-bucket Q2_K WMMA MoE path; first-token/perf experimental, multi-token greedy drift observed
   DS4_SERVER_MOE_WMMA_GATE_HOT=N Gate/up WMMA bucket threshold; default 128
   DS4_SERVER_MOE_WMMA_DOWN_HOT=N Down WMMA bucket threshold; default 64
@@ -266,6 +270,18 @@ if [[ "${DS4_SERVER_MOE_EXPERT_SHARED_X:-0}" == "1" ]]; then
 fi
 if [[ "${DS4_SERVER_MOE_EXPERT_SHARED_MID:-0}" == "1" ]]; then
   export DS4_HIP_MOE_EXPERT_SHARED_MID=1
+fi
+if [[ "${DS4_SERVER_MOE_Q8K_DOWN:-0}" == "1" ]]; then
+  export DS4_HIP_MOE_Q8K_DOWN=1
+fi
+if [[ -n "${DS4_SERVER_MOE_Q8K_DOWN_LAYERS:-}" ]]; then
+  export DS4_HIP_MOE_Q8K_DOWN_LAYERS="$DS4_SERVER_MOE_Q8K_DOWN_LAYERS"
+fi
+if [[ "${DS4_SERVER_MOE_Q8K_DOWN_DIRECT:-0}" == "1" ]]; then
+  export DS4_HIP_MOE_Q8K_DOWN_DIRECT=1
+fi
+if [[ -n "${DS4_SERVER_MOE_Q8K_DOWN_TILE:-}" ]]; then
+  export DS4_HIP_MOE_Q8K_DOWN_TILE="$DS4_SERVER_MOE_Q8K_DOWN_TILE"
 fi
 if [[ "${DS4_SERVER_MOE_WMMA_HOT:-0}" == "1" ]]; then
   export DS4_HIP_MOE_WMMA_HOT=1

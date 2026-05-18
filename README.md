@@ -197,6 +197,37 @@ DS4_SERVER_Q8_REPACK=1
 DS4_SERVER_Q8_REPACK_SPLIT16=1
 ```
 
+The upstream-shaped ROCm/CUDA-port backend is built separately with
+`make rocm-upstream` (`./ds4-rocm-upstream`). Do not run it concurrently with the
+old-HIP server. Its Q2_K/6-expert prefill path now defaults to an old-HIP-style
+expert-batched MoE kernel (`DS4_CUDA_NO_MOE_Q2_EXPERT_BATCH=1` disables it;
+`DS4_CUDA_MOE_GATE_TILE`, `DS4_CUDA_MOE_DOWN_TILE`, `DS4_CUDA_MOE_GATE_RPB`, and
+`DS4_CUDA_MOE_DOWN_RPB` mirror the HIP tuning knobs). On the Radeon 8060S,
+`/tmp/prompt1741.txt --ctx 4096 -n 1` measures about `58.15 tok/s` zero-copy and
+`59.52 tok/s` with `DS4_CUDA_COPY_MODEL=1 DS4_CUDA_COPY_MODEL_CHUNK_MB=1024`,
+with the latter copying the 92.02 GiB tensor payload in about `31.8s`.
+Forced-stream quality reports at `/tmp/ds4_rocm_quality_q2expert_default` pass
+the current conservative logprob-drop thresholds against old-HIP references. An
+opt-in ROCm hot-bucket WMMA MoE profile
+(`DS4_CUDA_MOE_WMMA_HOT=1 DS4_CUDA_MOE_WMMA_GATE_HOT=64 DS4_CUDA_MOE_WMMA_DOWN_HOT=32`)
+raises the same smoke to about `75.21 tok/s` zero-copy and passes the forced-stream
+quality gate at `/tmp/ds4_rocm_quality_wmma_hot_g64d32`; it remains opt-in because
+it moves exact greedy near-ties. Adding `DS4_CUDA_ATTENTION_OUTPUT_CUBLAS_ALL=1`
+preloads the 86 attention-output Q8 tensors as FP16 (~5.38 GiB) and routes both
+attention-output projections through hipBLAS, raising the same zero-copy smoke to
+about `79.7-79.9 tok/s` and `81.07 tok/s` with opt-in staged full-copy
+(`DS4_CUDA_COPY_MODEL=1 DS4_CUDA_COPY_MODEL_CHUNK_MB=1024`, copy ~33.8s);
+forced-stream quality passes at
+`/tmp/ds4_rocm_quality_wmma_attnout_cublas_all`, but exact greedy near-ties move
+more, so keep it opt-in. For follow-up profiling, `DS4_CUDA_MOE_PROFILE=1`
+now splits the Q2_K expert-batch path into bucket/gate-scalar/gate-WMMA,
+down-scalar/down-WMMA/sum timings; `DS4_CUDA_ATTN_OUT_STAGE_PROFILE=1` splits
+attention-output A/B time, and the CUDA-port Q8 batch tile knobs mirror HIP
+(`DS4_CUDA_Q8_BATCH_TILE`, `DS4_CUDA_Q8_BATCH_SHARED_X_BLOCKS`,
+`DS4_CUDA_Q8_GROUPED_BATCH_TILE`, `DS4_CUDA_Q8_GROUPED_BATCH_SHARED_X_BLOCKS`).
+`DS4_CUDA_ATTN_Q_B_CUBLAS=1` and `DS4_CUDA_SHARED_EXPERT_CUBLAS=1` are available
+as targeted q-path/shared-expert diagnostics.
+
 For the fastest currently measured long-prompt prefill smoke test, add the
 experimental hot-bucket Q2_K MoE WMMA path on top of the fast profile:
 
@@ -223,6 +254,23 @@ for Q2_K expert tiles. The strict first-token smoke above stayed `We`, but
 full-layer 32-token greedy-logprob comparisons against the scalar/shared-X MoE
 path drifted (for example ` prompt` -> ` text` on the 5707-token prompt), so
 leave it off when exact continuation matching matters.
+
+A separate upstream-inspired Q8_K MoE-down path is available behind
+`DS4_HIP_MOE_Q8K_DOWN=1` (`DS4_SERVER_MOE_Q8K_DOWN=1` for the server wrapper).
+It keeps the exact scalar/shared-X Q2_K gate/up path, quantizes the gated mid
+activations to Q8_K, then runs an expert-batched Q2_K x Q8_K down projection with
+packed int8 dot products. Because the mid quantization changes arithmetic, it is
+opt-in. With no explicit layer list it is restricted to `layer_index >= 40`, the
+widest range that passed the current stricter security-style 5464-token/256-token
+greedy gate; all-layer mode drifted by generated step 5, `>=21` drifted by step
+188, and `>=39` drifted by step 16 on that same gate. Override with
+`DS4_HIP_MOE_Q8K_DOWN_LAYERS=LIST`, select the slower direct sum6 variant with
+`DS4_HIP_MOE_Q8K_DOWN_DIRECT=1`, or change the expert tile with
+`DS4_HIP_MOE_Q8K_DOWN_TILE=4|8|16` (default 4). The `40-80` range also matched a
+5635-token/256-token story gate and a 6244-token/256-token Promessi gate. In
+2048-token chunk sweeps on the Radeon 8060S it is a modest/noisy prefill win,
+mostly at mid contexts; keep it off for maximum conservative exactness until
+broader gates pass.
 
 The HIP Q8 shared-X batched prefill matmul is now default-on (tile32 for normal
 Q8 batch matmuls and tile32/RPB32 for grouped `attn_output_a` low projection).
@@ -254,8 +302,8 @@ safe restart behavior.
 The HIP backend is now at the first stable fast path: zero-copy and full-copy
 loading both work, the non-winning experiments have been removed, and the
 winning Q8 batched prefill path is enabled by default. The remaining safe
-prefill/decode knobs are exposed through `DS4_SERVER_FAST_FULL=1`; the Q2_K
-hot-bucket MoE WMMA path is opt-in separately and currently blocked from
+prefill/decode knobs are exposed through `DS4_SERVER_FAST_FULL=1`; the Q8_K
+MoE-down and Q2_K hot-bucket MoE WMMA paths are opt-in separately and currently blocked from
 promotion by multi-token greedy drift. The next work is kernel quality, then
 decode/inference behavior, then KV/cache work:
 
@@ -796,6 +844,8 @@ first answer:
 ./ds4 --dump-tokens -p "..."
 ./ds4 --dump-logprobs /tmp/out.json --logprobs-top-k 20 --temp 0 -p "..."
 tools/compare_logprobs.py /tmp/base.json /tmp/candidate.json --show-text
+tools/quality_logprob_report.py /tmp/base.json /tmp/candidate-forced.json --candidate-token-field eval
+tools/run_rocm_quality_gate.py --skip-greedy
 ./ds4-server --trace /tmp/ds4-trace.txt ...
 ```
 
@@ -807,5 +857,18 @@ tools/compare_logprobs.py /tmp/base.json /tmp/candidate.json --show-text
   alternatives at each step, which helps separate sampling choices from
   logit/model issues. `tools/compare_logprobs.py` compares two such dumps by
   selected token id and reports the first divergent step.
+- `--force-tokens FILE` replays a known token sequence while preserving the
+  local greedy choice as `selected`, useful for backend drift isolation.
+  `tools/quality_logprob_report.py` treats this as a quality/stability signal:
+  compare the logprob assigned to the same forced reference stream instead of
+  failing only because two near-tie greedy argmax choices differ.
+- `tools/run_rocm_quality_gate.py` runs the ROCm forced-stream quality gate
+  against the saved old-HIP reference JSONs. It refuses to run while the
+  old-HIP server PID file is live unless `--allow-server` is passed.
+- `DS4_METAL_GRAPH_DUMP_PREFIX` / `DS4_METAL_GRAPH_TRACE_FILE` enable gated
+  graph tensor diagnostics. `tools/compare_graph_traces.py` compares compact
+  trace JSONL files; `tools/compare_router_dumps.py` compares router top-k and
+  `ffn_moe_scores` dumps; `tools/compare_fp8_kv_decisions.py` compares
+  `KVrope`/`KVcur` FP8 bucket decisions and near-threshold flips.
 - `ds4-server --trace` writes the rendered prompts, cache decisions, generated
   text, and tool-parser events for a whole agent session.

@@ -1,0 +1,271 @@
+#!/usr/bin/env python3
+"""List GGUF tensor offsets for DS4 diagnostics.
+
+Examples:
+  tools/gguf_tensor_offsets model.gguf 'blk.*.attn_kv.weight'
+  tools/gguf_tensor_offsets model.gguf blk.0.attn_kv.weight blk.1.attn_kv.weight --offsets-only
+  tools/gguf_tensor_offsets model.gguf 'blk.*.attn_sinks.weight' --csv
+
+Offsets printed by this tool are absolute mmap/file offsets, matching the
+`abs_offset` values passed into the ROCm/HIP backend and usable with diagnostic
+envs such as `DS4_CUDA_OLDHIP_Q8_SMALL_DECODE_OFFSETS`.
+"""
+
+from __future__ import annotations
+
+import argparse
+import fnmatch
+import mmap
+import os
+import re
+import struct
+import sys
+from dataclasses import dataclass
+from typing import Any
+
+GGUF_TYPES = {
+    0: "f32",
+    1: "f16",
+    2: "q4_0",
+    3: "q4_1",
+    6: "q5_0",
+    7: "q5_1",
+    8: "q8_0",
+    9: "q8_1",
+    10: "q2_k",
+    11: "q3_k",
+    12: "q4_k",
+    13: "q5_k",
+    14: "q6_k",
+    15: "q8_k",
+    16: "iq2_xxs",
+    17: "iq2_xs",
+    18: "iq3_xxs",
+    19: "iq1_s",
+    20: "iq4_nl",
+    21: "iq3_s",
+    22: "iq2_s",
+    23: "iq4_xs",
+    24: "i8",
+    25: "i16",
+    26: "i32",
+    27: "i64",
+    28: "f64",
+    29: "iq1_m",
+    30: "bf16",
+}
+
+META_TYPES = {
+    0: "u8",
+    1: "i8",
+    2: "u16",
+    3: "i16",
+    4: "u32",
+    5: "i32",
+    6: "f32",
+    7: "bool",
+    8: "str",
+    9: "array",
+    10: "u64",
+    11: "i64",
+    12: "f64",
+}
+
+
+@dataclass
+class TensorInfo:
+    name: str
+    dims: list[int]
+    typ: int
+    rel_offset: int
+    abs_offset: int
+
+
+class Reader:
+    def __init__(self, mm: mmap.mmap):
+        self.mm = mm
+        self.off = 0
+
+    def read(self, fmt: str) -> Any:
+        size = struct.calcsize(fmt)
+        if self.off + size > len(self.mm):
+            raise EOFError("unexpected EOF while reading GGUF")
+        out = struct.unpack_from(fmt, self.mm, self.off)
+        self.off += size
+        return out[0] if len(out) == 1 else out
+
+    def u32(self) -> int:
+        return int(self.read("<I"))
+
+    def u64(self) -> int:
+        return int(self.read("<Q"))
+
+    def scalar(self, typ: int) -> Any:
+        if typ == 0:
+            return self.read("<B")
+        if typ == 1:
+            return self.read("<b")
+        if typ == 2:
+            return self.read("<H")
+        if typ == 3:
+            return self.read("<h")
+        if typ == 4:
+            return self.read("<I")
+        if typ == 5:
+            return self.read("<i")
+        if typ == 6:
+            return self.read("<f")
+        if typ == 7:
+            return self.read("<?")
+        if typ == 10:
+            return self.read("<Q")
+        if typ == 11:
+            return self.read("<q")
+        if typ == 12:
+            return self.read("<d")
+        raise ValueError(f"unsupported metadata scalar type {typ}")
+
+    def string(self) -> str:
+        n = self.u64()
+        if self.off + n > len(self.mm):
+            raise EOFError("unexpected EOF while reading GGUF string")
+        b = self.mm[self.off:self.off + n]
+        self.off += n
+        return b.decode("utf-8", "replace")
+
+    def meta_value(self, typ: int) -> Any:
+        if typ == 8:
+            return self.string()
+        if typ == 9:
+            elem_type = self.u32()
+            n = self.u64()
+            # Avoid allocating giant arrays; only general.alignment is needed by
+            # callers, and it is scalar in current GGUFs.
+            for _ in range(n):
+                self.skip_meta_value(elem_type)
+            return None
+        return self.scalar(typ)
+
+    def skip_meta_value(self, typ: int) -> None:
+        _ = self.meta_value(typ)
+
+
+def align_up(v: int, a: int) -> int:
+    if a <= 1:
+        return v
+    return (v + a - 1) // a * a
+
+
+def parse_gguf(path: str) -> tuple[int, int, list[TensorInfo]]:
+    with open(path, "rb") as f:
+        mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+        try:
+            r = Reader(mm)
+            magic = mm[:4]
+            r.off = 4
+            if magic != b"GGUF":
+                raise ValueError(f"not a GGUF file: bad magic {magic!r}")
+            version = r.u32()
+            n_tensors = r.u64()
+            n_kv = r.u64()
+            alignment = 32
+            for _ in range(n_kv):
+                key = r.string()
+                typ = r.u32()
+                if typ not in META_TYPES:
+                    raise ValueError(f"unsupported metadata type {typ} for key {key}")
+                if key == "general.alignment" and typ == 4:
+                    alignment = int(r.meta_value(typ))
+                else:
+                    r.skip_meta_value(typ)
+
+            raw_infos: list[tuple[str, list[int], int, int]] = []
+            for _ in range(n_tensors):
+                name = r.string()
+                nd = r.u32()
+                dims = [r.u64() for _ in range(nd)]
+                typ = r.u32()
+                rel = r.u64()
+                raw_infos.append((name, dims, typ, rel))
+
+            data_pos = align_up(r.off, alignment)
+            tensors = [TensorInfo(name, dims, typ, rel, data_pos + rel)
+                       for name, dims, typ, rel in raw_infos]
+            return version, alignment, tensors
+        finally:
+            mm.close()
+
+
+def wanted(name: str, patterns: list[str], regex: bool) -> bool:
+    if not patterns:
+        return True
+    if regex:
+        return any(re.search(p, name) for p in patterns)
+    return any(fnmatch.fnmatchcase(name, p) for p in patterns)
+
+
+def csv_escape(s: str) -> str:
+    if any(c in s for c in ',"\n'):
+        return '"' + s.replace('"', '""') + '"'
+    return s
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("model", help="GGUF model path")
+    ap.add_argument("patterns", nargs="*", help="tensor name globs, e.g. 'blk.*.attn_kv.weight'")
+    ap.add_argument("--regex", action="store_true", help="treat patterns as regular expressions instead of shell globs")
+    ap.add_argument("--offsets-only", action="store_true", help="print a comma-separated absolute-offset list")
+    ap.add_argument("--names-only", action="store_true", help="print only matching tensor names")
+    ap.add_argument("--csv", action="store_true", help="print CSV columns: name,abs_offset,rel_offset,type,dims")
+    ap.add_argument("--type", dest="type_filter", help="filter by tensor type name or numeric id")
+    args = ap.parse_args()
+
+    try:
+        _version, _alignment, tensors = parse_gguf(args.model)
+    except Exception as e:
+        print(f"gguf_tensor_offsets: {e}", file=sys.stderr)
+        return 1
+
+    type_filter_id: int | None = None
+    type_filter_name: str | None = None
+    if args.type_filter:
+        try:
+            type_filter_id = int(args.type_filter, 0)
+        except ValueError:
+            type_filter_name = args.type_filter.lower()
+
+    matches: list[TensorInfo] = []
+    for t in tensors:
+        if not wanted(t.name, args.patterns, args.regex):
+            continue
+        if type_filter_id is not None and t.typ != type_filter_id:
+            continue
+        if type_filter_name is not None and GGUF_TYPES.get(t.typ, str(t.typ)).lower() != type_filter_name:
+            continue
+        matches.append(t)
+
+    if args.offsets_only:
+        print(",".join(str(t.abs_offset) for t in matches))
+        return 0
+    if args.names_only:
+        for t in matches:
+            print(t.name)
+        return 0
+    if args.csv:
+        print("name,abs_offset,rel_offset,type,dims")
+        for t in matches:
+            typ = GGUF_TYPES.get(t.typ, str(t.typ))
+            print(f"{csv_escape(t.name)},{t.abs_offset},{t.rel_offset},{typ},{csv_escape('x'.join(map(str, t.dims)))}")
+        return 0
+
+    width = max((len(t.name) for t in matches), default=4)
+    for t in matches:
+        typ = GGUF_TYPES.get(t.typ, str(t.typ))
+        dims = "x".join(str(d) for d in t.dims)
+        print(f"{t.name:<{width}} abs={t.abs_offset} rel={t.rel_offset} type={typ} dims={dims}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

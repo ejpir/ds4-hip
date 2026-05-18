@@ -1,0 +1,614 @@
+#!/usr/bin/env python3
+"""Compare DS4 decode-layer graph dump tensors for replay triage.
+
+This is the first-stage replay helper: it consumes existing
+DS4_METAL_GRAPH_DUMP_PREFIX capture files from two runs (normally old-HIP and
+ROCm with the same forced tokens) and reports per-tensor numeric divergence.
+It is intentionally dump-driven so we can reuse the existing graph debug hooks
+before adding any one-off replay device code.  File discovery is conservative by
+default: parsed dump names must be known DS4 graph-dump stage names, which avoids
+prefix collisions such as `/tmp/run_rocm` accidentally picking up
+`/tmp/run_rocm_oldhc_*` files.
+
+Expected files are produced by ds4.c debug hooks, e.g.:
+    {prefix}_hc_layer_in-17_pos77.bin
+    {prefix}_KVrope-17_pos77.bin
+    {prefix}_KVcur-17_pos77.bin
+    {prefix}_ffn_moe_topk-22_pos75.i32
+
+Typical capture shape:
+    DS4_METAL_GRAPH_DUMP_PREFIX=/tmp/haiku_hip \
+    DS4_METAL_GRAPH_DUMP_LAYER=17,22,23 \
+    DS4_METAL_GRAPH_DUMP_POS=75-77 \
+    DS4_METAL_GRAPH_DUMP_NAME=hc_layer_in,attn_norm,KVraw,KVnorm,KVrope,KVcur,raw_cache,kqv_out,attn_out,ffn_norm,ffn_out,hc_ffn_post \
+      ./ds4 ... --dump-logprobs /tmp/haiku_hip.json
+
+Then compare:
+    tools/replay_decode_layer_compare /tmp/haiku_hip /tmp/haiku_rocm \
+      --layer 17,22,23 --pos 75-77 --fp8-kv --limit 80
+"""
+
+from __future__ import annotations
+
+import argparse
+import glob
+import math
+import os
+import re
+import sys
+from dataclasses import dataclass
+from typing import Iterable
+
+import numpy as np
+
+FILE_RE = re.compile(r"^(?P<name>.+)-(?P<layer>\d+)_pos(?P<pos>\d+)\.(?P<kind>bin|i32)$")
+
+STAGE_ORDER = [
+    "hc_layer_in",
+    "hc_attn_pre_mixes", "hc_attn_pre_weights", "hc_attn_pre_post_weights", "hc_attn_pre_comb", "hc_attn_pre",
+    "attn_norm",
+    "q_lora", "q_lora_ref", "q_lora_norm",
+    "Qraw", "Qraw_ref", "Qnorm", "Qcur",
+    "KVraw", "KVraw_ref", "KVnorm", "KVrope", "KVcur",
+    "raw_cache", "KVcompress", "attn_comp_kv_raw", "attn_comp_score_raw",
+    "indexer_KVcompress", "indexer_comp_kv_raw", "indexer_comp_score_raw",
+    "attn_scores", "attn_weights", "attn_ref_out", "attn_state_kv", "attn_state_score",
+    "indexer_scores", "indexer_topk", "indexer_state_kv", "indexer_state_score",
+    "kqv_out", "kqv_back", "attn_low", "attn_out", "hc_attn_post",
+    "hc_ffn_pre_mixes", "hc_ffn_pre_weights", "hc_ffn_pre_post_weights", "hc_ffn_pre_comb", "hc_ffn_pre",
+    "ffn_norm",
+    "ffn_moe_logits", "ffn_moe_probs", "ffn_moe_scores", "ffn_moe_topk", "ffn_moe_weights_scaled",
+    "ffn_moe_logits_ref", "ffn_moe_probs_ref", "ffn_moe_scores_ref", "ffn_moe_topk_ref", "ffn_moe_weights_scaled_ref",
+    "ffn_moe_gate_clamped", "ffn_moe_up_clamped", "ffn_moe_weighted_swiglu", "ffn_moe_down", "ffn_moe_out", "ffn_moe_out_ref",
+    "ffn_shexp_gate", "ffn_shexp_gate_ref", "ffn_shexp_up", "ffn_shexp_up_ref",
+    "ffn_shexp_mid", "ffn_shexp_mid_ref", "ffn_shexp", "ffn_shexp_ref",
+    "ffn_out", "ffn_out_ref", "hc_ffn_post",
+    "result_hc_pre", "result_hc_weights", "result_hc", "result_norm", "result_output",
+]
+STAGE_INDEX = {name: i for i, name in enumerate(STAGE_ORDER)}
+KNOWN_DUMP_NAMES = set(STAGE_ORDER)
+KV_SEGMENT_NAMES = {
+    "KVraw", "KVraw_ref", "KVnorm", "KVrope", "KVcur", "raw_cache",
+    "KVcompress", "attn_comp_kv_raw", "indexer_KVcompress", "indexer_comp_kv_raw",
+}
+
+
+@dataclass(frozen=True)
+class DumpKey:
+    pos: int
+    layer: int
+    name: str
+    kind: str
+
+
+@dataclass
+class Metrics:
+    key: DumpKey
+    n: int
+    changed: int
+    max_abs: float = 0.0
+    max_abs_idx: int = 0
+    base_at_max_abs: float = 0.0
+    cand_at_max_abs: float = 0.0
+    mean_abs: float = 0.0
+    rms_abs: float = 0.0
+    signed_mean: float = 0.0
+    max_rel: float = 0.0
+    max_rel_idx: int = 0
+    max_ulp: int = 0
+    max_ulp_idx: int = 0
+    i32_first_diff: int | None = None
+    size_mismatch: bool = False
+
+    @property
+    def failed(self) -> bool:
+        return self.changed != 0 or self.size_mismatch
+
+
+def parse_u32_filter(spec: str | None) -> set[int] | None:
+    if not spec or spec == "all":
+        return None
+    vals: set[int] = set()
+    for part in spec.split(','):
+        part = part.strip()
+        if not part:
+            continue
+        if '-' in part:
+            lo_s, hi_s = part.split('-', 1)
+            lo, hi = int(lo_s), int(hi_s)
+            if hi < lo:
+                lo, hi = hi, lo
+            vals.update(range(lo, hi + 1))
+        else:
+            vals.add(int(part))
+    return vals
+
+
+def parse_name_filter(spec: str | None) -> list[str] | None:
+    if not spec or spec == "all":
+        return None
+    out = [p.strip() for p in spec.split(',') if p.strip()]
+    return out or None
+
+
+def name_wanted(name: str, filters: list[str] | None) -> bool:
+    if filters is None:
+        return True
+    return any(f in name for f in filters)
+
+
+def sort_key(k: DumpKey) -> tuple[int, int, int, str, str]:
+    return (k.pos, k.layer, STAGE_INDEX.get(k.name, 100000), k.name, k.kind)
+
+
+def discover(prefix: str, allow_unknown_names: bool = False) -> dict[DumpKey, str]:
+    out: dict[DumpKey, str] = {}
+    prefix_base = os.path.basename(prefix)
+    for path in glob.glob(prefix + "_*-*_pos*.bin") + glob.glob(prefix + "_*-*_pos*.i32"):
+        base = os.path.basename(path)
+        if not base.startswith(prefix_base + "_"):
+            continue
+        suffix = base[len(prefix_base) + 1:]
+        m = FILE_RE.match(suffix)
+        if not m:
+            continue
+        name = m.group("name")
+        if not allow_unknown_names and name not in KNOWN_DUMP_NAMES:
+            continue
+        key = DumpKey(
+            pos=int(m.group("pos")),
+            layer=int(m.group("layer")),
+            name=name,
+            kind=m.group("kind"),
+        )
+        out[key] = path
+    return out
+
+
+def read_array(path: str, kind: str) -> np.ndarray:
+    if kind == "bin":
+        return np.fromfile(path, dtype=np.float32)
+    if kind == "i32":
+        return np.fromfile(path, dtype=np.int32)
+    raise ValueError(f"unsupported dump kind: {kind}")
+
+
+def ordered_f32_i64(x: np.ndarray) -> np.ndarray:
+    u = x.astype(np.float32, copy=False).view(np.uint32)
+    ordered = np.where((u & np.uint32(0x80000000)) != 0,
+                       ~u,
+                       u ^ np.uint32(0x80000000))
+    return ordered.astype(np.int64)
+
+
+def compare_f32(key: DumpKey, a: np.ndarray, b: np.ndarray, abs_tol: float, rel_tol: float, ulp_tol: int) -> Metrics:
+    n = int(min(a.size, b.size))
+    m = Metrics(key=key, n=n, changed=0, size_mismatch=(a.size != b.size))
+    if n == 0:
+        return m
+    af = a[:n].astype(np.float32, copy=False)
+    bf = b[:n].astype(np.float32, copy=False)
+    diff = bf.astype(np.float64) - af.astype(np.float64)
+    absdiff = np.abs(diff)
+    finite = np.isfinite(af) & np.isfinite(bf)
+    denom = np.maximum(np.maximum(np.abs(af.astype(np.float64)), np.abs(bf.astype(np.float64))), 1.0e-30)
+    rel = np.where(finite, absdiff / denom, np.inf)
+    ulp = np.zeros(n, dtype=np.int64)
+    if finite.any():
+        ai = ordered_f32_i64(af)
+        bi = ordered_f32_i64(bf)
+        ulp = np.abs(bi - ai)
+
+    m.max_abs_idx = int(np.argmax(absdiff))
+    m.max_abs = float(absdiff[m.max_abs_idx])
+    m.base_at_max_abs = float(af[m.max_abs_idx])
+    m.cand_at_max_abs = float(bf[m.max_abs_idx])
+    m.mean_abs = float(np.mean(absdiff))
+    m.rms_abs = float(math.sqrt(float(np.mean(diff * diff))))
+    m.signed_mean = float(np.mean(diff))
+    m.max_rel_idx = int(np.argmax(rel))
+    m.max_rel = float(rel[m.max_rel_idx])
+    m.max_ulp_idx = int(np.argmax(ulp))
+    m.max_ulp = int(ulp[m.max_ulp_idx])
+
+    changed = (absdiff > abs_tol) & (rel > rel_tol)
+    if ulp_tol > 0:
+        changed |= ulp > ulp_tol
+    else:
+        changed |= ulp != 0
+    changed |= ~finite
+    m.changed = int(np.count_nonzero(changed))
+    if m.size_mismatch:
+        m.changed += abs(int(a.size) - int(b.size))
+    return m
+
+
+def compare_i32(key: DumpKey, a: np.ndarray, b: np.ndarray) -> Metrics:
+    n = int(min(a.size, b.size))
+    m = Metrics(key=key, n=n, changed=0, size_mismatch=(a.size != b.size))
+    if n == 0:
+        return m
+    eq = a[:n] == b[:n]
+    changed = int(n - np.count_nonzero(eq))
+    if changed:
+        m.i32_first_diff = int(np.nonzero(~eq)[0][0])
+        m.base_at_max_abs = float(a[m.i32_first_diff])
+        m.cand_at_max_abs = float(b[m.i32_first_diff])
+    if m.size_mismatch:
+        changed += abs(int(a.size) - int(b.size))
+    m.changed = changed
+    return m
+
+
+# E4M3FN quantization helpers matching tools/compare_fp8_kv_decisions.py.
+def e4m3_value(i: int) -> float:
+    exp_scale = [
+        0.0, 0.015625, 0.03125, 0.0625,
+        0.125, 0.25, 0.5, 1.0,
+        2.0, 4.0, 8.0, 16.0,
+        32.0, 64.0, 128.0, 256.0,
+    ]
+    exp = (i >> 3) & 0x0F
+    mant = i & 0x07
+    if exp == 0:
+        return mant * 0.001953125
+    return (1.0 + mant * 0.125) * exp_scale[exp]
+
+
+E4M3 = np.array([e4m3_value(i) for i in range(127)], dtype=np.float64)
+
+
+def quantize_abs_bucket(qabs: np.ndarray) -> np.ndarray:
+    q = np.minimum(np.abs(qabs.astype(np.float64)), 448.0)
+    idx = np.searchsorted(E4M3, q, side="right") - 1
+    idx = np.clip(idx, 0, 126).astype(np.int32)
+    can_next = idx < 126
+    cur = E4M3[idx]
+    nxt = E4M3[np.minimum(idx + 1, 126)]
+    cur_diff = np.abs(q - cur)
+    nxt_diff = np.abs(q - nxt)
+    tie_even_next = (nxt_diff == cur_diff) & (((idx + 1) & 1) == 0) & ((idx & 1) != 0)
+    use_next = can_next & ((nxt_diff < cur_diff) | tie_even_next)
+    return (idx + use_next.astype(np.int32)).astype(np.int32)
+
+
+def scale_for_blocks(x: np.ndarray) -> np.ndarray:
+    rows = x.reshape((-1, 64)).astype(np.float64)
+    amax = np.max(np.abs(rows), axis=1)
+    amax = np.maximum(amax, 1.0e-4)
+    return np.ldexp(np.ones_like(amax), np.ceil(np.log2(amax / 448.0)).astype(np.int32))
+
+
+def self_ref_report(label: str, files: dict[DumpKey, str], keys: Iterable[DumpKey]) -> None:
+    ref_keys = [k for k in keys if k.kind == "bin" and k.name.endswith("_ref")]
+    rows: list[Metrics] = []
+    for ref_key in sorted(ref_keys, key=sort_key):
+        out_key = DumpKey(ref_key.pos, ref_key.layer, ref_key.name[:-4], ref_key.kind)
+        if out_key not in files or ref_key not in files:
+            continue
+        a = read_array(files[ref_key], ref_key.kind)
+        b = read_array(files[out_key], out_key.kind)
+        m = compare_f32(out_key, a, b, 0.0, 0.0, 0)
+        rows.append(m)
+    if not rows:
+        return
+    print(f"\n{label} self-ref kernel-vs-CPU rows:")
+    for m in rows:
+        print("  " + fmt_metric(m))
+
+
+def f32_to_f16_bits_hip_round_scalar(v: float) -> int:
+    u = int(np.float32(v).view(np.uint32))
+    sign = (u >> 16) & 0x8000
+    exp = ((u >> 23) & 0xFF) - 127 + 15
+    mant = u & 0x7FFFFF
+    if exp <= 0:
+        if exp < -10:
+            return sign
+        mant |= 0x800000
+        shift = 14 - exp
+        half_mant = mant >> shift
+        if (mant >> (shift - 1)) & 1:
+            half_mant += 1
+        return (sign | half_mant) & 0xFFFF
+    if exp >= 31:
+        return sign | 0x7C00
+    half = sign | (exp << 10) | (mant >> 13)
+    if mant & 0x1000:
+        half += 1
+    return half & 0xFFFF
+
+
+def f16_tail_cache_summary(base: dict[DumpKey, str], cand: dict[DumpKey, str], keys: Iterable[DumpKey], head_dim: int, n_rot: int) -> None:
+    by_lp = {(k.layer, k.pos) for k in keys if k.kind == "bin" and k.name in ("KVcur", "raw_cache")}
+    if not by_lp:
+        return
+    print("\nF16 raw-cache tail decision summary:")
+    total_flips = 0
+    total_raw_tail_diffs = 0
+    n_nope = head_dim - n_rot
+    for layer, pos in sorted(by_lp):
+        kv_key = DumpKey(pos, layer, "KVcur", "bin")
+        raw_key = DumpKey(pos, layer, "raw_cache", "bin")
+        if kv_key not in base or kv_key not in cand or raw_key not in base or raw_key not in cand:
+            continue
+        bkv = read_array(base[kv_key], "bin")
+        ckv = read_array(cand[kv_key], "bin")
+        braw = read_array(base[raw_key], "bin")
+        craw = read_array(cand[raw_key], "bin")
+        usable = min(bkv.size, ckv.size, head_dim)
+        if usable < head_dim or braw.size < head_dim or craw.size < head_dim:
+            continue
+        raw_rows = min(braw.size, craw.size) // head_dim
+        if raw_rows <= 0:
+            continue
+        row_off = raw_rows - 1
+        flips: list[tuple[float, int, int, int]] = []
+        for d in range(n_nope, head_dim):
+            bb = f32_to_f16_bits_hip_round_scalar(float(bkv[d]))
+            cb = f32_to_f16_bits_hip_round_scalar(float(ckv[d]))
+            if bb != cb:
+                rb = float(braw[row_off * head_dim + d])
+                rc = float(craw[row_off * head_dim + d])
+                flips.append((abs(rc - rb), d, bb, cb))
+        nflip = len(flips)
+        total_flips += nflip
+        if nflip:
+            _, d, bb, cb = max(flips, key=lambda x: x[0])
+            print(
+                f"  layer={layer} pos={pos} current_tail_f16_flips={nflip} max_flip_dim={d} "
+                f"base_kv={float(bkv[d]):+.9g} cand_kv={float(ckv[d]):+.9g} "
+                f"base_raw={float(braw[row_off * head_dim + d]):+.9g} cand_raw={float(craw[row_off * head_dim + d]):+.9g} "
+                f"base_bits=0x{bb:04x} cand_bits=0x{cb:04x}"
+            )
+
+        brows = braw[:raw_rows * head_dim].reshape((raw_rows, head_dim))[:, n_nope:head_dim]
+        crows = craw[:raw_rows * head_dim].reshape((raw_rows, head_dim))[:, n_nope:head_dim]
+        diff = np.abs(crows.astype(np.float64) - brows.astype(np.float64))
+        changed = brows != crows
+        ndiff = int(np.count_nonzero(changed))
+        total_raw_tail_diffs += ndiff
+        if ndiff:
+            flat = int(np.argmax(np.where(changed, diff, -1.0)))
+            rr = flat // n_rot
+            dd = n_nope + (flat % n_rot)
+            rb = float(brows[rr, dd - n_nope])
+            rc = float(crows[rr, dd - n_nope])
+            bb = f32_to_f16_bits_hip_round_scalar(rb)
+            cb = f32_to_f16_bits_hip_round_scalar(rc)
+            print(
+                f"  layer={layer} pos={pos} raw_tail_diffs={ndiff} max_row={rr} max_dim={dd} "
+                f"base_raw={rb:+.9g} cand_raw={rc:+.9g} "
+                f"base_bits=0x{bb:04x} cand_bits=0x{cb:04x}"
+            )
+    print(f"  total_current_tail_f16_flips={total_flips}")
+    print(f"  total_raw_tail_diffs={total_raw_tail_diffs}")
+
+
+def fp8_kv_summary(base: dict[DumpKey, str], cand: dict[DumpKey, str], keys: Iterable[DumpKey], head_dim: int, n_rot: int) -> None:
+    by_lp = {(k.layer, k.pos) for k in keys if k.kind == "bin" and k.name in ("KVrope", "KVcur")}
+    if not by_lp:
+        return
+    print("\nFP8 KV decision summary:")
+    total_flips = 0
+    for layer, pos in sorted(by_lp):
+        br_key = DumpKey(pos, layer, "KVrope", "bin")
+        cr_key = DumpKey(pos, layer, "KVcur", "bin")
+        if br_key not in base or br_key not in cand or cr_key not in base or cr_key not in cand:
+            continue
+        brope = read_array(base[br_key], "bin")
+        crope = read_array(cand[br_key], "bin")
+        bcur = read_array(base[cr_key], "bin")
+        ccur = read_array(cand[cr_key], "bin")
+        n_nope = head_dim - n_rot
+        usable = min(brope.size, crope.size, bcur.size, ccur.size, n_nope)
+        usable -= usable % 64
+        if usable <= 0:
+            continue
+        br = brope[:usable]
+        cr = crope[:usable]
+        scales_b = np.repeat(scale_for_blocks(br), 64)
+        scales_c = np.repeat(scale_for_blocks(cr), 64)
+        bb = quantize_abs_bucket(br / scales_b)
+        cb = quantize_abs_bucket(cr / scales_c)
+        sign_flip = np.signbit(bcur[:usable]) != np.signbit(ccur[:usable])
+        bucket_flip = (bb != cb) | sign_flip
+        nflip = int(np.count_nonzero(bucket_flip))
+        total_flips += nflip
+        if nflip:
+            cur_delta = np.abs(ccur[:usable].astype(np.float64) - bcur[:usable].astype(np.float64))
+            idx = int(np.argmax(np.where(bucket_flip, cur_delta, -1.0)))
+            print(
+                f"  layer={layer} pos={pos} flips={nflip} "
+                f"max_flip_dim={idx} base_cur={float(bcur[idx]):+.9g} cand_cur={float(ccur[idx]):+.9g} "
+                f"base_bucket={int(bb[idx])} cand_bucket={int(cb[idx])}"
+            )
+    print(f"  total_fp8_bucket_or_sign_flips={total_flips}")
+
+
+def kv_segment_views(x: np.ndarray, head_dim: int, n_rot: int) -> list[tuple[str, np.ndarray]]:
+    if head_dim <= 0 or n_rot <= 0 or n_rot > head_dim:
+        return []
+    rows = x[:(x.size // head_dim) * head_dim]
+    if rows.size <= 0:
+        return []
+    r = rows.reshape((-1, head_dim))
+    n_nope = head_dim - n_rot
+    return [
+        (f"no_rope_value_dims[0:{n_nope}]", r[:, :n_nope].reshape(-1)),
+        (f"rope_key_tail[{n_nope}:{head_dim}]", r[:, n_nope:head_dim].reshape(-1)),
+    ]
+
+
+def kv_segment_report(
+        base: dict[DumpKey, str],
+        cand: dict[DumpKey, str],
+        keys: Iterable[DumpKey],
+        head_dim: int,
+        n_rot: int,
+        abs_tol: float,
+        rel_tol: float,
+        ulp_tol: int,
+        limit: int) -> None:
+    rows: list[Metrics] = []
+    for key in sorted(keys, key=sort_key):
+        if key.kind != "bin" or key.name not in KV_SEGMENT_NAMES:
+            continue
+        if key not in base or key not in cand:
+            continue
+        a = read_array(base[key], key.kind)
+        b = read_array(cand[key], key.kind)
+        av = kv_segment_views(a, head_dim, n_rot)
+        bv = kv_segment_views(b, head_dim, n_rot)
+        if len(av) != len(bv):
+            continue
+        for (label, aseg), (label_b, bseg) in zip(av, bv):
+            if label != label_b:
+                continue
+            seg_key = DumpKey(key.pos, key.layer, f"{key.name}:{label}", key.kind)
+            rows.append(compare_f32(seg_key, aseg, bseg, abs_tol, rel_tol, ulp_tol))
+    if not rows:
+        return
+    print("\nKV segment summary (derived from existing full-width dumps):")
+    shown = 0
+    for m in rows:
+        if m.failed and shown < limit:
+            print("  " + fmt_metric(m))
+            shown += 1
+    if shown == 0:
+        print("  no changed KV segment rows")
+    elif shown < sum(1 for m in rows if m.failed):
+        print(f"  ... {sum(1 for m in rows if m.failed) - shown} more changed segment rows")
+
+
+def fmt_metric(m: Metrics) -> str:
+    k = m.key
+    if k.kind == "i32":
+        if m.i32_first_diff is None:
+            detail = ""
+        else:
+            detail = f" first_idx={m.i32_first_diff} base={int(m.base_at_max_abs)} cand={int(m.cand_at_max_abs)}"
+        return f"pos={k.pos} layer={k.layer:02d} {k.name:<28} i32 n={m.n} changed={m.changed}{detail}"
+    return (
+        f"pos={k.pos} layer={k.layer:02d} {k.name:<28} f32 n={m.n} changed={m.changed} "
+        f"max_abs={m.max_abs:.9g}@{m.max_abs_idx} ({m.base_at_max_abs:+.9g}->{m.cand_at_max_abs:+.9g}) "
+        f"rms={m.rms_abs:.9g} mean_abs={m.mean_abs:.9g} meanΔ={m.signed_mean:+.3g} "
+        f"max_rel={m.max_rel:.3g}@{m.max_rel_idx} max_ulp={m.max_ulp}@{m.max_ulp_idx}"
+    )
+
+
+def print_gain_report(metrics: list[Metrics], gain_min: float) -> None:
+    f32 = [m for m in metrics if m.key.kind == "bin" and not m.size_mismatch]
+    groups: dict[tuple[int, int], list[Metrics]] = {}
+    for m in f32:
+        groups.setdefault((m.key.pos, m.key.layer), []).append(m)
+    rows: list[tuple[float, Metrics, Metrics]] = []
+    for group in groups.values():
+        group.sort(key=lambda m: sort_key(m.key))
+        prev: Metrics | None = None
+        for cur in group:
+            if prev and prev.rms_abs > 0.0:
+                gain = cur.rms_abs / prev.rms_abs
+                if gain >= gain_min:
+                    rows.append((gain, prev, cur))
+            if cur.rms_abs > 0.0:
+                prev = cur
+    if not rows:
+        return
+    print(f"\nObserved cascade gain candidates (rms ratio >= {gain_min:g}; not controlled replay yet):")
+    for gain, prev, cur in sorted(rows, key=lambda x: x[0], reverse=True)[:40]:
+        print(
+            f"  gain={gain:.3g} pos={cur.key.pos} layer={cur.key.layer} "
+            f"{prev.key.name}({prev.rms_abs:.3g}) -> {cur.key.name}({cur.rms_abs:.3g})"
+        )
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("baseline_prefix", help="old-HIP dump prefix (without _NAME-layer_pos.bin suffix)")
+    ap.add_argument("candidate_prefix", help="ROCm dump prefix (without _NAME-layer_pos.bin suffix)")
+    ap.add_argument("--layer", default=None, help="layer filter: 17 or 17,22 or 17-23 or all")
+    ap.add_argument("--pos", default=None, help="position filter: 75 or 75-77 or all")
+    ap.add_argument("--name", default=None, help="comma-separated substring filter for tensor names")
+    ap.add_argument("--all", action="store_true", help="print unchanged rows too")
+    ap.add_argument("--limit", type=int, default=80, help="maximum per-tensor rows to print")
+    ap.add_argument("--abs-tol", type=float, default=0.0)
+    ap.add_argument("--rel-tol", type=float, default=0.0)
+    ap.add_argument("--ulp-tol", type=int, default=0)
+    ap.add_argument("--gain-min", type=float, default=10.0, help="print observed stage rms ratios above this value; 0 disables")
+    ap.add_argument("--self-ref", action="store_true", help="compare *_ref CPU reference dumps with same-prefix GPU dumps")
+    ap.add_argument("--fp8-kv", action="store_true", help="also summarize KVrope/KVcur E4M3 bucket/sign flips")
+    ap.add_argument("--f16-kv-cache", action="store_true", help="summarize current-row RoPE-tail f16 raw-cache rounding flips")
+    ap.add_argument("--kv-segments", action="store_true", help="split KV/raw-cache comparisons into no-RoPE/value dims and RoPE key-tail dims without new dumps")
+    ap.add_argument("--kv-segment-limit", type=int, default=40, help="maximum changed KV segment rows to print")
+    ap.add_argument("--allow-unknown-names", action="store_true", help="include parsed dump names not present in this tool's known DS4 stage list")
+    ap.add_argument("--head-dim", type=int, default=512)
+    ap.add_argument("--n-rot", type=int, default=64)
+    args = ap.parse_args()
+
+    layers = parse_u32_filter(args.layer)
+    poss = parse_u32_filter(args.pos)
+    names = parse_name_filter(args.name)
+
+    base = discover(args.baseline_prefix, args.allow_unknown_names)
+    cand = discover(args.candidate_prefix, args.allow_unknown_names)
+    common = sorted(set(base) & set(cand), key=sort_key)
+    if layers is not None:
+        common = [k for k in common if k.layer in layers]
+    if poss is not None:
+        common = [k for k in common if k.pos in poss]
+    if names is not None:
+        common = [k for k in common if name_wanted(k.name, names)]
+
+    print(f"baseline_files={len(base)} candidate_files={len(cand)} common_selected={len(common)}")
+    missing_in_cand = sorted(set(base) - set(cand), key=sort_key)
+    missing_in_base = sorted(set(cand) - set(base), key=sort_key)
+    if missing_in_cand:
+        print(f"candidate_missing={len(missing_in_cand)}")
+    if missing_in_base:
+        print(f"baseline_missing={len(missing_in_base)}")
+
+    metrics: list[Metrics] = []
+    shown = 0
+    first_changed: Metrics | None = None
+    for key in common:
+        try:
+            a = read_array(base[key], key.kind)
+            b = read_array(cand[key], key.kind)
+        except OSError as e:
+            print(f"failed to read {key}: {e}", file=sys.stderr)
+            continue
+        if key.kind == "bin":
+            m = compare_f32(key, a, b, args.abs_tol, args.rel_tol, args.ulp_tol)
+        else:
+            m = compare_i32(key, a, b)
+        metrics.append(m)
+        if first_changed is None and m.failed:
+            first_changed = m
+        if (args.all or m.failed) and shown < args.limit:
+            print(fmt_metric(m))
+            shown += 1
+
+    changed_rows = sum(1 for m in metrics if m.failed)
+    print(f"\ncompared_rows={len(metrics)} changed_rows={changed_rows} shown={shown}")
+    if first_changed:
+        print("first_changed: " + fmt_metric(first_changed))
+
+    if args.gain_min > 0.0:
+        print_gain_report(metrics, args.gain_min)
+    if args.self_ref:
+        self_ref_report("baseline", base, common)
+        self_ref_report("candidate", cand, common)
+    if args.fp8_kv:
+        fp8_kv_summary(base, cand, common, args.head_dim, args.n_rot)
+    if args.f16_kv_cache:
+        f16_tail_cache_summary(base, cand, common, args.head_dim, args.n_rot)
+    if args.kv_segments:
+        kv_segment_report(base, cand, common, args.head_dim, args.n_rot,
+                          args.abs_tol, args.rel_tol, args.ulp_tol,
+                          args.kv_segment_limit)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

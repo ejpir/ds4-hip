@@ -125,7 +125,7 @@ ds4_server_gpuapi.o: ds4_server.c ds4.h rax.h
 ds4_bench_gpuapi.o: ds4_bench.c ds4.h
 	$(CC) $(CFLAGS) -DDS4_USE_GPU_API -DDS4_USE_HIP -c -o $@ ds4_bench.c
 
-ds4_cuda.o: ds4_cuda.cu ds4_gpu.h ds4_iq2_tables_cuda.inc ds4_rocm.h
+ds4_cuda.o: ds4_cuda.cu ds4_gpu.h ds4_iq2_tables_cuda.inc ds4_rocm.h rocm/ds4_rocm_common.cuh rocm/ds4_rocm_q8.cuh rocm/ds4_rocm_fp8_kv.cuh rocm/ds4_rocm_attention.cuh rocm/ds4_rocm_hc.cuh rocm/ds4_rocm_output.cuh rocm/ds4_rocm_moe.cuh
 	$(ROCM_HIPCC) $(ROCM_CFLAGS) -c -o $@ ds4_cuda.cu
 
 ifneq ($(HIPCC),)

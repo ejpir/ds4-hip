@@ -8211,21 +8211,195 @@ static bool metal_tensor_fill_f32(ds4_metal_tensor *t, float v, uint64_t n) {
  * the command batch, so it is intentionally isolated here.
  */
 
+static bool metal_graph_debug_u32_filter_wants(const char *env, uint32_t value) {
+    if (!env || !env[0] || strcmp(env, "all") == 0) return true;
+
+    const char *p = env;
+    while (*p) {
+        while (*p == ',' || isspace((unsigned char)*p)) p++;
+        if (!*p) break;
+        char *end = NULL;
+        unsigned long lo = strtoul(p, &end, 10);
+        if (end == p) return false;
+        unsigned long hi = lo;
+        if (*end == '-') {
+            p = end + 1;
+            hi = strtoul(p, &end, 10);
+            if (end == p) return false;
+        }
+        if ((unsigned long)value >= lo && (unsigned long)value <= hi) return true;
+        p = end;
+        while (*p && *p != ',') p++;
+    }
+    return false;
+}
+
+static bool metal_graph_debug_filter_wants(
+        const char *name,
+        uint32_t    il,
+        uint32_t    pos,
+        const char *name_env,
+        const char *layer_env,
+        const char *pos_env) {
+    if (name_env && name_env[0] && strcmp(name_env, "all") != 0 && strstr(name_env, name) == NULL) return false;
+    if (!metal_graph_debug_u32_filter_wants(layer_env, il)) return false;
+    if (!metal_graph_debug_u32_filter_wants(pos_env, pos)) return false;
+    return true;
+}
+
 static bool metal_graph_debug_wants(const char *name, uint32_t il, uint32_t pos) {
     const char *prefix = getenv("DS4_METAL_GRAPH_DUMP_PREFIX");
     if (!prefix || !prefix[0]) return false;
 
-    const char *name_env = getenv("DS4_METAL_GRAPH_DUMP_NAME");
-    if (name_env && name_env[0] && strstr(name_env, name) == NULL) return false;
+    return metal_graph_debug_filter_wants(name, il, pos,
+                                          getenv("DS4_METAL_GRAPH_DUMP_NAME"),
+                                          getenv("DS4_METAL_GRAPH_DUMP_LAYER"),
+                                          getenv("DS4_METAL_GRAPH_DUMP_POS"));
+}
 
-    const char *layer_env = getenv("DS4_METAL_GRAPH_DUMP_LAYER");
-    if (layer_env && layer_env[0] && strcmp(layer_env, "all") != 0 &&
-        (uint32_t)strtoul(layer_env, NULL, 10) != il) return false;
+static bool metal_graph_debug_trace_wants(const char *name, uint32_t il, uint32_t pos) {
+    const char *path = getenv("DS4_METAL_GRAPH_TRACE_FILE");
+    if (!path || !path[0]) return false;
 
-    const char *pos_env = getenv("DS4_METAL_GRAPH_DUMP_POS");
-    if (pos_env && pos_env[0] && (uint32_t)strtoul(pos_env, NULL, 10) != pos) return false;
+    const char *name_env = getenv("DS4_METAL_GRAPH_TRACE_NAME");
+    const char *layer_env = getenv("DS4_METAL_GRAPH_TRACE_LAYER");
+    const char *pos_env = getenv("DS4_METAL_GRAPH_TRACE_POS");
+    if (!name_env || !name_env[0]) name_env = getenv("DS4_METAL_GRAPH_DUMP_NAME");
+    if (!layer_env || !layer_env[0]) layer_env = getenv("DS4_METAL_GRAPH_DUMP_LAYER");
+    if (!pos_env || !pos_env[0]) pos_env = getenv("DS4_METAL_GRAPH_DUMP_POS");
 
-    return true;
+    return metal_graph_debug_filter_wants(name, il, pos, name_env, layer_env, pos_env);
+}
+
+static uint64_t metal_graph_debug_fnv1a_u32(uint64_t h, uint32_t v) {
+    h ^= (uint64_t)v;
+    h *= UINT64_C(1099511628211);
+    return h;
+}
+
+static void metal_graph_debug_trace_f32(
+        const char *name,
+        const float *buf,
+        uint64_t    n_f32,
+        uint32_t    il,
+        uint32_t    pos) {
+    const char *path = getenv("DS4_METAL_GRAPH_TRACE_FILE");
+    if (!path || !path[0] || !buf || n_f32 == 0) return;
+
+    double sum = 0.0;
+    double sum_abs = 0.0;
+    double sum_sq = 0.0;
+    float min_v = 0.0f;
+    float max_v = 0.0f;
+    float max_abs_v = 0.0f;
+    uint64_t max_abs_i = 0;
+    uint64_t n_nan = 0;
+    uint64_t n_inf = 0;
+    bool have_finite = false;
+    uint64_t hash = UINT64_C(1469598103934665603);
+
+    for (uint64_t i = 0; i < n_f32; i++) {
+        float v = buf[i];
+        uint32_t bits;
+        memcpy(&bits, &v, sizeof(bits));
+        hash = metal_graph_debug_fnv1a_u32(hash, bits);
+        if (isnan(v)) {
+            n_nan++;
+            continue;
+        }
+        if (isinf(v)) {
+            n_inf++;
+            continue;
+        }
+        double dv = (double)v;
+        double av = fabs(dv);
+        sum += dv;
+        sum_abs += av;
+        sum_sq += dv * dv;
+        if (!have_finite) {
+            min_v = max_v = max_abs_v = v;
+            max_abs_i = i;
+            have_finite = true;
+        } else {
+            if (v < min_v) min_v = v;
+            if (v > max_v) max_v = v;
+            if (av > fabs((double)max_abs_v)) {
+                max_abs_v = v;
+                max_abs_i = i;
+            }
+        }
+    }
+
+    double denom = n_f32 ? (double)n_f32 : 1.0;
+    FILE *fp = fopen(path, "ab");
+    if (!fp) return;
+    fprintf(fp,
+            "{\"backend\":\"%s\",\"type\":\"f32\",\"name\":\"%s\","
+            "\"layer\":%u,\"pos\":%u,\"n\":%" PRIu64 ","
+            "\"hash\":\"%016" PRIx64 "\",\"mean\":%.9g,\"mean_abs\":%.9g,"
+            "\"rms\":%.9g,\"min\":%.9g,\"max\":%.9g,"
+            "\"max_abs\":%.9g,\"max_abs_idx\":%" PRIu64 ","
+            "\"nan\":%" PRIu64 ",\"inf\":%" PRIu64 "}\n",
+            DS4_GPU_BACKEND_NAME,
+            name,
+            il,
+            pos,
+            n_f32,
+            hash,
+            sum / denom,
+            sum_abs / denom,
+            sqrt(sum_sq / denom),
+            have_finite ? min_v : 0.0f,
+            have_finite ? max_v : 0.0f,
+            have_finite ? fabs((double)max_abs_v) : 0.0,
+            max_abs_i,
+            n_nan,
+            n_inf);
+    fclose(fp);
+}
+
+static void metal_graph_debug_trace_i32(
+        const char    *name,
+        const int32_t *buf,
+        uint64_t       n_i32,
+        uint32_t       il,
+        uint32_t       pos) {
+    const char *path = getenv("DS4_METAL_GRAPH_TRACE_FILE");
+    if (!path || !path[0] || !buf || n_i32 == 0) return;
+
+    int32_t min_v = buf[0];
+    int32_t max_v = buf[0];
+    uint64_t hash = UINT64_C(1469598103934665603);
+    for (uint64_t i = 0; i < n_i32; i++) {
+        uint32_t bits;
+        memcpy(&bits, &buf[i], sizeof(bits));
+        hash = metal_graph_debug_fnv1a_u32(hash, bits);
+        if (buf[i] < min_v) min_v = buf[i];
+        if (buf[i] > max_v) max_v = buf[i];
+    }
+
+    FILE *fp = fopen(path, "ab");
+    if (!fp) return;
+    fprintf(fp,
+            "{\"backend\":\"%s\",\"type\":\"i32\",\"name\":\"%s\","
+            "\"layer\":%u,\"pos\":%u,\"n\":%" PRIu64 ","
+            "\"hash\":\"%016" PRIx64 "\",\"min\":%d,\"max\":%d,\"values\":[",
+            DS4_GPU_BACKEND_NAME,
+            name,
+            il,
+            pos,
+            n_i32,
+            hash,
+            min_v,
+            max_v);
+    uint64_t n_print = n_i32 < 64 ? n_i32 : 64;
+    for (uint64_t i = 0; i < n_print; i++) {
+        if (i) fputc(',', fp);
+        fprintf(fp, "%d", buf[i]);
+    }
+    if (n_print < n_i32) fputs(",\"...\"", fp);
+    fputs("]}\n", fp);
+    fclose(fp);
 }
 
 static void metal_graph_debug_dump_tensor(
@@ -8235,7 +8409,9 @@ static void metal_graph_debug_dump_tensor(
         uint32_t          il,
         uint32_t          pos) {
     const char *prefix = getenv("DS4_METAL_GRAPH_DUMP_PREFIX");
-    if (!t || n_f32 == 0 || !metal_graph_debug_wants(name, il, pos)) return;
+    const bool want_dump = metal_graph_debug_wants(name, il, pos);
+    const bool want_trace = metal_graph_debug_trace_wants(name, il, pos);
+    if (!t || n_f32 == 0 || (!want_dump && !want_trace)) return;
 
     if (ds4_metal_synchronize() == 0) {
         fprintf(stderr, "ds4: failed to synchronize before dumping %s layer %u pos %u\n", name, il, pos);
@@ -8244,10 +8420,13 @@ static void metal_graph_debug_dump_tensor(
 
     float *buf = xmalloc((size_t)n_f32 * sizeof(buf[0]));
     if (ds4_metal_tensor_read(t, 0, buf, n_f32 * sizeof(buf[0])) != 0) {
-        char path[1024];
-        snprintf(path, sizeof(path), "%s_%s-%u_pos%u.bin", prefix, name, il, pos);
-        if (write_f32_binary_file(path, buf, n_f32)) {
-            fprintf(stderr, "ds4: dumped %s layer %u pos %u to %s\n", name, il, pos, path);
+        if (want_trace) metal_graph_debug_trace_f32(name, buf, n_f32, il, pos);
+        if (want_dump) {
+            char path[1024];
+            snprintf(path, sizeof(path), "%s_%s-%u_pos%u.bin", prefix, name, il, pos);
+            if (write_f32_binary_file(path, buf, n_f32)) {
+                fprintf(stderr, "ds4: dumped %s layer %u pos %u to %s\n", name, il, pos, path);
+            }
         }
     }
     free(buf);
@@ -8264,7 +8443,9 @@ static void metal_graph_debug_dump_i32_tensor(
         uint32_t          il,
         uint32_t          pos) {
     const char *prefix = getenv("DS4_METAL_GRAPH_DUMP_PREFIX");
-    if (!t || n_i32 == 0 || !metal_graph_debug_wants(name, il, pos)) return;
+    const bool want_dump = metal_graph_debug_wants(name, il, pos);
+    const bool want_trace = metal_graph_debug_trace_wants(name, il, pos);
+    if (!t || n_i32 == 0 || (!want_dump && !want_trace)) return;
 
     if (ds4_metal_synchronize() == 0) {
         fprintf(stderr, "ds4: failed to synchronize before dumping %s layer %u pos %u\n", name, il, pos);
@@ -8273,14 +8454,17 @@ static void metal_graph_debug_dump_i32_tensor(
 
     int32_t *buf = xmalloc((size_t)n_i32 * sizeof(buf[0]));
     if (ds4_metal_tensor_read(t, 0, buf, n_i32 * sizeof(buf[0])) != 0) {
-        char path[1024];
-        snprintf(path, sizeof(path), "%s_%s-%u_pos%u.i32", prefix, name, il, pos);
-        FILE *fp = fopen(path, "wb");
-        if (fp) {
-            if (fwrite(buf, sizeof(buf[0]), (size_t)n_i32, fp) == (size_t)n_i32) {
-                fprintf(stderr, "ds4: dumped %s layer %u pos %u to %s\n", name, il, pos, path);
+        if (want_trace) metal_graph_debug_trace_i32(name, buf, n_i32, il, pos);
+        if (want_dump) {
+            char path[1024];
+            snprintf(path, sizeof(path), "%s_%s-%u_pos%u.i32", prefix, name, il, pos);
+            FILE *fp = fopen(path, "wb");
+            if (fp) {
+                if (fwrite(buf, sizeof(buf[0]), (size_t)n_i32, fp) == (size_t)n_i32) {
+                    fprintf(stderr, "ds4: dumped %s layer %u pos %u to %s\n", name, il, pos, path);
+                }
+                fclose(fp);
             }
-            fclose(fp);
         }
     }
     free(buf);
@@ -8290,8 +8474,662 @@ static void metal_graph_debug_dump_i32_tensor(
     }
 }
 
+static void metal_graph_debug_dump_f32_buffer(
+        const char *name,
+        const float *buf,
+        uint64_t    n_f32,
+        uint32_t    il,
+        uint32_t    pos) {
+    const char *prefix = getenv("DS4_METAL_GRAPH_DUMP_PREFIX");
+    const bool want_dump = metal_graph_debug_wants(name, il, pos);
+    const bool want_trace = metal_graph_debug_trace_wants(name, il, pos);
+    if (!buf || n_f32 == 0 || (!want_dump && !want_trace)) return;
+
+    if (want_trace) metal_graph_debug_trace_f32(name, buf, n_f32, il, pos);
+    if (want_dump) {
+        char path[1024];
+        snprintf(path, sizeof(path), "%s_%s-%u_pos%u.bin", prefix, name, il, pos);
+        if (write_f32_binary_file(path, buf, n_f32)) {
+            fprintf(stderr, "ds4: dumped %s layer %u pos %u to %s\n", name, il, pos, path);
+        }
+    }
+}
+
+static bool metal_graph_debug_read_exact_if_exists(const char *path, void *buf, size_t bytes, bool *exists);
+static bool metal_graph_debug_inject_wants(const char *name, uint32_t il, uint32_t pos);
+
+static void metal_graph_debug_dump_raw_cache(
+        const char       *name,
+        ds4_metal_tensor *raw_cache,
+        uint32_t          raw_cap,
+        uint32_t          raw_start,
+        uint32_t          n_raw,
+        uint32_t          head_dim,
+        uint32_t          il,
+        uint32_t          pos) {
+    const bool want_dump = metal_graph_debug_wants(name, il, pos);
+    const bool want_trace = metal_graph_debug_trace_wants(name, il, pos);
+    if (!raw_cache || raw_cap == 0 || n_raw == 0 || head_dim == 0 || (!want_dump && !want_trace)) return;
+    if (raw_start >= raw_cap || n_raw > raw_cap) return;
+    if (ds4_metal_tensor_bytes(raw_cache) < (uint64_t)raw_cap * head_dim * sizeof(float)) return;
+
+    if (ds4_metal_synchronize() == 0) {
+        fprintf(stderr, "ds4: failed to synchronize before dumping %s layer %u pos %u\n", name, il, pos);
+        return;
+    }
+
+    const uint64_t row_bytes = (uint64_t)head_dim * sizeof(float);
+    float *buf = xmalloc((size_t)n_raw * head_dim * sizeof(buf[0]));
+    bool ok = true;
+    for (uint32_t r = 0; r < n_raw; r++) {
+        const uint32_t phys = (raw_start + r) % raw_cap;
+        if (ds4_metal_tensor_read(raw_cache,
+                                  (uint64_t)phys * row_bytes,
+                                  buf + (uint64_t)r * head_dim,
+                                  row_bytes) == 0) {
+            ok = false;
+            break;
+        }
+    }
+    if (ok) metal_graph_debug_dump_f32_buffer(name, buf, (uint64_t)n_raw * head_dim, il, pos);
+    free(buf);
+
+    if (ds4_metal_begin_commands() == 0) {
+        fprintf(stderr, "ds4: failed to resume Metal command batch after dumping %s layer %u pos %u\n", name, il, pos);
+    }
+}
+
+static bool metal_graph_debug_inject_raw_cache(
+        const char       *name,
+        ds4_metal_tensor *raw_cache,
+        uint32_t          raw_cap,
+        uint32_t          raw_start,
+        uint32_t          n_raw,
+        uint32_t          head_dim,
+        uint32_t          il,
+        uint32_t          pos) {
+    const char *prefix = getenv("DS4_METAL_GRAPH_INJECT_PREFIX");
+    if (!prefix || !prefix[0] || !name || !raw_cache || raw_cap == 0 || n_raw == 0 || head_dim == 0) return false;
+    if (!metal_graph_debug_inject_wants(name, il, pos)) return false;
+    if (raw_start >= raw_cap || n_raw > raw_cap) return false;
+    if (ds4_metal_tensor_bytes(raw_cache) < (uint64_t)raw_cap * head_dim * sizeof(float)) return false;
+
+    char path[1024];
+    snprintf(path, sizeof(path), "%s_%s-%u_pos%u.bin", prefix, name, il, pos);
+    const uint64_t n_f32 = (uint64_t)n_raw * head_dim;
+    float *buf = xmalloc((size_t)n_f32 * sizeof(buf[0]));
+    bool exists = false;
+    if (!metal_graph_debug_read_exact_if_exists(path, buf, (size_t)n_f32 * sizeof(buf[0]), &exists) || !exists) {
+        free(buf);
+        return false;
+    }
+
+    if (ds4_metal_synchronize() == 0) {
+        fprintf(stderr, "ds4: failed to synchronize before injecting %s layer %u pos %u\n", name, il, pos);
+        free(buf);
+        return false;
+    }
+
+    const uint64_t row_bytes = (uint64_t)head_dim * sizeof(float);
+    bool ok = true;
+    for (uint32_t r = 0; r < n_raw; r++) {
+        const uint32_t phys = (raw_start + r) % raw_cap;
+        if (ds4_metal_tensor_write(raw_cache,
+                                   (uint64_t)phys * row_bytes,
+                                   buf + (uint64_t)r * head_dim,
+                                   row_bytes) == 0) {
+            ok = false;
+            break;
+        }
+    }
+    if (ok) fprintf(stderr, "ds4: injected %s layer %u pos %u from %s\n", name, il, pos, path);
+    else fprintf(stderr, "ds4: failed to inject %s layer %u pos %u from %s\n", name, il, pos, path);
+    free(buf);
+
+    if (ds4_metal_begin_commands() == 0) {
+        fprintf(stderr, "ds4: failed to resume Metal command batch after injecting %s layer %u pos %u\n", name, il, pos);
+    }
+    return ok;
+}
+
+static void metal_graph_debug_dump_decode_attention_audit(
+        const ds4_model  *model,
+        uint64_t          sinks_offset,
+        ds4_metal_tensor *q,
+        ds4_metal_tensor *raw_cache,
+        uint32_t          raw_cap,
+        uint32_t          raw_start,
+        uint32_t          n_raw,
+        uint32_t          n_head,
+        uint32_t          head_dim,
+        uint32_t          il,
+        uint32_t          pos) {
+    const bool want_scores = metal_graph_debug_wants("attn_scores", il, pos) ||
+                             metal_graph_debug_trace_wants("attn_scores", il, pos);
+    const bool want_weights = metal_graph_debug_wants("attn_weights", il, pos) ||
+                              metal_graph_debug_trace_wants("attn_weights", il, pos);
+    const bool want_ref = metal_graph_debug_wants("attn_ref_out", il, pos) ||
+                          metal_graph_debug_trace_wants("attn_ref_out", il, pos);
+    if (!want_scores && !want_weights && !want_ref) return;
+    if (!model || !model->map || !q || !raw_cache || raw_cap == 0 || n_raw == 0 ||
+        n_head == 0 || head_dim == 0 || raw_start >= raw_cap || n_raw > raw_cap) return;
+    if (sinks_offset > model->size || (uint64_t)n_head * sizeof(float) > model->size - sinks_offset) return;
+    if (ds4_metal_tensor_bytes(q) < (uint64_t)n_head * head_dim * sizeof(float) ||
+        ds4_metal_tensor_bytes(raw_cache) < (uint64_t)raw_cap * head_dim * sizeof(float)) return;
+
+    if (ds4_metal_synchronize() == 0) {
+        fprintf(stderr, "ds4: failed to synchronize before attention audit layer %u pos %u\n", il, pos);
+        return;
+    }
+
+    const uint64_t q_n = (uint64_t)n_head * head_dim;
+    const uint64_t raw_n = (uint64_t)n_raw * head_dim;
+    float *qbuf = xmalloc((size_t)q_n * sizeof(qbuf[0]));
+    float *raw = xmalloc((size_t)raw_n * sizeof(raw[0]));
+    bool ok = ds4_metal_tensor_read(q, 0, qbuf, q_n * sizeof(qbuf[0])) != 0;
+    const uint64_t row_bytes = (uint64_t)head_dim * sizeof(float);
+    for (uint32_t r = 0; ok && r < n_raw; r++) {
+        const uint32_t phys = (raw_start + r) % raw_cap;
+        ok = ds4_metal_tensor_read(raw_cache,
+                                   (uint64_t)phys * row_bytes,
+                                   raw + (uint64_t)r * head_dim,
+                                   row_bytes) != 0;
+    }
+    if (!ok) {
+        free(raw);
+        free(qbuf);
+        (void)ds4_metal_begin_commands();
+        return;
+    }
+
+    const float *sinks = (const float *)((const unsigned char *)model->map + sinks_offset);
+    const bool need_scores = want_scores || (want_ref && !want_weights);
+    float *scores = need_scores ? xmalloc((size_t)((uint64_t)n_head * n_raw) * sizeof(float)) : NULL;
+    float *weights = want_weights ? xmalloc((size_t)((uint64_t)n_head * (n_raw + 1u)) * sizeof(float)) : NULL;
+    float *ref = want_ref ? xmalloc((size_t)q_n * sizeof(float)) : NULL;
+    const float scale = 1.0f / sqrtf((float)head_dim);
+
+    for (uint32_t h = 0; h < n_head; h++) {
+        const float *qh = qbuf + (uint64_t)h * head_dim;
+        float max_s = sinks[h];
+        for (uint32_t r = 0; r < n_raw; r++) {
+            const float *kv = raw + (uint64_t)r * head_dim;
+            float dot = 0.0f;
+            for (uint32_t d = 0; d < head_dim; d++) dot += qh[d] * kv[d];
+            const float s = dot * scale;
+            if (scores) scores[(uint64_t)h * n_raw + r] = s;
+            if (s > max_s) max_s = s;
+        }
+
+        float denom = expf(sinks[h] - max_s);
+        if (weights) weights[(uint64_t)h * (n_raw + 1u) + n_raw] = denom;
+        for (uint32_t r = 0; r < n_raw; r++) {
+            const float s = scores ? scores[(uint64_t)h * n_raw + r] : 0.0f;
+            float sr = s;
+            if (!scores) {
+                const float *kv = raw + (uint64_t)r * head_dim;
+                float dot = 0.0f;
+                for (uint32_t d = 0; d < head_dim; d++) dot += qh[d] * kv[d];
+                sr = dot * scale;
+            }
+            const float w = expf(sr - max_s);
+            if (weights) weights[(uint64_t)h * (n_raw + 1u) + r] = w;
+            denom += w;
+        }
+        const float inv = 1.0f / denom;
+        if (weights) {
+            for (uint32_t r = 0; r <= n_raw; r++) weights[(uint64_t)h * (n_raw + 1u) + r] *= inv;
+        }
+        if (ref) {
+            float *oh = ref + (uint64_t)h * head_dim;
+            memset(oh, 0, (size_t)head_dim * sizeof(oh[0]));
+            for (uint32_t r = 0; r < n_raw; r++) {
+                const float *kv = raw + (uint64_t)r * head_dim;
+                const float w = weights ? weights[(uint64_t)h * (n_raw + 1u) + r]
+                                        : expf((scores ? scores[(uint64_t)h * n_raw + r] : 0.0f) - max_s) * inv;
+                for (uint32_t d = 0; d < head_dim; d++) oh[d] += kv[d] * w;
+            }
+        }
+    }
+
+    if (scores && want_scores) metal_graph_debug_dump_f32_buffer("attn_scores", scores, (uint64_t)n_head * n_raw, il, pos);
+    if (weights) metal_graph_debug_dump_f32_buffer("attn_weights", weights, (uint64_t)n_head * (n_raw + 1u), il, pos);
+    if (ref) metal_graph_debug_dump_f32_buffer("attn_ref_out", ref, q_n, il, pos);
+
+    free(ref);
+    free(weights);
+    free(scores);
+    free(raw);
+    free(qbuf);
+
+    if (ds4_metal_begin_commands() == 0) {
+        fprintf(stderr, "ds4: failed to resume Metal command batch after attention audit layer %u pos %u\n", il, pos);
+    }
+}
+
+static void metal_graph_debug_dump_router_scores(
+        const char       *name,
+        ds4_metal_tensor *probs,
+        const ds4_model  *model,
+        uint64_t          bias_offset,
+        bool              has_bias,
+        uint32_t          n_tokens,
+        uint32_t          il,
+        uint32_t          pos) {
+    const bool want_dump = metal_graph_debug_wants(name, il, pos);
+    const bool want_trace = metal_graph_debug_trace_wants(name, il, pos);
+    if (!probs || !model || !model->map || n_tokens == 0 || (!want_dump && !want_trace)) return;
+    const uint64_t n = (uint64_t)n_tokens * DS4_N_EXPERT;
+    if (ds4_metal_tensor_bytes(probs) < n * sizeof(float)) return;
+    if (has_bias && (bias_offset > model->size ||
+                     (uint64_t)DS4_N_EXPERT * sizeof(float) > model->size - bias_offset)) return;
+
+    if (ds4_metal_synchronize() == 0) {
+        fprintf(stderr, "ds4: failed to synchronize before dumping %s layer %u pos %u\n", name, il, pos);
+        return;
+    }
+
+    float *buf = xmalloc((size_t)n * sizeof(buf[0]));
+    if (ds4_metal_tensor_read(probs, 0, buf, n * sizeof(buf[0])) != 0) {
+        if (has_bias) {
+            const float *bias = (const float *)((const unsigned char *)model->map + bias_offset);
+            for (uint32_t t = 0; t < n_tokens; t++) {
+                for (uint32_t e = 0; e < DS4_N_EXPERT; e++) {
+                    buf[(uint64_t)t * DS4_N_EXPERT + e] += bias[e];
+                }
+            }
+        }
+        metal_graph_debug_dump_f32_buffer(name, buf, n, il, pos);
+    }
+    free(buf);
+
+    if (ds4_metal_begin_commands() == 0) {
+        fprintf(stderr, "ds4: failed to resume Metal command batch after dumping %s layer %u pos %u\n", name, il, pos);
+    }
+}
+
+static void metal_graph_debug_matvec_direct_ref(
+        float            *out,
+        const ds4_model  *model,
+        const ds4_tensor *weight,
+        const float      *x) {
+    if (weight->type != DS4_TENSOR_Q8_0) {
+        matvec_any(out, model, weight, x);
+        return;
+    }
+
+    const uint64_t in_dim = weight->dim[0];
+    const uint64_t out_dim = weight->dim[1];
+    const uint64_t blocks = (in_dim + 31u) / 32u;
+    const uint64_t row_bytes = blocks * 34u;
+    const uint8_t *data = tensor_data(model, weight);
+    for (uint64_t r = 0; r < out_dim; r++) {
+        const uint8_t *row = data + r * row_bytes;
+        float acc = 0.0f;
+        for (uint64_t b = 0; b < blocks; b++) {
+            uint16_t scale_bits;
+            memcpy(&scale_bits, row + b * 34u, sizeof(scale_bits));
+            const float d = f16_to_f32(scale_bits);
+            const int8_t *qs = (const int8_t *)(row + b * 34u + 2u);
+            const uint64_t i0 = b * 32u;
+            const uint64_t n = in_dim - i0 < 32u ? in_dim - i0 : 32u;
+            for (uint64_t i = 0; i < n; i++) acc += d * (float)qs[i] * x[i0 + i];
+        }
+        out[r] = acc;
+    }
+}
+
+static void metal_graph_debug_dump_ffn_refs(
+        ds4_metal_tensor       *ffn_norm_tensor,
+        const ds4_model        *model,
+        const ds4_layer_weights *layer,
+        uint32_t                il,
+        uint32_t                pos,
+        int                     token) {
+    const bool want =
+        metal_graph_debug_wants("ffn_shexp_gate_ref", il, pos) ||
+        metal_graph_debug_wants("ffn_shexp_up_ref", il, pos) ||
+        metal_graph_debug_wants("ffn_shexp_mid_ref", il, pos) ||
+        metal_graph_debug_wants("ffn_shexp_ref", il, pos) ||
+        metal_graph_debug_wants("ffn_moe_out_ref", il, pos) ||
+        metal_graph_debug_wants("ffn_out_ref", il, pos) ||
+        metal_graph_debug_trace_wants("ffn_shexp_gate_ref", il, pos) ||
+        metal_graph_debug_trace_wants("ffn_shexp_up_ref", il, pos) ||
+        metal_graph_debug_trace_wants("ffn_shexp_mid_ref", il, pos) ||
+        metal_graph_debug_trace_wants("ffn_shexp_ref", il, pos) ||
+        metal_graph_debug_trace_wants("ffn_moe_out_ref", il, pos) ||
+        metal_graph_debug_trace_wants("ffn_out_ref", il, pos);
+    if (!want || !ffn_norm_tensor || !model || !model->map || !layer) return;
+
+    const uint64_t shared_in_dim = layer->ffn_gate_shexp->dim[0];
+    const uint64_t shared_dim = layer->ffn_gate_shexp->dim[1];
+    const uint64_t expert_in_dim = layer->ffn_gate_exps->dim[0];
+    const uint64_t down_in_dim = layer->ffn_down_exps->dim[0];
+    if (shared_in_dim != DS4_N_EMBD || ds4_metal_tensor_bytes(ffn_norm_tensor) < shared_in_dim * sizeof(float)) return;
+    if (expert_in_dim % QK_K != 0 || down_in_dim % QK_K != 0) return;
+
+    if (ds4_metal_synchronize() == 0) {
+        fprintf(stderr, "ds4: failed to synchronize before FFN CPU reference layer %u pos %u\n", il, pos);
+        return;
+    }
+
+    float *x = xmalloc((size_t)shared_in_dim * sizeof(x[0]));
+    if (ds4_metal_tensor_read(ffn_norm_tensor, 0, x, (size_t)shared_in_dim * sizeof(x[0])) == 0) {
+        fprintf(stderr, "ds4: failed to read ffn_norm for FFN CPU reference layer %u pos %u\n", il, pos);
+        free(x);
+        (void)ds4_metal_begin_commands();
+        return;
+    }
+
+    float *shared_gate = xmalloc((size_t)shared_dim * sizeof(shared_gate[0]));
+    float *shared_up = xmalloc((size_t)shared_dim * sizeof(shared_up[0]));
+    float *shared_mid = xmalloc((size_t)shared_dim * sizeof(shared_mid[0]));
+    float *shared = xmalloc((size_t)DS4_N_EMBD * sizeof(shared[0]));
+    float *routed = xmalloc((size_t)DS4_N_EMBD * sizeof(routed[0]));
+    float *ffn_out = xmalloc((size_t)DS4_N_EMBD * sizeof(ffn_out[0]));
+    const uint64_t shared_blocks = (shared_in_dim + 31u) / 32u;
+    int8_t *shared_xq = xmalloc((size_t)shared_blocks * 32u);
+    float *shared_xscale = xmalloc((size_t)shared_blocks * sizeof(shared_xscale[0]));
+    float *routed_mid_all = xmalloc((size_t)DS4_N_EXPERT_USED * down_in_dim * sizeof(routed_mid_all[0]));
+    block_q8_K *routed_xq = xmalloc((size_t)(expert_in_dim / QK_K) * sizeof(routed_xq[0]));
+    block_q8_K *routed_midq = xmalloc((size_t)DS4_N_EXPERT_USED * (down_in_dim / QK_K) * sizeof(routed_midq[0]));
+
+    quantize_q8_0_activation(x, shared_xq, shared_xscale, shared_in_dim);
+    matvec_q8_0_pair_prequant(shared_gate,
+                              shared_up,
+                              model,
+                              layer->ffn_gate_shexp,
+                              layer->ffn_up_shexp,
+                              shared_xq,
+                              shared_xscale);
+    swiglu(shared_mid, shared_gate, shared_up, shared_dim);
+    matvec_q8_0(shared, model, layer->ffn_down_shexp, shared_mid);
+    layer_routed_moe_one_prealloc(routed,
+                                  model,
+                                  layer,
+                                  x,
+                                  il,
+                                  token,
+                                  DS4_SWIGLU_CLAMP_EXP,
+                                  routed_mid_all,
+                                  routed_xq,
+                                  routed_midq);
+    for (uint32_t i = 0; i < DS4_N_EMBD; i++) ffn_out[i] = shared[i] + routed[i];
+
+    metal_graph_debug_dump_f32_buffer("ffn_shexp_gate_ref", shared_gate, shared_dim, il, pos);
+    metal_graph_debug_dump_f32_buffer("ffn_shexp_up_ref", shared_up, shared_dim, il, pos);
+    metal_graph_debug_dump_f32_buffer("ffn_shexp_mid_ref", shared_mid, shared_dim, il, pos);
+    metal_graph_debug_dump_f32_buffer("ffn_shexp_ref", shared, DS4_N_EMBD, il, pos);
+    metal_graph_debug_dump_f32_buffer("ffn_moe_out_ref", routed, DS4_N_EMBD, il, pos);
+    metal_graph_debug_dump_f32_buffer("ffn_out_ref", ffn_out, DS4_N_EMBD, il, pos);
+
+    free(routed_midq);
+    free(routed_xq);
+    free(routed_mid_all);
+    free(shared_xscale);
+    free(shared_xq);
+    free(ffn_out);
+    free(routed);
+    free(shared);
+    free(shared_mid);
+    free(shared_up);
+    free(shared_gate);
+    free(x);
+
+    if (ds4_metal_begin_commands() == 0) {
+        fprintf(stderr, "ds4: failed to resume Metal command batch after FFN CPU reference layer %u pos %u\n", il, pos);
+    }
+}
+
+static void metal_graph_debug_dump_dense_ref(
+        const char       *name,
+        ds4_metal_tensor *x_tensor,
+        const ds4_model  *model,
+        const ds4_tensor *weight,
+        uint64_t          in_dim,
+        uint64_t          out_dim,
+        uint32_t          il,
+        uint32_t          pos) {
+    if (!name || !name[0] || !x_tensor || !model || !model->map || !weight || in_dim == 0 || out_dim == 0) return;
+    if (!metal_graph_debug_wants(name, il, pos) && !metal_graph_debug_trace_wants(name, il, pos)) return;
+    if (ds4_metal_tensor_bytes(x_tensor) < in_dim * sizeof(float)) return;
+    if (weight->ndim != 2 || weight->dim[0] != in_dim || weight->dim[1] != out_dim) return;
+
+    if (ds4_metal_synchronize() == 0) {
+        fprintf(stderr, "ds4: failed to synchronize before dense CPU reference %s layer %u pos %u\n", name, il, pos);
+        return;
+    }
+
+    float *x = xmalloc((size_t)in_dim * sizeof(x[0]));
+    float *out = xmalloc((size_t)out_dim * sizeof(out[0]));
+    if (ds4_metal_tensor_read(x_tensor, 0, x, in_dim * sizeof(x[0])) != 0) {
+        metal_graph_debug_matvec_direct_ref(out, model, weight, x);
+        metal_graph_debug_dump_f32_buffer(name, out, out_dim, il, pos);
+    }
+    free(out);
+    free(x);
+
+    if (ds4_metal_begin_commands() == 0) {
+        fprintf(stderr, "ds4: failed to resume Metal command batch after dense CPU reference %s layer %u pos %u\n", name, il, pos);
+    }
+}
+
+static void metal_graph_debug_dump_router_ref(
+        ds4_metal_tensor        *x_tensor,
+        const ds4_model         *model,
+        const ds4_layer_weights *layer,
+        uint32_t                 il,
+        uint32_t                 pos,
+        int                      token) {
+    const bool want_logits = metal_graph_debug_wants("ffn_moe_logits_ref", il, pos) ||
+                             metal_graph_debug_trace_wants("ffn_moe_logits_ref", il, pos);
+    const bool want_probs = metal_graph_debug_wants("ffn_moe_probs_ref", il, pos) ||
+                            metal_graph_debug_trace_wants("ffn_moe_probs_ref", il, pos);
+    const bool want_scores = metal_graph_debug_wants("ffn_moe_scores_ref", il, pos) ||
+                             metal_graph_debug_trace_wants("ffn_moe_scores_ref", il, pos);
+    const bool want_topk = metal_graph_debug_wants("ffn_moe_topk_ref", il, pos) ||
+                           metal_graph_debug_trace_wants("ffn_moe_topk_ref", il, pos);
+    const bool want_weights = metal_graph_debug_wants("ffn_moe_weights_scaled_ref", il, pos) ||
+                              metal_graph_debug_trace_wants("ffn_moe_weights_scaled_ref", il, pos);
+    if (!want_logits && !want_probs && !want_scores && !want_topk && !want_weights) return;
+    if (!x_tensor || !model || !model->map || !layer || !layer->ffn_gate_inp) return;
+    if (ds4_metal_tensor_bytes(x_tensor) < (uint64_t)DS4_N_EMBD * sizeof(float)) return;
+
+    if (ds4_metal_synchronize() == 0) {
+        fprintf(stderr, "ds4: failed to synchronize before router CPU reference layer %u pos %u\n", il, pos);
+        return;
+    }
+
+    float *x = xmalloc((size_t)DS4_N_EMBD * sizeof(x[0]));
+    if (ds4_metal_tensor_read(x_tensor, 0, x, (uint64_t)DS4_N_EMBD * sizeof(x[0])) == 0) {
+        free(x);
+        (void)ds4_metal_begin_commands();
+        return;
+    }
+
+    float logits[DS4_N_EXPERT];
+    float probs[DS4_N_EXPERT];
+    float scores[DS4_N_EXPERT];
+    int selected[DS4_N_EXPERT_USED];
+    float weights[DS4_N_EXPERT_USED];
+
+    matvec_any(logits, model, layer->ffn_gate_inp, x);
+    for (int e = 0; e < DS4_N_EXPERT; e++) {
+        probs[e] = sqrtf(softplus_stable(logits[e]));
+        scores[e] = probs[e];
+    }
+    if (layer->ffn_exp_probs_b) {
+        const float *bias = tensor_data(model, layer->ffn_exp_probs_b);
+        for (int e = 0; e < DS4_N_EXPERT; e++) scores[e] += bias[e];
+    }
+    if (layer->ffn_gate_tid2eid) {
+        layer_hash_selected_experts(selected, model, layer, token);
+        layer_hash_router_weights_from_probs(weights, probs, selected);
+    } else {
+        layer_topk_selected_experts_from_probs(selected, weights, model, layer, probs);
+    }
+
+    metal_graph_debug_dump_f32_buffer("ffn_moe_logits_ref", logits, DS4_N_EXPERT, il, pos);
+    metal_graph_debug_dump_f32_buffer("ffn_moe_probs_ref", probs, DS4_N_EXPERT, il, pos);
+    metal_graph_debug_dump_f32_buffer("ffn_moe_scores_ref", scores, DS4_N_EXPERT, il, pos);
+    if (want_topk) metal_graph_debug_trace_i32("ffn_moe_topk_ref", selected, DS4_N_EXPERT_USED, il, pos);
+    if (want_topk && metal_graph_debug_wants("ffn_moe_topk_ref", il, pos)) {
+        const char *prefix = getenv("DS4_METAL_GRAPH_DUMP_PREFIX");
+        char path[1024];
+        snprintf(path, sizeof(path), "%s_ffn_moe_topk_ref-%u_pos%u.i32", prefix, il, pos);
+        FILE *fp = fopen(path, "wb");
+        if (fp) {
+            if (fwrite(selected, sizeof(selected[0]), DS4_N_EXPERT_USED, fp) == DS4_N_EXPERT_USED) {
+                fprintf(stderr, "ds4: dumped ffn_moe_topk_ref layer %u pos %u to %s\n", il, pos, path);
+            }
+            fclose(fp);
+        }
+    }
+    metal_graph_debug_dump_f32_buffer("ffn_moe_weights_scaled_ref", weights, DS4_N_EXPERT_USED, il, pos);
+
+    free(x);
+
+    if (ds4_metal_begin_commands() == 0) {
+        fprintf(stderr, "ds4: failed to resume Metal command batch after router CPU reference layer %u pos %u\n", il, pos);
+    }
+}
+
+static bool metal_graph_debug_read_exact_if_exists(const char *path, void *buf, size_t bytes, bool *exists) {
+    *exists = false;
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return errno == ENOENT;
+    *exists = true;
+    const size_t nr = fread(buf, 1, bytes, fp);
+    const bool ok = nr == bytes && fclose(fp) == 0;
+    if (!ok) fprintf(stderr, "ds4: failed to read exact debug payload %s\n", path);
+    return ok;
+}
+
+static bool metal_graph_debug_inject_wants(const char *name, uint32_t il, uint32_t pos) {
+    const char *prefix = getenv("DS4_METAL_GRAPH_INJECT_PREFIX");
+    if (!prefix || !prefix[0]) return false;
+
+    return metal_graph_debug_filter_wants(name, il, pos,
+                                          getenv("DS4_METAL_GRAPH_INJECT_NAME"),
+                                          getenv("DS4_METAL_GRAPH_INJECT_LAYER"),
+                                          getenv("DS4_METAL_GRAPH_INJECT_POS"));
+}
+
+static bool metal_graph_debug_inject_tensor(
+        const char       *name,
+        ds4_metal_tensor *t,
+        uint64_t          n_f32,
+        uint32_t          il,
+        uint32_t          pos) {
+    const char *prefix = getenv("DS4_METAL_GRAPH_INJECT_PREFIX");
+    if (!prefix || !prefix[0] || !name || !t || n_f32 == 0) return false;
+    if (!metal_graph_debug_inject_wants(name, il, pos)) return false;
+    if (ds4_metal_tensor_bytes(t) < n_f32 * sizeof(float)) return false;
+
+    char path[1024];
+    snprintf(path, sizeof(path), "%s_%s-%u_pos%u.bin", prefix, name, il, pos);
+    float *buf = xmalloc((size_t)n_f32 * sizeof(buf[0]));
+    bool exists = false;
+    if (!metal_graph_debug_read_exact_if_exists(path, buf, (size_t)n_f32 * sizeof(buf[0]), &exists) || !exists) {
+        free(buf);
+        return false;
+    }
+
+    if (ds4_metal_synchronize() == 0) {
+        fprintf(stderr, "ds4: failed to synchronize before injecting %s layer %u pos %u\n", name, il, pos);
+        free(buf);
+        return false;
+    }
+    if (ds4_metal_tensor_write(t, 0, buf, (size_t)n_f32 * sizeof(buf[0])) == 0) {
+        fprintf(stderr, "ds4: failed to inject %s layer %u pos %u from %s\n", name, il, pos, path);
+        free(buf);
+        (void)ds4_metal_begin_commands();
+        return false;
+    }
+    fprintf(stderr, "ds4: injected %s layer %u pos %u from %s\n", name, il, pos, path);
+    free(buf);
+
+    if (ds4_metal_begin_commands() == 0) {
+        fprintf(stderr, "ds4: failed to resume Metal command batch after injecting %s layer %u pos %u\n", name, il, pos);
+    }
+    return true;
+}
+
+static void metal_graph_debug_force_router_topk(
+        ds4_metal_tensor *selected,
+        ds4_metal_tensor *weights,
+        ds4_metal_tensor *probs,
+        uint32_t          il,
+        uint32_t          pos) {
+    const char *prefix = getenv("DS4_METAL_GRAPH_FORCE_ROUTER_TOPK_PREFIX");
+    if (!prefix || !prefix[0] || !selected || !weights || !probs) return;
+    if (ds4_metal_tensor_bytes(selected) < DS4_N_EXPERT_USED * sizeof(int32_t) ||
+        ds4_metal_tensor_bytes(weights) < DS4_N_EXPERT_USED * sizeof(float) ||
+        ds4_metal_tensor_bytes(probs) < DS4_N_EXPERT * sizeof(float)) return;
+
+    char path[1024];
+    int32_t forced_selected[DS4_N_EXPERT_USED];
+    bool exists = false;
+    snprintf(path, sizeof(path), "%s_ffn_moe_topk-%u_pos%u.i32", prefix, il, pos);
+    if (!metal_graph_debug_read_exact_if_exists(path,
+                                                forced_selected,
+                                                sizeof(forced_selected),
+                                                &exists) ||
+        !exists) {
+        return;
+    }
+
+    float forced_weights[DS4_N_EXPERT_USED];
+    bool have_weights = false;
+    snprintf(path, sizeof(path), "%s_ffn_moe_weights_scaled-%u_pos%u.bin", prefix, il, pos);
+    if (!metal_graph_debug_read_exact_if_exists(path,
+                                                forced_weights,
+                                                sizeof(forced_weights),
+                                                &have_weights)) {
+        return;
+    }
+
+    if (ds4_metal_synchronize() == 0) {
+        fprintf(stderr, "ds4: failed to synchronize before forcing router topk layer %u pos %u\n", il, pos);
+        return;
+    }
+
+    if (!have_weights) {
+        float all_probs[DS4_N_EXPERT];
+        if (ds4_metal_tensor_read(probs, 0, all_probs, sizeof(all_probs)) == 0) {
+            fprintf(stderr, "ds4: failed to read router probs before forcing layer %u pos %u\n", il, pos);
+            (void)ds4_metal_begin_commands();
+            return;
+        }
+        float sum = 0.0f;
+        for (uint32_t k = 0; k < DS4_N_EXPERT_USED; k++) {
+            int e = forced_selected[k];
+            if (e < 0 || e >= (int)DS4_N_EXPERT) e = 0;
+            forced_selected[k] = e;
+            forced_weights[k] = all_probs[e];
+            sum += forced_weights[k];
+        }
+        if (sum < 6.103515625e-5f) sum = 6.103515625e-5f;
+        for (uint32_t k = 0; k < DS4_N_EXPERT_USED; k++) forced_weights[k] = forced_weights[k] / sum * DS4_EXPERT_WEIGHT_SCALE;
+    }
+
+    if (ds4_metal_tensor_write(selected, 0, forced_selected, sizeof(forced_selected)) == 0 ||
+        ds4_metal_tensor_write(weights, 0, forced_weights, sizeof(forced_weights)) == 0) {
+        fprintf(stderr, "ds4: failed to write forced router topk layer %u pos %u\n", il, pos);
+        (void)ds4_metal_begin_commands();
+        return;
+    }
+    fprintf(stderr, "ds4: forced router topk layer %u pos %u from %s\n", il, pos, prefix);
+
+    if (ds4_metal_begin_commands() == 0) {
+        fprintf(stderr, "ds4: failed to resume Metal command batch after forcing router topk layer %u pos %u\n", il, pos);
+    }
+}
+
 static bool metal_graph_needs_ffn_out(const ds4_metal_graph *g, uint32_t il, uint32_t pos) {
-    return g->materialize_ffn_out || metal_graph_debug_wants("ffn_out", il, pos);
+    return g->materialize_ffn_out ||
+           metal_graph_debug_wants("ffn_out", il, pos) ||
+           metal_graph_debug_trace_wants("ffn_out", il, pos);
 }
 
 static bool metal_graph_ensure_ffn_out(ds4_metal_graph *g) {
@@ -8841,6 +9679,10 @@ static bool metal_graph_encode_decode_layer(
             ok = metal_graph_layer_stage_profile_boundary("decode", (name), il, pos, 1, &decode_stage_t0); \
         } \
     } while (0)
+    if (ok) {
+        metal_graph_debug_dump_tensor("hc_layer_in", g->cur_hc, hc_dim, il, pos);
+        metal_graph_debug_inject_tensor("hc_layer_in", g->cur_hc, hc_dim, il, pos);
+    }
     if (ok) ok = ds4_metal_rms_norm_plain_tensor(g->flat_hc, g->cur_hc, (uint32_t)hc_dim, DS4_RMS_EPS) != 0;
     if (ok) ok = metal_graph_matmul_plain_tensor(g->hc_mix, model, layer->hc_attn_fn,
                                                  hc_dim, mix_hc, g->flat_hc, 1);
@@ -8889,6 +9731,7 @@ static bool metal_graph_encode_decode_layer(
     DS4_METAL_PROFILE_DECODE_STAGE("attn_norm");
     if (ok) {
         metal_graph_debug_dump_tensor("attn_norm", g->attn_norm, DS4_N_EMBD, il, pos);
+        metal_graph_debug_inject_tensor("attn_norm", g->attn_norm, DS4_N_EMBD, il, pos);
     }
     if (ok) ok = ds4_metal_matmul_q8_0_tensor(g->qr, model->map, model->size,
                                               layer->attn_q_a->abs_offset,
@@ -8896,6 +9739,8 @@ static bool metal_graph_encode_decode_layer(
                                               g->attn_norm, 1) != 0;
     if (ok) {
         metal_graph_debug_dump_tensor("q_lora", g->qr, q_rank, il, pos);
+        metal_graph_debug_dump_dense_ref("q_lora_ref", g->attn_norm, model, layer->attn_q_a,
+                                         DS4_N_EMBD, q_rank, il, pos);
     }
     if (qkv_rms_fused) {
         if (ok) ok = ds4_metal_matmul_q8_0_tensor(g->kv_raw, model->map, model->size,
@@ -8904,6 +9749,8 @@ static bool metal_graph_encode_decode_layer(
                                                   g->attn_norm, 1) != 0;
         if (ok) {
             metal_graph_debug_dump_tensor("KVraw", g->kv_raw, DS4_N_HEAD_DIM, il, pos);
+            metal_graph_debug_dump_dense_ref("KVraw_ref", g->attn_norm, model, layer->attn_kv,
+                                             DS4_N_EMBD, DS4_N_HEAD_DIM, il, pos);
         }
         if (ok) ok = ds4_metal_dsv4_qkv_rms_norm_rows_tensor(g->qr_norm,
                                                              g->qr,
@@ -8935,6 +9782,8 @@ static bool metal_graph_encode_decode_layer(
                                               g->qr_norm, 1) != 0;
     if (ok) {
         metal_graph_debug_dump_tensor("Qraw", g->q, q_dim, il, pos);
+        metal_graph_debug_dump_dense_ref("Qraw_ref", g->qr_norm, model, layer->attn_q_b,
+                                         q_rank, q_dim, il, pos);
     }
     if (ok) ok = ds4_metal_head_rms_norm_tensor(g->q, 1, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_RMS_EPS) != 0;
     if (ok) {
@@ -8948,6 +9797,7 @@ static bool metal_graph_encode_decode_layer(
     DS4_METAL_PROFILE_DECODE_STAGE("q_path");
     if (ok) {
         metal_graph_debug_dump_tensor("Qcur", g->q, q_dim, il, pos);
+        metal_graph_debug_inject_tensor("Qcur", g->q, q_dim, il, pos);
     }
     if (!qkv_rms_fused) {
         if (ok) ok = ds4_metal_matmul_q8_0_tensor(g->kv_raw, model->map, model->size,
@@ -8956,6 +9806,8 @@ static bool metal_graph_encode_decode_layer(
                                                   g->attn_norm, 1) != 0;
         if (ok) {
             metal_graph_debug_dump_tensor("KVraw", g->kv_raw, DS4_N_HEAD_DIM, il, pos);
+            metal_graph_debug_dump_dense_ref("KVraw_ref", g->attn_norm, model, layer->attn_kv,
+                                             DS4_N_EMBD, DS4_N_HEAD_DIM, il, pos);
         }
         if (ok) ok = ds4_metal_rms_norm_weight_tensor(g->kv, g->kv_raw,
                                                       model->map, model->size,
@@ -8980,6 +9832,8 @@ static bool metal_graph_encode_decode_layer(
     DS4_METAL_PROFILE_DECODE_STAGE("kv_path");
     if (ok) {
         metal_graph_debug_dump_tensor("KVcur", g->kv, DS4_N_HEAD_DIM, il, pos);
+        const bool injected_kv = metal_graph_debug_inject_tensor("KVcur", g->kv, DS4_N_HEAD_DIM, il, pos);
+        if (injected_kv) ok = ds4_metal_store_raw_kv_tensor(raw_cache, g->kv, raw_cap, raw_row, DS4_N_HEAD_DIM) != 0;
     }
 
     uint32_t n_comp = 0;
@@ -9233,6 +10087,23 @@ static bool metal_graph_encode_decode_layer(
 
     if (ok) {
         const uint32_t raw_start = metal_graph_raw_start_for_span(g, pos, n_raw);
+        metal_graph_debug_dump_raw_cache("raw_cache", raw_cache, raw_cap, raw_start,
+                                         n_raw, DS4_N_HEAD_DIM, il, pos);
+        metal_graph_debug_inject_raw_cache("raw_cache", raw_cache, raw_cap, raw_start,
+                                           n_raw, DS4_N_HEAD_DIM, il, pos);
+        if (n_comp == 0) {
+            metal_graph_debug_dump_decode_attention_audit(model,
+                                                          layer->attn_sinks->abs_offset,
+                                                          g->q,
+                                                          raw_cache,
+                                                          raw_cap,
+                                                          raw_start,
+                                                          n_raw,
+                                                          DS4_N_HEAD,
+                                                          DS4_N_HEAD_DIM,
+                                                          il,
+                                                          pos);
+        }
         if (n_comp != 0 && comp_selected != NULL && n_selected != 0) {
             ok = ds4_metal_attention_indexed_mixed_batch_heads_tensor(
                     g->heads,
@@ -9293,6 +10164,7 @@ static bool metal_graph_encode_decode_layer(
                                             DS4_ROPE_YARN_BETA_SLOW) != 0;
     if (ok) {
         metal_graph_debug_dump_tensor("kqv_back", g->heads, q_dim, il, pos);
+        metal_graph_debug_inject_tensor("kqv_back", g->heads, q_dim, il, pos);
     }
     const bool fuse_attn_out_hc = !metal_graph_use_reference_attn_out_hc();
     if (ok && fuse_attn_out_hc) {
@@ -9345,6 +10217,7 @@ static bool metal_graph_encode_decode_layer(
     DS4_METAL_PROFILE_DECODE_STAGE("attn_hc_post");
     if (ok) {
         metal_graph_debug_dump_tensor("hc_attn_post", g->after_attn_hc, hc_dim, il, pos);
+        metal_graph_debug_inject_tensor("hc_attn_post", g->after_attn_hc, hc_dim, il, pos);
     }
     if (ok) ok = ds4_metal_rms_norm_plain_tensor(g->flat_hc, g->after_attn_hc, (uint32_t)hc_dim, DS4_RMS_EPS) != 0;
     if (ok) ok = metal_graph_matmul_plain_tensor(g->hc_mix, model, layer->hc_ffn_fn,
@@ -9391,6 +10264,7 @@ static bool metal_graph_encode_decode_layer(
     DS4_METAL_PROFILE_DECODE_STAGE("ffn_norm");
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_norm", g->ffn_norm, DS4_N_EMBD, il, pos);
+        metal_graph_debug_inject_tensor("ffn_norm", g->ffn_norm, DS4_N_EMBD, il, pos);
     }
     const uint64_t gate_row_bytes = routed_expert_row_bytes(layer->ffn_gate_exps);
     const uint64_t gate_expert_bytes = expert_mid_dim * gate_row_bytes;
@@ -9398,6 +10272,7 @@ static bool metal_graph_encode_decode_layer(
     const uint64_t down_expert_bytes = routed_out_dim * down_row_bytes;
     if (ok) ok = metal_graph_matmul_plain_tensor(g->router_logits, model, layer->ffn_gate_inp,
                                                  DS4_N_EMBD, DS4_N_EXPERT, g->ffn_norm, 1);
+    if (ok) metal_graph_debug_inject_tensor("ffn_moe_logits", g->router_logits, DS4_N_EXPERT, il, pos);
     if (ok) ok = ds4_metal_router_select_tensor(g->router_selected, g->router_weights, g->router_probs,
                                                 model->map, model->size,
                                                 layer->ffn_exp_probs_b ? layer->ffn_exp_probs_b->abs_offset : 0,
@@ -9411,11 +10286,21 @@ static bool metal_graph_encode_decode_layer(
                                                 g->router_logits) != 0;
     DS4_METAL_PROFILE_DECODE_STAGE("router");
     if (ok) {
+        metal_graph_debug_dump_router_scores("ffn_moe_scores",
+                                             g->router_probs,
+                                             model,
+                                             layer->ffn_exp_probs_b ? layer->ffn_exp_probs_b->abs_offset : 0,
+                                             layer->ffn_exp_probs_b != NULL,
+                                             1,
+                                             il,
+                                             pos);
         metal_graph_debug_dump_tensor("ffn_moe_logits", g->router_logits, DS4_N_EXPERT, il, pos);
         metal_graph_debug_dump_tensor("ffn_moe_probs", g->router_probs, DS4_N_EXPERT, il, pos);
         metal_graph_debug_dump_i32_tensor("ffn_moe_topk", g->router_selected, DS4_N_EXPERT_USED, il, pos);
         metal_graph_debug_dump_tensor("ffn_moe_weights_scaled", g->router_weights, DS4_N_EXPERT_USED, il, pos);
+        metal_graph_debug_dump_router_ref(g->ffn_norm, model, layer, il, pos, token);
     }
+    if (ok) metal_graph_debug_force_router_topk(g->router_selected, g->router_weights, g->router_probs, il, pos);
     if (ok) ok = ds4_metal_routed_moe_one_tensor(g->routed_out,
                                                  g->routed_gate,
                                                  g->routed_up,
@@ -9451,6 +10336,7 @@ static bool metal_graph_encode_decode_layer(
     }
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_moe_out", g->routed_out, DS4_N_EMBD, il, pos);
+        metal_graph_debug_inject_tensor("ffn_moe_out", g->routed_out, DS4_N_EMBD, il, pos);
     }
     const bool fuse_shared_gate_up =
         !g->quality &&
@@ -9478,6 +10364,11 @@ static bool metal_graph_encode_decode_layer(
         if (ok) ok = ds4_metal_swiglu_tensor(g->shared_mid, g->shared_gate, g->shared_up, shared_dim, 0.0f, 1.0f) != 0;
     }
     DS4_METAL_PROFILE_DECODE_STAGE("shared_gate_up");
+    if (ok) {
+        metal_graph_debug_dump_tensor("ffn_shexp_gate", g->shared_gate, shared_dim, il, pos);
+        metal_graph_debug_dump_tensor("ffn_shexp_up", g->shared_up, shared_dim, il, pos);
+        metal_graph_debug_dump_tensor("ffn_shexp_mid", g->shared_mid, shared_dim, il, pos);
+    }
     const bool keep_ffn_out = metal_graph_needs_ffn_out(g, il, pos);
     const bool fuse_shared_down_hc =
         !keep_ffn_out && !metal_graph_use_reference_shared_down_hc();
@@ -9504,6 +10395,7 @@ static bool metal_graph_encode_decode_layer(
     DS4_METAL_PROFILE_DECODE_STAGE("shared_down");
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_shexp", g->shared_out, DS4_N_EMBD, il, pos);
+        metal_graph_debug_inject_tensor("ffn_shexp", g->shared_out, DS4_N_EMBD, il, pos);
     }
     if (ok && keep_ffn_out) {
         ok = metal_graph_ensure_ffn_out(g) &&
@@ -9511,6 +10403,9 @@ static bool metal_graph_encode_decode_layer(
     }
     if (ok && keep_ffn_out) {
         metal_graph_debug_dump_tensor("ffn_out", g->ffn_out, DS4_N_EMBD, il, pos);
+    }
+    if (ok) {
+        metal_graph_debug_dump_ffn_refs(g->ffn_norm, model, layer, il, pos, token);
     }
     if (ok && !fuse_shared_down_hc) {
         ok = ds4_metal_hc_expand_add_split_tensor(g->after_ffn_hc,
@@ -9525,6 +10420,7 @@ static bool metal_graph_encode_decode_layer(
 #undef DS4_METAL_PROFILE_DECODE_STAGE
     if (ok) {
         metal_graph_debug_dump_tensor("hc_ffn_post", g->after_ffn_hc, hc_dim, il, pos);
+        metal_graph_debug_inject_tensor("hc_ffn_post", g->after_ffn_hc, hc_dim, il, pos);
     }
     return ok;
 }
@@ -10801,6 +11697,10 @@ static bool metal_graph_encode_layer_attention_batch(
     ds4_metal_tensor *after_attn_hc_view = ds4_metal_tensor_view(
             g->batch_after_attn_hc, 0, (uint64_t)n_tokens * hc_dim * sizeof(float));
     bool ok = hc_mix_view && hc_split_view && attn_cur_view && after_attn_hc_view;
+    if (ok) {
+        metal_graph_debug_dump_tensor("hc_layer_in", g->batch_cur_hc,
+                                      (uint64_t)n_tokens * hc_dim, il, pos0);
+    }
     if (ok) ok = ds4_metal_rms_norm_plain_rows_tensor(g->batch_flat_hc,
                                                       g->batch_cur_hc,
                                                       (uint32_t)hc_dim,
@@ -10958,6 +11858,8 @@ static bool metal_graph_encode_layer_attention_batch(
     if (ok) {
         metal_graph_debug_dump_tensor("Qcur", g->batch_q,
                                       (uint64_t)n_tokens * q_dim, il, pos0);
+        metal_graph_debug_inject_tensor("Qcur", g->batch_q,
+                                        (uint64_t)n_tokens * q_dim, il, pos0);
     }
     DS4_METAL_PROFILE_Q_STAGE("rope");
     DS4_METAL_PROFILE_ATTN_STAGE("q_path");
@@ -11012,6 +11914,8 @@ static bool metal_graph_encode_layer_attention_batch(
     if (ok) {
         metal_graph_debug_dump_tensor("KVcur", g->batch_kv,
                                       (uint64_t)n_tokens * DS4_N_HEAD_DIM, il, pos0);
+        metal_graph_debug_inject_tensor("KVcur", g->batch_kv,
+                                        (uint64_t)n_tokens * DS4_N_HEAD_DIM, il, pos0);
     }
     DS4_METAL_PROFILE_ATTN_STAGE("kv_path");
     /*
@@ -12229,12 +13133,22 @@ static bool metal_graph_encode_layer_ffn_batch(
                                               g->batch_ffn_norm,
                                               n_tokens) != 0;
     DS4_METAL_PROFILE_FFN_STAGE("shared_gate_up");
+    if (ok) {
+        metal_graph_debug_dump_tensor("ffn_shexp_gate", g->batch_shared_gate,
+                                      (uint64_t)n_tokens * shared_dim, il, pos0);
+        metal_graph_debug_dump_tensor("ffn_shexp_up", g->batch_shared_up,
+                                      (uint64_t)n_tokens * shared_dim, il, pos0);
+    }
     if (ok) ok = ds4_metal_swiglu_tensor(g->batch_shared_mid,
                                          g->batch_shared_gate,
                                          g->batch_shared_up,
                                          (uint32_t)((uint64_t)n_tokens * shared_dim),
                                          0.0f,
                                          1.0f) != 0;
+    if (ok) {
+        metal_graph_debug_dump_tensor("ffn_shexp_mid", g->batch_shared_mid,
+                                      (uint64_t)n_tokens * shared_dim, il, pos0);
+    }
     if (ok) ok = ds4_metal_matmul_q8_0_tensor(g->batch_shared_out,
                                               model->map,
                                               model->size,
@@ -15925,6 +16839,66 @@ int ds4_engine_first_token_test(ds4_engine *e, const ds4_tokens *prompt) {
     return 0;
 }
 
+#ifdef DS4_USE_GPU_API
+static bool ds4_str_contains_cstr(ds4_str s, const char *needle) {
+    if (!needle || !needle[0]) return true;
+    const size_t n = strlen(needle);
+    if (s.len < n) return false;
+    for (uint64_t i = 0; i + n <= s.len; i++) {
+        if (memcmp(s.ptr + i, needle, n) == 0) return true;
+    }
+    return false;
+}
+
+static bool accelerator_cuda_preload_q8_f16_tensors(const ds4_model *m) {
+    if (!m || !m->map || m->size == 0) return false;
+    const bool preload_all = getenv("DS4_CUDA_Q8_F16_PRELOAD") != NULL ||
+                             getenv("DS4_CUDA_Q8_F32_PRELOAD") != NULL;
+    const bool preload_attn_out = getenv("DS4_CUDA_ATTENTION_OUTPUT_PRELOAD") != NULL ||
+                                  getenv("DS4_CUDA_ATTENTION_OUTPUT_CUBLAS") != NULL ||
+                                  getenv("DS4_CUDA_ATTENTION_OUTPUT_CUBLAS_ALL") != NULL;
+    const bool preload_q_b = getenv("DS4_CUDA_ATTN_Q_B_PRELOAD") != NULL;
+    const bool preload_shared = getenv("DS4_CUDA_SHARED_EXPERT_CUBLAS") != NULL ||
+                                getenv("DS4_CUDA_SHARED_EXPERT_PRELOAD") != NULL;
+    if (!preload_all && !preload_attn_out && !preload_q_b && !preload_shared) return true;
+
+    const double t0 = now_sec();
+    uint64_t requested = 0;
+    uint64_t expanded_bytes = 0;
+    for (uint64_t i = 0; i < m->n_tensors; i++) {
+        const ds4_tensor *t = &m->tensors[i];
+        if (t->type != DS4_TENSOR_Q8_0 || t->ndim != 2 || t->bytes == 0) continue;
+        const bool is_attn_out = ds4_str_contains_cstr(t->name, "attn_output_a.weight") ||
+                                 ds4_str_contains_cstr(t->name, "attn_output_b.weight");
+        const bool is_q_b = ds4_str_contains_cstr(t->name, "attn_q_b.weight");
+        const bool is_shared = ds4_str_contains_cstr(t->name, "ffn_gate_shexp.weight") ||
+                               ds4_str_contains_cstr(t->name, "ffn_up_shexp.weight") ||
+                               ds4_str_contains_cstr(t->name, "ffn_down_shexp.weight");
+        if (!preload_all && !(preload_attn_out && is_attn_out) && !(preload_q_b && is_q_b) && !(preload_shared && is_shared)) continue;
+        if (t->abs_offset > m->size || t->bytes > m->size - t->abs_offset) return false;
+        char label[160];
+        snprintf(label, sizeof(label), "tensor:%.*s", (int)t->name.len, t->name.ptr);
+        if (ds4_gpu_cache_q8_f16_range(m->map, m->size, t->abs_offset, t->bytes, t->dim[0], t->dim[1], label) == 0) {
+            fprintf(stderr, "ds4: CUDA failed to preload dequantized Q8 tensor %.*s\n",
+                    (int)t->name.len, t->name.ptr);
+            return false;
+        }
+        requested++;
+        if (t->dim[0] != 0 && t->dim[1] <= UINT64_MAX / t->dim[0] / sizeof(uint16_t)) {
+            expanded_bytes += t->dim[0] * t->dim[1] * sizeof(uint16_t);
+        }
+    }
+    if (requested != 0 || getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE") != NULL) {
+        fprintf(stderr,
+                "ds4: CUDA requested Q8 fp16 preload tensors=%" PRIu64 " expanded=%.2f GiB in %.3fs\n",
+                requested,
+                (double)expanded_bytes / 1073741824.0,
+                now_sec() - t0);
+    }
+    return true;
+}
+#endif
+
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     ds4_engine *e = xcalloc(1, sizeof(*e));
     e->model.fd = -1;
@@ -15977,6 +16951,15 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             *out = NULL;
             return 1;
         }
+#ifdef DS4_USE_GPU_API
+        if (!accelerator_cuda_preload_q8_f16_tensors(&e->model)) {
+            fprintf(stderr, "ds4: %s failed to preload optional Q8 caches; aborting startup\n",
+                    ds4_backend_name(e->backend));
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+#endif
         if (e->mtp_ready &&
             !ds4_metal_set_model_map_range_fd(e->mtp_model.map,
                                               e->mtp_model.size,

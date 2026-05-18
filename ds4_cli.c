@@ -33,6 +33,7 @@ typedef struct {
     uint64_t seed;
     bool dump_tokens;
     const char *dump_logprobs_path;
+    const char *force_tokens_path;
     int dump_logprobs_top_k;
     ds4_think_mode think_mode;
     bool head_test;
@@ -147,6 +148,8 @@ static void usage(FILE *fp) {
         "      Write greedy continuation top-logprobs as JSON without printing text.\n"
         "  --logprobs-top-k N\n"
         "      Number of local alternatives stored by --dump-logprobs. Default: 20\n"
+        "  --force-tokens FILE\n"
+        "      With --dump-logprobs, feed token ids from FILE/JSON instead of local argmax.\n"
         "  --head-test\n"
         "      Run the output HC/logits head after the native slice.\n"
         "  --first-token-test\n"
@@ -607,6 +610,68 @@ static void json_write_token(FILE *fp, ds4_engine *engine, int token) {
     free(text);
 }
 
+static char *read_text_file_nullable(const char *path) {
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return NULL;
+    if (fseek(fp, 0, SEEK_END) != 0) {
+        fclose(fp);
+        return NULL;
+    }
+    long len = ftell(fp);
+    if (len < 0) {
+        fclose(fp);
+        return NULL;
+    }
+    rewind(fp);
+    char *buf = malloc((size_t)len + 1);
+    if (!buf) {
+        fclose(fp);
+        return NULL;
+    }
+    size_t nread = fread(buf, 1, (size_t)len, fp);
+    int close_rc = fclose(fp);
+    if (nread != (size_t)len || close_rc != 0) {
+        free(buf);
+        return NULL;
+    }
+    buf[len] = '\0';
+    return buf;
+}
+
+static bool load_forced_tokens_file(const char *path, ds4_tokens *out) {
+    char *buf = read_text_file_nullable(path);
+    if (!buf) return false;
+
+    if (strstr(buf, "\"selected\"") != NULL) {
+        char *p = buf;
+        while ((p = strstr(p, "\"selected\"")) != NULL) {
+            char *id = strstr(p, "\"id\"");
+            if (!id) break;
+            p = id + 4;
+            while (*p && !isdigit((unsigned char)*p) && *p != '-') p++;
+            char *end = NULL;
+            long v = strtol(p, &end, 10);
+            if (end == p || v < INT_MIN || v > INT_MAX) break;
+            ds4_tokens_push(out, (int)v);
+            p = end;
+        }
+    } else {
+        char *p = buf;
+        while (*p) {
+            while (*p && !isdigit((unsigned char)*p) && *p != '-') p++;
+            if (!*p) break;
+            char *end = NULL;
+            long v = strtol(p, &end, 10);
+            if (end == p) break;
+            if (v >= INT_MIN && v <= INT_MAX) ds4_tokens_push(out, (int)v);
+            p = end;
+        }
+    }
+
+    free(buf);
+    return out->len > 0;
+}
+
 static int run_logprob_dump(ds4_engine *engine, const cli_config *cfg, const ds4_tokens *prompt) {
     ds4_session *session = NULL;
     if (ds4_session_create(&session, engine, cfg->gen.ctx_size) != 0) {
@@ -636,10 +701,24 @@ static int run_logprob_dump(ds4_engine *engine, const cli_config *cfg, const ds4
         return 1;
     }
 
+    ds4_tokens forced = {0};
+    const char *force_path = cfg->gen.force_tokens_path;
+    if (!force_path || !force_path[0]) force_path = getenv("DS4_FORCE_TOKENS_FILE");
+    if (force_path && force_path[0]) {
+        if (!load_forced_tokens_file(force_path, &forced)) {
+            fprintf(stderr, "ds4: failed to read forced token ids from: %s\n", force_path);
+            fclose(fp);
+            ds4_session_free(session);
+            return 1;
+        }
+        fprintf(stderr, "ds4: forcing %d continuation tokens from %s\n", forced.len, force_path);
+    }
+
     int k = cfg->gen.dump_logprobs_top_k > 0 ? cfg->gen.dump_logprobs_top_k : 20;
     if (k > 128) k = 128;
     ds4_token_score *scores = calloc((size_t)k, sizeof(scores[0]));
     if (!scores) {
+        ds4_tokens_free(&forced);
         fclose(fp);
         ds4_session_free(session);
         return 1;
@@ -654,10 +733,18 @@ static int run_logprob_dump(ds4_engine *engine, const cli_config *cfg, const ds4
     else if (max_tokens > room - 1) max_tokens = room - 1;
     for (; generated < max_tokens; generated++) {
         int n = ds4_session_top_logprobs(session, scores, k);
-        int token = ds4_session_argmax(session);
+        int selected = ds4_session_argmax(session);
+        int token = selected;
+        bool forced_step = generated < forced.len;
+        if (forced_step) token = forced.v[generated];
         if (generated) fputs(",\n", fp);
         fprintf(fp, "    {\"step\":%d,\"selected\":", generated);
-        json_write_token(fp, engine, token);
+        json_write_token(fp, engine, selected);
+        if (forced_step) {
+            fputs(",\"eval\":", fp);
+            json_write_token(fp, engine, token);
+            fputs(",\"forced\":true", fp);
+        }
         fputs(",\"top_logprobs\":[", fp);
         for (int i = 0; i < n && scores[i].id >= 0; i++) {
             if (i) fputc(',', fp);
@@ -670,6 +757,7 @@ static int run_logprob_dump(ds4_engine *engine, const cli_config *cfg, const ds4
         if (token == ds4_token_eos(engine)) break;
         if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
             fprintf(stderr, "ds4: decode failed while dumping logprobs: %s\n", err);
+            ds4_tokens_free(&forced);
             free(scores);
             fclose(fp);
             ds4_session_free(session);
@@ -679,10 +767,12 @@ static int run_logprob_dump(ds4_engine *engine, const cli_config *cfg, const ds4
     fputs("\n  ]\n}\n", fp);
     if (fclose(fp) != 0) {
         fprintf(stderr, "ds4: failed to close --dump-logprobs file: %s\n", cfg->gen.dump_logprobs_path);
+        ds4_tokens_free(&forced);
         free(scores);
         ds4_session_free(session);
         return 1;
     }
+    ds4_tokens_free(&forced);
     free(scores);
     ds4_session_free(session);
     return 0;
@@ -1235,6 +1325,8 @@ static cli_config parse_options(int argc, char **argv) {
             c.gen.dump_logprobs_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--logprobs-top-k")) {
             c.gen.dump_logprobs_top_k = parse_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--force-tokens")) {
+            c.gen.force_tokens_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--think")) {
             c.gen.think_mode = DS4_THINK_HIGH;
         } else if (!strcmp(arg, "--think-max")) {

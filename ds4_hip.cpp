@@ -5534,6 +5534,126 @@ __device__ static inline float ds4_hip_q2_k_dequant_256_scaled_w32(const unsigne
     return d * scale * q - dmin * mn;
 }
 
+struct ds4_hip_block_q8_K {
+    float d;
+    int8_t qs[256];
+    int16_t bsums[16];
+};
+
+__device__ static inline int32_t ds4_hip_dp4a_i8(int32_t a, int32_t b, int32_t c) {
+#if defined(__HIP_PLATFORM_AMD__)
+    const char4 av = *reinterpret_cast<const char4 *>(&a);
+    const char4 bv = *reinterpret_cast<const char4 *>(&b);
+    return amd_mixed_dot(av, bv, c, false);
+#else
+    const int8_t *ap = reinterpret_cast<const int8_t *>(&a);
+    const int8_t *bp = reinterpret_cast<const int8_t *>(&b);
+    return c + (int32_t)ap[0] * (int32_t)bp[0]
+             + (int32_t)ap[1] * (int32_t)bp[1]
+             + (int32_t)ap[2] * (int32_t)bp[2]
+             + (int32_t)ap[3] * (int32_t)bp[3];
+#endif
+}
+
+__device__ static inline float ds4_hip_qwarp8_reduce_sum(float v) {
+    v += __shfl_down(v, 4, 8);
+    v += __shfl_down(v, 2, 8);
+    v += __shfl_down(v, 1, 8);
+    return v;
+}
+
+__device__ static inline int32_t ds4_hip_dot_q2_16_i8(const uint8_t *q2, const int8_t *q8, int shift) {
+    int32_t sum = 0;
+#pragma unroll
+    for (uint32_t i = 0; i < 16u; i += 4u) {
+        const int32_t v = (*(const int32_t *)(q2 + i) >> shift) & 0x03030303;
+        sum = ds4_hip_dp4a_i8(v, *(const int32_t *)(q8 + i), sum);
+    }
+    return sum;
+}
+
+__device__ static inline float ds4_hip_dot_q2_k_q8_k_block(const unsigned char *x, const ds4_hip_block_q8_K *y) {
+    const uint8_t *q2 = x + 16u;
+    const int8_t *q8 = y->qs;
+    const uint8_t *sc = x;
+    int summs = 0;
+#pragma unroll
+    for (int j = 0; j < 16; j++) summs += (int)y->bsums[j] * (int)(sc[j] >> 4);
+    const uint16_t d_bits = (uint16_t)x[80] | ((uint16_t)x[81] << 8);
+    const uint16_t dmin_bits = (uint16_t)x[82] | ((uint16_t)x[83] << 8);
+    const float dall = y->d * ds4_hip_f16_to_f32(d_bits);
+    const float dmin = y->d * ds4_hip_f16_to_f32(dmin_bits);
+    int isum = 0;
+    int is = 0;
+    for (int k = 0; k < 2; k++) {
+        int shift = 0;
+        for (int j = 0; j < 4; j++) {
+            int d = sc[is++] & 0x0f;
+            isum += d * ds4_hip_dot_q2_16_i8(q2, q8, shift);
+            d = sc[is++] & 0x0f;
+            isum += d * ds4_hip_dot_q2_16_i8(q2 + 16, q8 + 16, shift);
+            shift += 2;
+            q8 += 32;
+        }
+        q2 += 32;
+    }
+    return dall * (float)isum - dmin * (float)summs;
+}
+
+__global__ static void ds4_hip_q8_K_quantize_kernel(ds4_hip_block_q8_K *__restrict__ out,
+                                                    const float *__restrict__ x,
+                                                    uint32_t in_dim,
+                                                    uint32_t n_rows) {
+    const uint32_t b = (uint32_t)blockIdx.x;
+    const uint32_t row = (uint32_t)blockIdx.y;
+    const uint32_t n_blocks = in_dim >> 8;
+    if (row >= n_rows || b >= n_blocks) return;
+    const float *xr = x + (uint64_t)row * in_dim + (uint64_t)b * 256u;
+    ds4_hip_block_q8_K *yb = out + (uint64_t)row * n_blocks + b;
+    __shared__ float abs_part[256];
+    __shared__ float val_part[256];
+    __shared__ float maxv_s;
+    __shared__ float iscale_s;
+    const uint32_t tid = threadIdx.x;
+    const float v = tid < 256u ? xr[tid] : 0.0f;
+    abs_part[tid] = tid < 256u ? fabsf(v) : 0.0f;
+    val_part[tid] = v;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride && abs_part[tid + stride] > abs_part[tid]) {
+            abs_part[tid] = abs_part[tid + stride];
+            val_part[tid] = val_part[tid + stride];
+        }
+        __syncthreads();
+    }
+    const float amax = abs_part[0];
+    if (amax == 0.0f) {
+        if (tid == 0) yb->d = 0.0f;
+        if (tid < 256u) yb->qs[tid] = 0;
+        if (tid < 16u) yb->bsums[tid] = 0;
+        return;
+    }
+    if (tid == 0) {
+        maxv_s = val_part[0];
+        iscale_s = -127.0f / maxv_s;
+    }
+    __syncthreads();
+    if (tid < 256u) {
+        int qv = (int)lrintf(iscale_s * xr[tid]);
+        if (qv > 127) qv = 127;
+        if (qv < -128) qv = -128;
+        yb->qs[tid] = (int8_t)qv;
+    }
+    __syncthreads();
+    if (tid < 16u) {
+        int sum = 0;
+#pragma unroll
+        for (int i = 0; i < 16; i++) sum += yb->qs[tid * 16u + (uint32_t)i];
+        yb->bsums[tid] = (int16_t)sum;
+    }
+    if (tid == 0) yb->d = 1.0f / iscale_s;
+}
+
 __global__ static void ds4_hip_moe_q2_gate_up_kernel(float *__restrict__ gate, float *__restrict__ up, float *__restrict__ mid,
                                                      const unsigned char *__restrict__ gate_w, const unsigned char *__restrict__ up_w,
                                                      const float *__restrict__ x, const int *__restrict__ selected, const float *__restrict__ weights,
@@ -5661,6 +5781,169 @@ __global__ static void ds4_hip_moe_bucket_pairs_kernel(int *__restrict__ counts,
     if (expert < 0 || expert >= 256) expert = 0;
     const uint32_t idx = (uint32_t)atomicAdd(&counts[expert], 1);
     if (idx < stride) buckets[(uint64_t)(uint32_t)expert * stride + idx] = (int)pair;
+}
+
+template <uint32_t PAIR_TILE>
+__global__ static void ds4_hip_moe_q2_gate_up_q8k_expert_batch_kernel(float *__restrict__ mid,
+                                                                      const unsigned char *__restrict__ gate_w,
+                                                                      const unsigned char *__restrict__ up_w,
+                                                                      const ds4_hip_block_q8_K *__restrict__ xq,
+                                                                      const float *__restrict__ weights,
+                                                                      const int *__restrict__ counts,
+                                                                      const int *__restrict__ buckets,
+                                                                      uint32_t stride,
+                                                                      uint32_t xq_blocks,
+                                                                      uint32_t mid_dim,
+                                                                      uint64_t gate_expert_bytes,
+                                                                      uint64_t gate_row_bytes,
+                                                                      uint64_t up_expert_bytes,
+                                                                      uint64_t up_row_bytes,
+                                                                      float clamp) {
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 7u;
+    const uint32_t group = tid >> 3;
+    const uint32_t rows_per_block = blockDim.x >> 3;
+    const uint32_t row = blockIdx.x * rows_per_block + group;
+    const uint32_t expert = blockIdx.y;
+    if (row >= mid_dim || expert >= 256u) return;
+    const uint32_t count = (uint32_t)counts[expert];
+    if (count == 0) return;
+    const unsigned char *grow = gate_w + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes;
+    const unsigned char *urow = up_w + (uint64_t)expert * up_expert_bytes + (uint64_t)row * up_row_bytes;
+    for (uint32_t p0 = 0; p0 < count; p0 += PAIR_TILE) {
+        int pair[PAIR_TILE];
+        float g_acc[PAIR_TILE];
+        float u_acc[PAIR_TILE];
+#pragma unroll
+        for (uint32_t u = 0; u < PAIR_TILE; u++) {
+            pair[u] = (p0 + u < count) ? buckets[(uint64_t)expert * stride + p0 + u] : -1;
+            g_acc[u] = 0.0f;
+            u_acc[u] = 0.0f;
+        }
+        for (uint32_t b = lane; b < xq_blocks; b += 8u) {
+            const unsigned char *gblk = grow + (uint64_t)b * 84u;
+            const unsigned char *ublk = urow + (uint64_t)b * 84u;
+#pragma unroll
+            for (uint32_t u = 0; u < PAIR_TILE; u++) {
+                if (pair[u] >= 0) {
+                    const uint32_t t = (uint32_t)pair[u] / 6u;
+                    const ds4_hip_block_q8_K *xqb = xq + (uint64_t)t * xq_blocks + b;
+                    g_acc[u] += ds4_hip_dot_q2_k_q8_k_block(gblk, xqb);
+                    u_acc[u] += ds4_hip_dot_q2_k_q8_k_block(ublk, xqb);
+                }
+            }
+        }
+#pragma unroll
+        for (uint32_t u = 0; u < PAIR_TILE; u++) {
+            g_acc[u] = ds4_hip_qwarp8_reduce_sum(g_acc[u]);
+            u_acc[u] = ds4_hip_qwarp8_reduce_sum(u_acc[u]);
+        }
+        if (lane == 0) {
+#pragma unroll
+            for (uint32_t u = 0; u < PAIR_TILE; u++) {
+                if (pair[u] >= 0) {
+                    float g = g_acc[u];
+                    float upv = u_acc[u];
+                    if (clamp > 1.0e-6f) {
+                        if (g > clamp) g = clamp;
+                        if (upv > clamp) upv = clamp;
+                        if (upv < -clamp) upv = -clamp;
+                    }
+                    mid[(uint64_t)(uint32_t)pair[u] * mid_dim + row] = ds4_hip_silu(g) * upv * weights[(uint32_t)pair[u]];
+                }
+            }
+        }
+    }
+}
+
+__global__ static void ds4_hip_moe_q2_down_q8k_sum6_kernel(float *__restrict__ out,
+                                                           const unsigned char *__restrict__ down_w,
+                                                           const ds4_hip_block_q8_K *__restrict__ midq,
+                                                           const int *__restrict__ selected,
+                                                           uint32_t n_tokens,
+                                                           uint32_t midq_blocks,
+                                                           uint32_t out_dim,
+                                                           uint64_t down_expert_bytes,
+                                                           uint64_t down_row_bytes) {
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 7u;
+    const uint32_t group = tid >> 3;
+    const uint32_t rows_per_block = blockDim.x >> 3;
+    const uint32_t row = blockIdx.x * rows_per_block + group;
+    const uint32_t t = (uint32_t)blockIdx.y;
+    if (row >= out_dim || t >= n_tokens) return;
+    float total = 0.0f;
+#pragma unroll
+    for (uint32_t slot = 0; slot < 6u; slot++) {
+        int expert = selected[(uint64_t)t * 6u + slot];
+        if (expert < 0) expert = 0;
+        const unsigned char *drow = down_w + (uint64_t)(uint32_t)expert * down_expert_bytes + (uint64_t)row * down_row_bytes;
+        const ds4_hip_block_q8_K *mrow = midq + ((uint64_t)t * 6u + slot) * midq_blocks;
+        float acc = 0.0f;
+        for (uint32_t b = lane; b < midq_blocks; b += 8u) {
+            acc += ds4_hip_dot_q2_k_q8_k_block(drow + (uint64_t)b * 84u, mrow + b);
+        }
+        acc = ds4_hip_qwarp8_reduce_sum(acc);
+        if (lane == 0) total += acc;
+    }
+    if (lane == 0) out[(uint64_t)t * out_dim + row] = total;
+}
+
+template <uint32_t PAIR_TILE>
+__global__ static void ds4_hip_moe_q2_down_q8k_expert_batch_kernel(float *__restrict__ experts,
+                                                                   const unsigned char *__restrict__ down_w,
+                                                                   const ds4_hip_block_q8_K *__restrict__ midq,
+                                                                   const int *__restrict__ counts,
+                                                                   const int *__restrict__ buckets,
+                                                                   uint32_t stride,
+                                                                   uint32_t midq_blocks,
+                                                                   uint32_t out_dim,
+                                                                   uint64_t down_expert_bytes,
+                                                                   uint64_t down_row_bytes) {
+    extern __shared__ unsigned char shraw[];
+    ds4_hip_block_q8_K *shmid = reinterpret_cast<ds4_hip_block_q8_K *>(shraw);
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 7u;
+    const uint32_t group = tid >> 3;
+    const uint32_t rows_per_block = blockDim.x >> 3;
+    const uint32_t row = (uint32_t)blockIdx.x * rows_per_block + group;
+    const uint32_t expert = (uint32_t)blockIdx.y;
+    if (expert >= 256u) return;
+    const bool row_valid = row < out_dim;
+    const uint32_t count = (uint32_t)counts[expert];
+    if (count == 0) return;
+    const unsigned char *drow = down_w + (uint64_t)expert * down_expert_bytes + (uint64_t)(row_valid ? row : 0u) * down_row_bytes;
+    for (uint32_t p0 = 0; p0 < count; p0 += PAIR_TILE) {
+        int pair[PAIR_TILE];
+#pragma unroll
+        for (uint32_t u = 0; u < PAIR_TILE; u++) {
+            pair[u] = (p0 + u < count) ? buckets[(uint64_t)expert * stride + p0 + u] : -1;
+        }
+        for (uint32_t j = tid; j < PAIR_TILE * midq_blocks; j += blockDim.x) {
+            const uint32_t u = j / midq_blocks;
+            const uint32_t b = j - u * midq_blocks;
+            shmid[j] = (pair[u] >= 0) ? midq[(uint64_t)(uint32_t)pair[u] * midq_blocks + b] : ds4_hip_block_q8_K{};
+        }
+        __syncthreads();
+        if (row_valid) {
+            float acc[PAIR_TILE];
+#pragma unroll
+            for (uint32_t u = 0; u < PAIR_TILE; u++) acc[u] = 0.0f;
+            for (uint32_t b = lane; b < midq_blocks; b += 8u) {
+                const unsigned char *dblk = drow + (uint64_t)b * 84u;
+#pragma unroll
+                for (uint32_t u = 0; u < PAIR_TILE; u++) {
+                    if (pair[u] >= 0) acc[u] += ds4_hip_dot_q2_k_q8_k_block(dblk, shmid + u * midq_blocks + b);
+                }
+            }
+#pragma unroll
+            for (uint32_t u = 0; u < PAIR_TILE; u++) {
+                acc[u] = ds4_hip_qwarp8_reduce_sum(acc[u]);
+                if (lane == 0 && pair[u] >= 0) experts[(uint64_t)(uint32_t)pair[u] * out_dim + row] = acc[u];
+            }
+        }
+        __syncthreads();
+    }
 }
 
 template <uint32_t PAIR_TILE>
@@ -6312,9 +6595,9 @@ static void ds4_hip_profile_end(bool enabled, hipEvent_t start, hipEvent_t stop,
     (void)hipEventDestroy(stop);
 }
 
-static bool ds4_hip_moe_wmma_layer_allowed(uint32_t layer) {
-    const char *spec = std::getenv("DS4_HIP_MOE_WMMA_LAYERS");
-    if (!spec || !spec[0]) return true;
+static bool ds4_hip_layer_spec_allows(const char *env_name, uint32_t layer, bool default_allowed) {
+    const char *spec = env_name ? std::getenv(env_name) : nullptr;
+    if (!spec || !spec[0]) return default_allowed;
     const char *p = spec;
     while (*p) {
         while (*p == ',' || *p == ' ' || *p == '\t') p++;
@@ -6331,6 +6614,10 @@ static bool ds4_hip_moe_wmma_layer_allowed(uint32_t layer) {
         p = end;
     }
     return false;
+}
+
+static bool ds4_hip_moe_wmma_layer_allowed(uint32_t layer) {
+    return ds4_hip_layer_spec_allows("DS4_HIP_MOE_WMMA_LAYERS", layer, true);
 }
 
 static void ds4_hip_moe_maybe_dump_routing_counts(const int *counts_dev,
@@ -8106,7 +8393,9 @@ extern "C" int ds4_metal_router_select_tensor(
         if (!p) return 0;
         hash = (const int *)p;
     }
-    const bool store_probs = probs && (g_quality || std::getenv("DS4_METAL_GRAPH_DUMP_PREFIX") != nullptr);
+    const bool store_probs = probs && (g_quality ||
+                                       std::getenv("DS4_METAL_GRAPH_DUMP_PREFIX") != nullptr ||
+                                       std::getenv("DS4_METAL_GRAPH_TRACE_FILE") != nullptr);
     ds4_hip_router_select_parallel_kernel<<<1, 256, 0, g_stream>>>(
             (int *)selected->ptr, (float *)weights->ptr, store_probs ? (float *)probs->ptr : nullptr,
             (const float *)logits->ptr, nullptr, bias, hash, hash_row_count, token, 1, has_bias, hash_mode);
@@ -8151,7 +8440,9 @@ extern "C" int ds4_metal_router_select_batch_tensor(
         if (!p) return 0;
         hash = (const int *)p;
     }
-    const bool store_probs = probs && (g_quality || std::getenv("DS4_METAL_GRAPH_DUMP_PREFIX") != nullptr);
+    const bool store_probs = probs && (g_quality ||
+                                       std::getenv("DS4_METAL_GRAPH_DUMP_PREFIX") != nullptr ||
+                                       std::getenv("DS4_METAL_GRAPH_TRACE_FILE") != nullptr);
     ds4_hip_router_select_parallel_kernel<<<n_tokens, 256, 0, g_stream>>>(
             (int *)selected->ptr, (float *)weights->ptr, store_probs ? (float *)probs->ptr : nullptr,
             (const float *)logits->ptr, tokens ? (const int *)tokens->ptr : nullptr,
@@ -8264,6 +8555,88 @@ extern "C" int ds4_metal_routed_moe_batch_tensor(
     }
     const uint64_t expert_scratch_bytes = (256ull + 256ull * pair_stride + 512ull) * sizeof(int);
     const uint64_t experts_bytes = (uint64_t)n_tokens * 6u * out_dim * sizeof(float);
+
+    const bool moe_q8k_act = std::getenv("DS4_HIP_MOE_Q8K_ACT") != nullptr && n_tokens >= expert_batch_min_tokens &&
+                             warp_threads == 32u && !store_gate_up &&
+                             (expert_in_dim & 255u) == 0u && (expert_mid_dim & 255u) == 0u;
+    if (moe_q8k_act) {
+        const uint32_t xq_blocks = expert_in_dim >> 8;
+        const uint32_t midq_blocks = expert_mid_dim >> 8;
+        const uint64_t counts_bytes = routed_expert_count * sizeof(int);
+        const uint64_t buckets_bytes = (uint64_t)routed_expert_count * pair_stride * sizeof(int);
+        uint64_t off = counts_bytes + buckets_bytes;
+        off = (off + 15u) & ~15ull;
+        const uint64_t xq_off = off;
+        const uint64_t xq_bytes = (uint64_t)n_tokens * xq_blocks * sizeof(ds4_hip_block_q8_K);
+        off += xq_bytes;
+        off = (off + 15u) & ~15ull;
+        const uint64_t midq_off = off;
+        const uint64_t midq_bytes = (uint64_t)pair_stride * midq_blocks * sizeof(ds4_hip_block_q8_K);
+        off += midq_bytes;
+        if (gate->bytes >= off) {
+            unsigned char *scratch = (unsigned char *)gate->ptr;
+            int *counts = (int *)scratch;
+            int *buckets = (int *)(scratch + counts_bytes);
+            ds4_hip_block_q8_K *xq = (ds4_hip_block_q8_K *)(scratch + xq_off);
+            ds4_hip_block_q8_K *midq = (ds4_hip_block_q8_K *)(scratch + midq_off);
+            if (!ds4_hip_check(hipMemsetAsync(counts, 0, counts_bytes, g_stream), "routed MoE q8k bucket memset")) return 0;
+            ds4_hip_moe_bucket_pairs_kernel<<<(unsigned)((pair_stride + 255u) / 256u), 256, 0, g_stream>>>(
+                    counts, buckets, (const int *)selected->ptr, n_tokens, pair_stride);
+            if (!ds4_hip_launch_ok("routed MoE q8k bucket launch")) return 0;
+            ds4_hip_moe_maybe_dump_routing_counts(counts, n_tokens, routed_expert_count);
+
+            hipEvent_t prof_start{}, prof_stop{};
+            bool prof = ds4_hip_profile_begin("DS4_HIP_MOE_PROFILE", &prof_start, &prof_stop);
+            ds4_hip_q8_K_quantize_kernel<<<dim3(xq_blocks, n_tokens, 1u), 256, 0, g_stream>>>(
+                    xq, (const float *)x->ptr, expert_in_dim, n_tokens);
+            if (!ds4_hip_launch_ok("routed MoE q8k x quantize launch")) return 0;
+            ds4_hip_profile_end(prof, prof_start, prof_stop, "moe_q8k_x_quant", expert_in_dim, xq_blocks, n_tokens);
+
+            unsigned q8k_tile = 8u;
+            if (const char *tile_env = std::getenv("DS4_HIP_MOE_Q8K_TILE")) {
+                const unsigned v = (unsigned)std::strtoul(tile_env, nullptr, 10);
+                if (v == 4u || v == 8u || v == 16u) q8k_tile = v;
+            }
+            const unsigned q8k_threads = 256u;
+            const uint32_t q8k_gate_rows_per_block = q8k_threads >> 3;
+            const dim3 q8k_gate_grid((unsigned)((expert_mid_dim + q8k_gate_rows_per_block - 1u) / q8k_gate_rows_per_block),
+                                     routed_expert_count, 1u);
+            prof = ds4_hip_profile_begin("DS4_HIP_MOE_PROFILE", &prof_start, &prof_stop);
+            if (q8k_tile == 4u) {
+                ds4_hip_moe_q2_gate_up_q8k_expert_batch_kernel<4><<<q8k_gate_grid, q8k_threads, 0, g_stream>>>(
+                        (float *)mid->ptr, gw, uw, xq, (const float *)weights->ptr, counts, buckets, pair_stride,
+                        xq_blocks, expert_mid_dim, gate_expert_bytes, gate_row_bytes, gate_expert_bytes, gate_row_bytes, clamp);
+            } else if (q8k_tile == 16u) {
+                ds4_hip_moe_q2_gate_up_q8k_expert_batch_kernel<16><<<q8k_gate_grid, q8k_threads, 0, g_stream>>>(
+                        (float *)mid->ptr, gw, uw, xq, (const float *)weights->ptr, counts, buckets, pair_stride,
+                        xq_blocks, expert_mid_dim, gate_expert_bytes, gate_row_bytes, gate_expert_bytes, gate_row_bytes, clamp);
+            } else {
+                ds4_hip_moe_q2_gate_up_q8k_expert_batch_kernel<8><<<q8k_gate_grid, q8k_threads, 0, g_stream>>>(
+                        (float *)mid->ptr, gw, uw, xq, (const float *)weights->ptr, counts, buckets, pair_stride,
+                        xq_blocks, expert_mid_dim, gate_expert_bytes, gate_row_bytes, gate_expert_bytes, gate_row_bytes, clamp);
+            }
+            if (!ds4_hip_launch_ok("routed MoE Q2_K q8k gate/up launch")) return 0;
+            ds4_hip_profile_end(prof, prof_start, prof_stop, "moe_q2_gate_up_q8k_expert", expert_in_dim, expert_mid_dim, n_tokens);
+
+            prof = ds4_hip_profile_begin("DS4_HIP_MOE_PROFILE", &prof_start, &prof_stop);
+            ds4_hip_q8_K_quantize_kernel<<<dim3(midq_blocks, pair_stride, 1u), 256, 0, g_stream>>>(
+                    midq, (const float *)mid->ptr, expert_mid_dim, pair_stride);
+            if (!ds4_hip_launch_ok("routed MoE q8k mid quantize launch")) return 0;
+            ds4_hip_profile_end(prof, prof_start, prof_stop, "moe_q8k_mid_quant", expert_mid_dim, midq_blocks, pair_stride);
+
+            prof = ds4_hip_profile_begin("DS4_HIP_MOE_PROFILE", &prof_start, &prof_stop);
+            const uint32_t q8k_down_rows_per_block = q8k_threads >> 3;
+            dim3 q8k_down_grid((unsigned)((out_dim + q8k_down_rows_per_block - 1u) / q8k_down_rows_per_block),
+                               (unsigned)n_tokens, 1u);
+            ds4_hip_moe_q2_down_q8k_sum6_kernel<<<q8k_down_grid, q8k_threads, 0, g_stream>>>(
+                    (float *)out->ptr, dw, midq, (const int *)selected->ptr,
+                    n_tokens, midq_blocks, out_dim, down_expert_bytes, down_row_bytes);
+            const bool q8k_ok = ds4_hip_launch_ok("routed MoE Q2_K q8k down launch");
+            ds4_hip_profile_end(prof, prof_start, prof_stop, "moe_q2_down_q8k_sum6", expert_mid_dim, out_dim, n_tokens);
+            return q8k_ok ? 1 : 0;
+        }
+    }
+
     const bool expert_batch = std::getenv("DS4_HIP_MOE_EXPERT_BATCH") != nullptr && n_tokens >= expert_batch_min_tokens &&
                               warp_threads == 32u && !store_gate_up && experts &&
                               gate->bytes >= expert_scratch_bytes && experts->bytes >= experts_bytes;
@@ -8451,6 +8824,68 @@ extern "C" int ds4_metal_routed_moe_batch_tensor(
             if (!launch_gate_wmma_hot()) return 0;
         } else {
             if (!launch_gate_range("moe_q2_gate_up_expert", 1u, 0u, gate_pair_tile)) return 0;
+        }
+        const char *q8k_down_layers_env = std::getenv("DS4_HIP_MOE_Q8K_DOWN_LAYERS");
+        const bool q8k_down_layer_allowed = q8k_down_layers_env && q8k_down_layers_env[0]
+                ? ds4_hip_layer_spec_allows("DS4_HIP_MOE_Q8K_DOWN_LAYERS", layer_index, false)
+                : layer_index >= 40u;
+        const bool moe_q8k_down = std::getenv("DS4_HIP_MOE_Q8K_DOWN") != nullptr &&
+                                  q8k_down_layer_allowed &&
+                                  (expert_mid_dim & 255u) == 0u;
+        if (moe_q8k_down) {
+            const uint32_t midq_blocks = expert_mid_dim >> 8;
+            uint64_t midq_off = (expert_scratch_bytes + 15u) & ~15ull;
+            const uint64_t midq_bytes = (uint64_t)pair_stride * midq_blocks * sizeof(ds4_hip_block_q8_K);
+            if (gate->bytes >= midq_off + midq_bytes) {
+                ds4_hip_block_q8_K *midq = (ds4_hip_block_q8_K *)((unsigned char *)gate->ptr + midq_off);
+                hipEvent_t prof_start{}, prof_stop{};
+                bool prof = ds4_hip_profile_begin("DS4_HIP_MOE_PROFILE", &prof_start, &prof_stop);
+                ds4_hip_q8_K_quantize_kernel<<<dim3(midq_blocks, pair_stride, 1u), 256, 0, g_stream>>>(
+                        midq, (const float *)mid->ptr, expert_mid_dim, pair_stride);
+                if (!ds4_hip_launch_ok("routed MoE q8k-down mid quantize launch")) return 0;
+                ds4_hip_profile_end(prof, prof_start, prof_stop, "moe_q8k_down_mid_quant", expert_mid_dim, midq_blocks, pair_stride);
+                constexpr unsigned q8k_threads = 256u;
+                constexpr uint32_t q8k_rows_per_block = q8k_threads >> 3;
+                if (std::getenv("DS4_HIP_MOE_Q8K_DOWN_DIRECT") == nullptr) {
+                    unsigned q8k_down_tile = 4u;
+                    if (const char *tile_env = std::getenv("DS4_HIP_MOE_Q8K_DOWN_TILE")) {
+                        const unsigned v = (unsigned)std::strtoul(tile_env, nullptr, 10);
+                        if (v == 4u || v == 8u || v == 16u) q8k_down_tile = v;
+                    }
+                    const dim3 q8k_down_expert_grid((unsigned)((out_dim + q8k_rows_per_block - 1u) / q8k_rows_per_block),
+                                                    routed_expert_count, 1u);
+                    const size_t shmem = (size_t)q8k_down_tile * midq_blocks * sizeof(ds4_hip_block_q8_K);
+                    prof = ds4_hip_profile_begin("DS4_HIP_MOE_PROFILE", &prof_start, &prof_stop);
+                    if (q8k_down_tile == 4u) {
+                        ds4_hip_moe_q2_down_q8k_expert_batch_kernel<4><<<q8k_down_expert_grid, q8k_threads, shmem, g_stream>>>(
+                                (float *)experts->ptr, dw, midq, counts, buckets, pair_stride,
+                                midq_blocks, out_dim, down_expert_bytes, down_row_bytes);
+                    } else if (q8k_down_tile == 16u) {
+                        ds4_hip_moe_q2_down_q8k_expert_batch_kernel<16><<<q8k_down_expert_grid, q8k_threads, shmem, g_stream>>>(
+                                (float *)experts->ptr, dw, midq, counts, buckets, pair_stride,
+                                midq_blocks, out_dim, down_expert_bytes, down_row_bytes);
+                    } else {
+                        ds4_hip_moe_q2_down_q8k_expert_batch_kernel<8><<<q8k_down_expert_grid, q8k_threads, shmem, g_stream>>>(
+                                (float *)experts->ptr, dw, midq, counts, buckets, pair_stride,
+                                midq_blocks, out_dim, down_expert_bytes, down_row_bytes);
+                    }
+                    if (!ds4_hip_launch_ok("routed MoE Q2_K q8k expert down launch")) return 0;
+                    ds4_hip_profile_end(prof, prof_start, prof_stop, "moe_q2_down_q8k_expert", expert_mid_dim, out_dim, n_tokens);
+                    ds4_hip_moe_experts_reduce_kernel<<<(unsigned)(((uint64_t)n_tokens * out_dim + 255u) / 256u), 256, 0, g_stream>>>(
+                            (float *)out->ptr, (const float *)experts->ptr, n_tokens, out_dim);
+                    const bool q8k_reduce_ok = ds4_hip_launch_ok("routed MoE q8k expert reduce launch");
+                    return q8k_reduce_ok ? 1 : 0;
+                }
+                prof = ds4_hip_profile_begin("DS4_HIP_MOE_PROFILE", &prof_start, &prof_stop);
+                dim3 q8k_down_grid((unsigned)((out_dim + q8k_rows_per_block - 1u) / q8k_rows_per_block),
+                                   (unsigned)n_tokens, 1u);
+                ds4_hip_moe_q2_down_q8k_sum6_kernel<<<q8k_down_grid, q8k_threads, 0, g_stream>>>(
+                        (float *)out->ptr, dw, midq, (const int *)selected->ptr,
+                        n_tokens, midq_blocks, out_dim, down_expert_bytes, down_row_bytes);
+                const bool q8k_down_ok = ds4_hip_launch_ok("routed MoE Q2_K q8k-only down launch");
+                ds4_hip_profile_end(prof, prof_start, prof_stop, "moe_q2_down_q8k_only", expert_mid_dim, out_dim, n_tokens);
+                return q8k_down_ok ? 1 : 0;
+            }
         }
         if (moe_wmma_hot && wmma_down_hot_count != 0u) {
             if (!launch_down_range("moe_q2_down_expert_cold", 1u, wmma_down_hot_threshold, down_pair_tile)) return 0;
