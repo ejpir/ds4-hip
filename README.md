@@ -220,7 +220,13 @@ about `79.7-79.9 tok/s` and `81.07 tok/s` with opt-in staged full-copy
 The hot WMMA down path now uses a default two-output-tile kernel (`DS4_CUDA_MOE_WMMA_NO_DOWN_N2=1`
 restores the older one-tile down kernel), and its Q2_K tile dequantization is row-oriented;
 with the same MoE+attention-output opt-ins a zero-copy smoke reached `85.28 tok/s`.
-Forced-stream quality passes at
+A newer opt-in attention-output hipBLAS variant,
+`DS4_CUDA_ATTENTION_OUTPUT_PACKED_B_CUBLAS=1`, keeps the grouped A output in a
+packed FP16 scratch buffer and accumulates B by group, avoiding the unpack and
+second activation conversion. Combined with the MoE WMMA and attention-output
+hipBLAS opt-ins it reached `89.71 tok/s` zero-copy under stage profiling and
+`91.82 tok/s` with `DS4_CUDA_COPY_MODEL=1`; forced-stream quality passes at
+`/tmp/ds4_rocm_quality_packed_attnout_b`. Forced-stream quality also passes at
 `/tmp/ds4_rocm_quality_rowwise_downn2_default`, but exact greedy near-ties move
 more, so keep the fast ROCm profile opt-in. For follow-up profiling, `DS4_CUDA_MOE_PROFILE=1`
 now splits the Q2_K expert-batch path into bucket/gate-scalar/gate-WMMA,

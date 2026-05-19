@@ -5988,6 +5988,93 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
         out_a_f16 = cuda_q8_f16_ptr(model_map, out_a_offset, out_a_bytes, group_dim, low_dim, "attn_output_a");
     }
     if (out_a_f16) {
+        const int packed_b =
+            getenv("DS4_CUDA_ATTENTION_OUTPUT_PACKED_B_CUBLAS") != NULL ||
+            getenv("DS4_HIP_ATTENTION_OUTPUT_PACKED_B_CUBLAS") != NULL;
+        if (packed_b &&
+            (getenv("DS4_CUDA_ATTENTION_OUTPUT_B_CUBLAS") != NULL ||
+             getenv("DS4_CUDA_ATTENTION_OUTPUT_CUBLAS_ALL") != NULL) &&
+            !g_quality_mode && getenv("DS4_METAL_GRAPH_DUMP_PREFIX") == NULL) {
+            const __half *out_b_f16 = cuda_q8_f16_ptr(model_map, out_b_offset, out_b_bytes,
+                                                      low_dim, out_dim, "attn_output_b");
+            if (out_b_f16) {
+                const uint64_t heads_h_count = (uint64_t)n_groups * n_tokens * group_dim;
+                const uint64_t low_h_count = (uint64_t)n_groups * n_tokens * rank;
+                const uint64_t heads_h_bytes = heads_h_count * sizeof(__half);
+                const uint64_t low_h_offset = (heads_h_bytes + 255u) & ~255ull;
+                const uint64_t tmp_bytes = low_h_offset + low_h_count * sizeof(__half);
+                void *tmp = cuda_tmp_alloc(tmp_bytes, "attention output packed b cublas");
+                if (!tmp) return 0;
+                __half *heads_h = (__half *)tmp;
+                __half *low_h = (__half *)((char *)tmp + low_h_offset);
+                attention_pack_group_heads_f16_kernel<<<(heads_h_count + 255) / 256, 256>>>(
+                        heads_h,
+                        (const float *)heads->ptr,
+                        n_tokens,
+                        n_groups,
+                        group_dim);
+                if (!cuda_ok(cudaGetLastError(), "attention_output_q8 packed heads pack launch")) return 0;
+                const float alpha = 1.0f;
+                const float beta0 = 0.0f;
+                const float beta1 = 1.0f;
+                cublasStatus_t st = cublasGemmStridedBatchedEx(g_cublas,
+                                                               CUBLAS_OP_T,
+                                                               CUBLAS_OP_N,
+                                                               (int)rank,
+                                                               (int)n_tokens,
+                                                               (int)group_dim,
+                                                               &alpha,
+                                                               out_a_f16,
+                                                               CUDA_R_16F,
+                                                               (int)group_dim,
+                                                               (long long)rank * group_dim,
+                                                               heads_h,
+                                                               CUDA_R_16F,
+                                                               (int)group_dim,
+                                                               (long long)n_tokens * group_dim,
+                                                               &beta0,
+                                                               low_h,
+                                                               CUDA_R_16F,
+                                                               (int)rank,
+                                                               (long long)rank * n_tokens,
+                                                               (int)n_groups,
+                                                               CUBLAS_COMPUTE_32F,
+                                                               CUBLAS_GEMM_DEFAULT);
+                if (st == CUBLAS_STATUS_SUCCESS) {
+                    int ok_packed_b = 1;
+                    for (uint32_t g = 0; g < n_groups; g++) {
+                        const float *beta = (g == 0u) ? &beta0 : &beta1;
+                        st = cublasGemmEx(g_cublas,
+                                           CUBLAS_OP_T,
+                                           CUBLAS_OP_N,
+                                           (int)out_dim,
+                                           (int)n_tokens,
+                                           (int)rank,
+                                           &alpha,
+                                           out_b_f16 + (uint64_t)g * rank,
+                                           CUDA_R_16F,
+                                           (int)low_dim,
+                                           low_h + (uint64_t)g * rank * n_tokens,
+                                           CUDA_R_16F,
+                                           (int)rank,
+                                           beta,
+                                           out->ptr,
+                                           CUDA_R_32F,
+                                           (int)out_dim,
+                                           CUBLAS_COMPUTE_32F,
+                                           CUBLAS_GEMM_DEFAULT);
+                        if (st != CUBLAS_STATUS_SUCCESS) {
+                            ok_packed_b = 0;
+                            break;
+                        }
+                    }
+                    if (ok_packed_b) return 1;
+                    fprintf(stderr, "ds4: cuBLAS attention output packed B failed: status %d; falling back\n", (int)st);
+                } else {
+                    fprintf(stderr, "ds4: cuBLAS attention output packed A failed: status %d; falling back\n", (int)st);
+                }
+            }
+        }
         const uint64_t heads_h_count = (uint64_t)n_groups * n_tokens * group_dim;
         const uint64_t low_tmp_count = (uint64_t)n_groups * n_tokens * rank;
         const uint64_t heads_h_bytes = heads_h_count * sizeof(__half);
