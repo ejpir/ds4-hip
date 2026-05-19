@@ -216,10 +216,13 @@ it moves exact greedy near-ties. Adding `DS4_CUDA_ATTENTION_OUTPUT_CUBLAS_ALL=1`
 preloads the 86 attention-output Q8 tensors as FP16 (~5.38 GiB) and routes both
 attention-output projections through hipBLAS, raising the same zero-copy smoke to
 about `79.7-79.9 tok/s` and `81.07 tok/s` with opt-in staged full-copy
-(`DS4_CUDA_COPY_MODEL=1 DS4_CUDA_COPY_MODEL_CHUNK_MB=1024`, copy ~33.8s);
-forced-stream quality passes at
-`/tmp/ds4_rocm_quality_wmma_attnout_cublas_all`, but exact greedy near-ties move
-more, so keep it opt-in. For follow-up profiling, `DS4_CUDA_MOE_PROFILE=1`
+(`DS4_CUDA_COPY_MODEL=1 DS4_CUDA_COPY_MODEL_CHUNK_MB=1024`, copy ~33.8s).
+The hot WMMA down path now uses a default two-output-tile kernel (`DS4_CUDA_MOE_WMMA_NO_DOWN_N2=1`
+restores the older one-tile down kernel), and its Q2_K tile dequantization is row-oriented;
+with the same MoE+attention-output opt-ins a zero-copy smoke reached `85.28 tok/s`.
+Forced-stream quality passes at
+`/tmp/ds4_rocm_quality_rowwise_downn2_default`, but exact greedy near-ties move
+more, so keep the fast ROCm profile opt-in. For follow-up profiling, `DS4_CUDA_MOE_PROFILE=1`
 now splits the Q2_K expert-batch path into bucket/gate-scalar/gate-WMMA,
 down-scalar/down-WMMA/sum timings; `DS4_CUDA_ATTN_OUT_STAGE_PROFILE=1` splits
 attention-output A/B time, and the CUDA-port Q8 batch tile knobs mirror HIP

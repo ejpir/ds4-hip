@@ -7282,6 +7282,17 @@ static int routed_moe_launch(
                     }
                     lo = hi;
                 }
+            } else if (!cuda_env_flag_any3("DS4_CUDA_MOE_WMMA_NO_DOWN_N2", "DS4_HIP_MOE_WMMA_NO_DOWN_N2", NULL)) {
+                const dim3 grid((out_dim + 2u * bn - 1u) / (2u * bn),
+                                (wmma_down_hot_max + mt * bm - 1u) / (mt * bm),
+                                wmma_down_hot_count);
+                const size_t shmem_n2 = (mt * bm * bk + 2u * bk * bn) * sizeof(half) +
+                                        (2u * mt * bm * bn) * sizeof(float);
+                moe_down_q2K_hotlist_wmma_n2_kernel<8,16,16,16><<<grid, block, shmem_n2>>>(
+                        (float *)down->ptr, down_w, (const float *)mid->ptr,
+                        counts, offsets, sorted_pairs, wmma_down_hot_dev, wmma_down_hot_count,
+                        expert_mid_dim, out_dim, down_expert_bytes, down_row_bytes);
+                if (!cuda_ok(cudaGetLastError(), "routed_moe q2 wmma hot down n2 launch")) return 0;
             } else if (wmma_mtiles == 16u) {
                 constexpr uint32_t mt16 = 16u, bm16 = 16u, bn16 = 16u, bk16 = 16u;
                 const dim3 block16(32u * mt16, 1u, 1u);

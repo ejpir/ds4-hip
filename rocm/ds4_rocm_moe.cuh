@@ -2038,6 +2038,80 @@ __device__ __forceinline__ static float q2_K_dequant_256_direct(const unsigned c
     return dev_f16_to_f32(d_bits) * scale * q - dev_f16_to_f32(dmin_bits) * mn;
 }
 
+template <int BN, int BK>
+__device__ __forceinline__ static void q2_K_dequant_tile_half_rowwise(
+        half *shB,
+        const unsigned char *base,
+        uint64_t row_bytes,
+        uint32_t n0,
+        uint32_t k0,
+        uint32_t out_dim,
+        uint32_t tid) {
+    for (uint32_t j = tid; j < (uint32_t)(BN * BK); j += blockDim.x) {
+        const uint32_t nn = j / (uint32_t)BK;
+        const uint32_t kk = j - nn * (uint32_t)BK;
+        const uint32_t row = n0 + nn;
+        if (row < out_dim) {
+            const uint32_t g = (k0 & 255u) >> 4u;
+            const uint32_t within = g & 7u;
+            const uint32_t qbase = (g >> 3u) * 32u + (within & 1u) * 16u;
+            const uint32_t shift = (within >> 1u) * 2u;
+            const unsigned char *blk = base + (uint64_t)row * row_bytes + (uint64_t)(k0 >> 8u) * 84u;
+            const float d = dev_f16_to_f32((uint16_t)blk[80] | ((uint16_t)blk[81] << 8));
+            const float dm = dev_f16_to_f32((uint16_t)blk[82] | ((uint16_t)blk[83] << 8));
+            const float s = (float)(blk[g] & 0x0fu);
+            const float m = (float)(blk[g] >> 4u);
+            const float q = (float)((blk[16u + qbase + kk] >> shift) & 3u);
+            shB[kk * (uint32_t)BN + nn] = __float2half(d * s * q - dm * m);
+        } else {
+            shB[kk * (uint32_t)BN + nn] = __float2half(0.0f);
+        }
+    }
+}
+
+template <int BN, int BK>
+__device__ __forceinline__ static void q2_K_dequant_dual_tile_half_rowwise(
+        half *shB0,
+        half *shB1,
+        const unsigned char *base0,
+        const unsigned char *base1,
+        uint64_t row_bytes,
+        uint32_t n0,
+        uint32_t k0,
+        uint32_t out_dim,
+        uint32_t tid) {
+    for (uint32_t j = tid; j < (uint32_t)(BN * BK); j += blockDim.x) {
+        const uint32_t nn = j / (uint32_t)BK;
+        const uint32_t kk = j - nn * (uint32_t)BK;
+        const uint32_t row = n0 + nn;
+        if (row < out_dim) {
+            const uint32_t g = (k0 & 255u) >> 4u;
+            const uint32_t within = g & 7u;
+            const uint32_t qbase = (g >> 3u) * 32u + (within & 1u) * 16u;
+            const uint32_t shift = (within >> 1u) * 2u;
+            const unsigned char *blk0 = base0 + (uint64_t)row * row_bytes + (uint64_t)(k0 >> 8u) * 84u;
+            const unsigned char *blk1 = base1 + (uint64_t)row * row_bytes + (uint64_t)(k0 >> 8u) * 84u;
+            const float d0 = dev_f16_to_f32((uint16_t)blk0[80] | ((uint16_t)blk0[81] << 8));
+            const float dm0 = dev_f16_to_f32((uint16_t)blk0[82] | ((uint16_t)blk0[83] << 8));
+            const float d1 = dev_f16_to_f32((uint16_t)blk1[80] | ((uint16_t)blk1[81] << 8));
+            const float dm1 = dev_f16_to_f32((uint16_t)blk1[82] | ((uint16_t)blk1[83] << 8));
+            const float s0 = (float)(blk0[g] & 0x0fu);
+            const float m0 = (float)(blk0[g] >> 4u);
+            const float s1 = (float)(blk1[g] & 0x0fu);
+            const float m1 = (float)(blk1[g] >> 4u);
+            const float q0 = (float)((blk0[16u + qbase + kk] >> shift) & 3u);
+            const float q1 = (float)((blk1[16u + qbase + kk] >> shift) & 3u);
+            const uint32_t sj = kk * (uint32_t)BN + nn;
+            shB0[sj] = __float2half(d0 * s0 * q0 - dm0 * m0);
+            shB1[sj] = __float2half(d1 * s1 * q1 - dm1 * m1);
+        } else {
+            const uint32_t sj = kk * (uint32_t)BN + nn;
+            shB0[sj] = __float2half(0.0f);
+            shB1[sj] = __float2half(0.0f);
+        }
+    }
+}
+
 __device__ __forceinline__ static float moe_silu_oldhip(float x) {
     return x * (1.0f / (1.0f + expf(-x)));
 }
@@ -2386,20 +2460,8 @@ __global__ static void moe_gate_up_mid_q2K_hotlist_wmma_kernel(
                 shA[j] = __float2half(0.0f);
             }
         }
-        for (uint32_t j = tid; j < BK * BN; j += blockDim.x) {
-            const uint32_t kk = j / BN;
-            const uint32_t nn = j - kk * BN;
-            const uint32_t row = n0 + nn;
-            const uint32_t k = k0 + kk;
-            if (row < expert_mid_dim) {
-                const uint64_t off = (uint64_t)row * gate_row_bytes + (uint64_t)(k >> 8u) * 84u;
-                shBg[j] = __float2half(q2_K_dequant_256_direct(gew + off, k & 255u));
-                shBu[j] = __float2half(q2_K_dequant_256_direct(uew + off, k & 255u));
-            } else {
-                shBg[j] = __float2half(0.0f);
-                shBu[j] = __float2half(0.0f);
-            }
-        }
+        q2_K_dequant_dual_tile_half_rowwise<BN, BK>(
+                shBg, shBu, gew, uew, gate_row_bytes, n0, k0, expert_mid_dim, tid);
         __syncthreads();
         if (wave < MTILES) {
             rocwmma::load_matrix_sync(a, shA + wave * BM * BK, BK);
@@ -2491,18 +2553,8 @@ __global__ static void moe_down_q2K_hotlist_wmma_kernel(
                 shA[j] = __float2half(0.0f);
             }
         }
-        for (uint32_t j = tid; j < BK * BN; j += blockDim.x) {
-            const uint32_t kk = j / BN;
-            const uint32_t nn = j - kk * BN;
-            const uint32_t row = n0 + nn;
-            const uint32_t k = k0 + kk;
-            if (row < out_dim) {
-                const uint64_t off = (uint64_t)row * down_row_bytes + (uint64_t)(k >> 8u) * 84u;
-                shB[j] = __float2half(q2_K_dequant_256_direct(dew + off, k & 255u));
-            } else {
-                shB[j] = __float2half(0.0f);
-            }
-        }
+        q2_K_dequant_tile_half_rowwise<BN, BK>(
+                shB, dew, down_row_bytes, n0, k0, out_dim, tid);
         __syncthreads();
         if (wave < MTILES) {
             rocwmma::load_matrix_sync(a, shA + wave * BM * BK, BK);
@@ -2524,6 +2576,102 @@ __global__ static void moe_down_q2K_hotlist_wmma_kernel(
         if (bucket_row < count && row < out_dim) {
             const uint32_t pair = pairs[first + bucket_row];
             down_out[(uint64_t)pair * out_dim + row] = shC[j];
+        }
+    }
+}
+
+template <int MTILES=8, int BM=16, int BN=16, int BK=16>
+__global__ static void moe_down_q2K_hotlist_wmma_n2_kernel(
+        float *down_out,
+        const char *down_base,
+        const float *mid,
+        const uint32_t *counts,
+        const uint32_t *offsets,
+        const uint32_t *pairs,
+        const uint32_t *hot_experts,
+        uint32_t hot_count,
+        uint32_t expert_mid_dim,
+        uint32_t out_dim,
+        uint64_t down_expert_bytes,
+        uint64_t down_row_bytes) {
+    extern __shared__ unsigned char raw_sh[];
+    half *shA = reinterpret_cast<half *>(raw_sh);
+    half *shB0 = shA + MTILES * BM * BK;
+    half *shB1 = shB0 + BK * BN;
+    float *shC0 = reinterpret_cast<float *>(shB1 + BK * BN);
+    float *shC1 = shC0 + MTILES * BM * BN;
+    const uint32_t hot_idx = (uint32_t)blockIdx.z;
+    if (hot_idx >= hot_count) return;
+    const uint32_t expert = hot_experts[hot_idx];
+    if (expert >= 256u) return;
+    const uint32_t count = counts[expert];
+    const uint32_t m_group0 = (uint32_t)blockIdx.y * MTILES * BM;
+    if (m_group0 >= count) return;
+    const uint32_t n0 = (uint32_t)blockIdx.x * (2u * BN);
+    const uint32_t tid = threadIdx.x;
+    const uint32_t wave = tid >> 5u;
+    const uint32_t first = offsets[expert];
+
+    using frag_a = rocwmma::fragment<rocwmma::matrix_a, BM, BN, BK, half, rocwmma::row_major>;
+    using frag_b = rocwmma::fragment<rocwmma::matrix_b, BM, BN, BK, half, rocwmma::row_major>;
+    using frag_c = rocwmma::fragment<rocwmma::accumulator, BM, BN, BK, float>;
+    frag_a a;
+    frag_b b0;
+    frag_b b1;
+    frag_c acc0;
+    frag_c acc1;
+    if (wave < MTILES) {
+        rocwmma::fill_fragment(acc0, 0.0f);
+        rocwmma::fill_fragment(acc1, 0.0f);
+    }
+
+    const unsigned char *dew = (const unsigned char *)down_base + (uint64_t)expert * down_expert_bytes;
+    for (uint32_t k0 = 0; k0 < expert_mid_dim; k0 += BK) {
+        for (uint32_t j = tid; j < MTILES * BM * BK; j += blockDim.x) {
+            const uint32_t mt = j / (BM * BK);
+            const uint32_t rem = j - mt * BM * BK;
+            const uint32_t mm = rem / BK;
+            const uint32_t kk = rem - mm * BK;
+            const uint32_t bucket_row = m_group0 + mt * BM + mm;
+            if (bucket_row < count) {
+                const uint32_t pair = pairs[first + bucket_row];
+                shA[j] = __float2half(mid[(uint64_t)pair * expert_mid_dim + k0 + kk]);
+            } else {
+                shA[j] = __float2half(0.0f);
+            }
+        }
+        q2_K_dequant_tile_half_rowwise<BN, BK>(
+                shB0, dew, down_row_bytes, n0, k0, out_dim, tid);
+        q2_K_dequant_tile_half_rowwise<BN, BK>(
+                shB1, dew, down_row_bytes, n0 + BN, k0, out_dim, tid);
+        __syncthreads();
+        if (wave < MTILES) {
+            rocwmma::load_matrix_sync(a, shA + wave * BM * BK, BK);
+            rocwmma::load_matrix_sync(b0, shB0, BN);
+            rocwmma::load_matrix_sync(b1, shB1, BN);
+            rocwmma::mma_sync(acc0, a, b0, acc0);
+            rocwmma::mma_sync(acc1, a, b1, acc1);
+        }
+        __syncthreads();
+    }
+
+    if (wave < MTILES) {
+        rocwmma::store_matrix_sync(shC0 + wave * BM * BN, acc0, BN, rocwmma::mem_row_major);
+        rocwmma::store_matrix_sync(shC1 + wave * BM * BN, acc1, BN, rocwmma::mem_row_major);
+    }
+    __syncthreads();
+    for (uint32_t j = tid; j < MTILES * BM * BN; j += blockDim.x) {
+        const uint32_t mt = j / (BM * BN);
+        const uint32_t rem = j - mt * BM * BN;
+        const uint32_t mm = rem / BN;
+        const uint32_t nn = rem - mm * BN;
+        const uint32_t bucket_row = m_group0 + mt * BM + mm;
+        if (bucket_row < count) {
+            const uint32_t pair = pairs[first + bucket_row];
+            const uint32_t row0 = n0 + nn;
+            const uint32_t row1 = n0 + BN + nn;
+            if (row0 < out_dim) down_out[(uint64_t)pair * out_dim + row0] = shC0[j];
+            if (row1 < out_dim) down_out[(uint64_t)pair * out_dim + row1] = shC1[j];
         }
     }
 }
