@@ -1747,8 +1747,8 @@ extern "C" int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_
     const int preload_transposed_b =
         (getenv("DS4_CUDA_ATTENTION_OUTPUT_INTERLEAVED_B_CUBLAS") != NULL ||
          getenv("DS4_HIP_ATTENTION_OUTPUT_INTERLEAVED_B_CUBLAS") != NULL) &&
-        (getenv("DS4_CUDA_ATTENTION_OUTPUT_TRANSPOSED_B_CUBLAS") != NULL ||
-         getenv("DS4_HIP_ATTENTION_OUTPUT_TRANSPOSED_B_CUBLAS") != NULL) &&
+        getenv("DS4_CUDA_ATTENTION_OUTPUT_NO_TRANSPOSED_B_CUBLAS") == NULL &&
+        getenv("DS4_HIP_ATTENTION_OUTPUT_NO_TRANSPOSED_B_CUBLAS") == NULL &&
         strstr(cache_label, "attn_output_b") != NULL;
     if (preload_transposed_b) {
         if (cuda_q8_f16_transpose_ptr(model_map, offset, bytes, in_dim, out_dim, cache_label)) return 1;
@@ -6135,8 +6135,8 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
             const int interleaved_b = getenv("DS4_CUDA_ATTENTION_OUTPUT_INTERLEAVED_B_CUBLAS") != NULL ||
                                       getenv("DS4_HIP_ATTENTION_OUTPUT_INTERLEAVED_B_CUBLAS") != NULL;
             const int transposed_b = interleaved_b &&
-                                     (getenv("DS4_CUDA_ATTENTION_OUTPUT_TRANSPOSED_B_CUBLAS") != NULL ||
-                                      getenv("DS4_HIP_ATTENTION_OUTPUT_TRANSPOSED_B_CUBLAS") != NULL);
+                                     getenv("DS4_CUDA_ATTENTION_OUTPUT_NO_TRANSPOSED_B_CUBLAS") == NULL &&
+                                     getenv("DS4_HIP_ATTENTION_OUTPUT_NO_TRANSPOSED_B_CUBLAS") == NULL;
             const __half *out_b_f16_t = transposed_b
                 ? cuda_q8_f16_transpose_ptr(model_map, out_b_offset, out_b_bytes,
                                             low_dim, out_dim, "attn_output_b")
