@@ -3963,8 +3963,10 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
                                          in_dim, out_dim, x, n_tok, label)) {
         return 1;
     }
-    if (n_tok > 1 && !g_quality_mode && getenv("DS4_CUDA_SHARED_EXPERT_CUBLAS") != NULL &&
-        ((in_dim == 4096u && out_dim == 2048u) || (in_dim == 2048u && out_dim == 4096u)) &&
+    if (n_tok > 1 && !g_quality_mode &&
+        ((getenv("DS4_CUDA_SHARED_EXPERT_CUBLAS") != NULL &&
+          ((in_dim == 4096u && out_dim == 2048u) || (in_dim == 2048u && out_dim == 4096u))) ||
+         (getenv("DS4_CUDA_SHARED_DOWN_CUBLAS") != NULL && in_dim == 2048u && out_dim == 4096u)) &&
         cuda_matmul_q8_0_tensor_f16_gemm(out, model_map, model_size, weight_offset,
                                          in_dim, out_dim, x, n_tok, label ? label : "shared_expert")) {
         return 1;
@@ -7260,10 +7262,10 @@ static int routed_moe_launch(
         }
         if (q2_prof[1]) (void)cudaEventRecord(q2_prof[1], 0);
 
-        uint32_t gate_tile = cuda_parse_u32_env_alias("DS4_CUDA_MOE_GATE_TILE", "DS4_HIP_MOE_GATE_TILE", 16u, 4u, 16u);
-        uint32_t down_tile = cuda_parse_u32_env_alias("DS4_CUDA_MOE_DOWN_TILE", "DS4_HIP_MOE_DOWN_TILE", 8u, 4u, 16u);
-        if (gate_tile != 4u && gate_tile != 8u && gate_tile != 16u) gate_tile = 16u;
-        if (down_tile != 4u && down_tile != 8u && down_tile != 16u) down_tile = 8u;
+        uint32_t gate_tile = cuda_parse_u32_env_alias("DS4_CUDA_MOE_GATE_TILE", "DS4_HIP_MOE_GATE_TILE", 4u, 4u, 16u);
+        uint32_t down_tile = cuda_parse_u32_env_alias("DS4_CUDA_MOE_DOWN_TILE", "DS4_HIP_MOE_DOWN_TILE", 4u, 4u, 16u);
+        if (gate_tile != 4u && gate_tile != 8u && gate_tile != 16u) gate_tile = 4u;
+        if (down_tile != 4u && down_tile != 8u && down_tile != 16u) down_tile = 4u;
         uint32_t gate_rpb = cuda_parse_u32_env_alias("DS4_CUDA_MOE_GATE_RPB", "DS4_HIP_MOE_GATE_RPB", 16u, 1u, 16u);
         uint32_t down_rpb = cuda_parse_u32_env_alias("DS4_CUDA_MOE_DOWN_RPB", "DS4_HIP_MOE_DOWN_RPB", 16u, 1u, 16u);
         if (gate_rpb == 0u) gate_rpb = 1u;

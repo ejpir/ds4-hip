@@ -11831,37 +11831,61 @@ static bool metal_graph_encode_layer_attention_batch(
                                       (uint64_t)n_tokens * q_dim, il, pos0);
     }
     DS4_METAL_PROFILE_Q_STAGE("q_b");
-    if (ok) ok = ds4_metal_head_rms_norm_tensor(g->batch_q,
+#if defined(DS4_USE_GPU_API)
+    const bool q_head_rope_fused = getenv("DS4_CUDA_NO_HEAD_RMS_ROPE_FUSED") == NULL &&
+                                   getenv("DS4_METAL_GRAPH_DUMP_PREFIX") == NULL;
+    if (q_head_rope_fused) {
+        if (ok) ok = ds4_metal_head_rms_norm_rope_tail_tensor(g->batch_q,
+                                                              n_tokens,
+                                                              DS4_N_HEAD,
+                                                              DS4_N_HEAD_DIM,
+                                                              DS4_N_ROT,
+                                                              pos0,
+                                                              compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
+                                                              false,
+                                                              freq_base,
+                                                              freq_scale,
+                                                              ext_factor,
+                                                              attn_factor,
+                                                              DS4_ROPE_YARN_BETA_FAST,
+                                                              DS4_ROPE_YARN_BETA_SLOW,
+                                                              DS4_RMS_EPS) != 0;
+        DS4_METAL_PROFILE_Q_STAGE("head_norm_rope");
+    } else
+#endif
+    {
+        if (ok) ok = ds4_metal_head_rms_norm_tensor(g->batch_q,
+                                                    n_tokens,
+                                                    DS4_N_HEAD,
+                                                    DS4_N_HEAD_DIM,
+                                                    DS4_RMS_EPS) != 0;
+        if (ok) {
+            metal_graph_debug_dump_tensor("Qnorm", g->batch_q,
+                                          (uint64_t)n_tokens * q_dim, il, pos0);
+        }
+        DS4_METAL_PROFILE_Q_STAGE("head_norm");
+        if (ok) ok = ds4_metal_rope_tail_tensor(g->batch_q,
                                                 n_tokens,
                                                 DS4_N_HEAD,
                                                 DS4_N_HEAD_DIM,
-                                                DS4_RMS_EPS) != 0;
-    if (ok) {
-        metal_graph_debug_dump_tensor("Qnorm", g->batch_q,
-                                      (uint64_t)n_tokens * q_dim, il, pos0);
+                                                DS4_N_ROT,
+                                                pos0,
+                                                compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
+                                                false,
+                                                freq_base,
+                                                freq_scale,
+                                                ext_factor,
+                                                attn_factor,
+                                                DS4_ROPE_YARN_BETA_FAST,
+                                                DS4_ROPE_YARN_BETA_SLOW) != 0;
+        DS4_METAL_PROFILE_Q_STAGE("rope");
     }
-    DS4_METAL_PROFILE_Q_STAGE("head_norm");
-    if (ok) ok = ds4_metal_rope_tail_tensor(g->batch_q,
-                                            n_tokens,
-                                            DS4_N_HEAD,
-                                            DS4_N_HEAD_DIM,
-                                            DS4_N_ROT,
-                                            pos0,
-                                            compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
-                                            false,
-                                            freq_base,
-                                            freq_scale,
-                                            ext_factor,
-                                            attn_factor,
-                                            DS4_ROPE_YARN_BETA_FAST,
-                                            DS4_ROPE_YARN_BETA_SLOW) != 0;
     if (ok) {
         metal_graph_debug_dump_tensor("Qcur", g->batch_q,
                                       (uint64_t)n_tokens * q_dim, il, pos0);
         metal_graph_debug_inject_tensor("Qcur", g->batch_q,
                                         (uint64_t)n_tokens * q_dim, il, pos0);
     }
-    DS4_METAL_PROFILE_Q_STAGE("rope");
     DS4_METAL_PROFILE_ATTN_STAGE("q_path");
     if (!qkv_rms_fused) {
         if (ok) ok = ds4_metal_matmul_q8_0_tensor(g->batch_kv_raw,
@@ -16881,7 +16905,9 @@ static bool accelerator_cuda_preload_q8_f16_tensors(const ds4_model *m) {
     const bool preload_q_b = getenv("DS4_CUDA_ATTN_Q_B_PRELOAD") != NULL;
     const bool preload_shared = getenv("DS4_CUDA_SHARED_EXPERT_CUBLAS") != NULL ||
                                 getenv("DS4_CUDA_SHARED_EXPERT_PRELOAD") != NULL;
-    if (!preload_all && !preload_attn_out && !preload_q_b && !preload_shared) return true;
+    const bool preload_shared_down = getenv("DS4_CUDA_SHARED_DOWN_CUBLAS") != NULL ||
+                                     getenv("DS4_CUDA_SHARED_DOWN_PRELOAD") != NULL;
+    if (!preload_all && !preload_attn_out && !preload_q_b && !preload_shared && !preload_shared_down) return true;
 
     const double t0 = now_sec();
     uint64_t requested = 0;
@@ -16892,10 +16918,12 @@ static bool accelerator_cuda_preload_q8_f16_tensors(const ds4_model *m) {
         const bool is_attn_out = ds4_str_contains_cstr(t->name, "attn_output_a.weight") ||
                                  ds4_str_contains_cstr(t->name, "attn_output_b.weight");
         const bool is_q_b = ds4_str_contains_cstr(t->name, "attn_q_b.weight");
+        const bool is_shared_down = ds4_str_contains_cstr(t->name, "ffn_down_shexp.weight");
         const bool is_shared = ds4_str_contains_cstr(t->name, "ffn_gate_shexp.weight") ||
                                ds4_str_contains_cstr(t->name, "ffn_up_shexp.weight") ||
-                               ds4_str_contains_cstr(t->name, "ffn_down_shexp.weight");
-        if (!preload_all && !(preload_attn_out && is_attn_out) && !(preload_q_b && is_q_b) && !(preload_shared && is_shared)) continue;
+                               is_shared_down;
+        if (!preload_all && !(preload_attn_out && is_attn_out) && !(preload_q_b && is_q_b) &&
+            !(preload_shared && is_shared) && !(preload_shared_down && is_shared_down)) continue;
         if (t->abs_offset > m->size || t->bytes > m->size - t->abs_offset) return false;
         char label[160];
         snprintf(label, sizeof(label), "tensor:%.*s", (int)t->name.len, t->name.ptr);
