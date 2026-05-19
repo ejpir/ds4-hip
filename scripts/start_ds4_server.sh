@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Safe ds4-server launcher for local OpenAI-compatible testing.
 # Defaults are conservative after the previous machine reset:
-# - no rocm-smi perflevel change unless DS4_SERVER_PERFLEVEL is set
+# - no rocm-smi perflevel change unless DS4_SERVER_PERFLEVEL or DS4_SERVER_FAST_FULL is set
 # - managed HIP tensors unless DS4_SERVER_DEVICE_TENSORS=1
 # - no optional final-Q8 cache/repack/top-only unless explicitly enabled
 
@@ -26,7 +26,7 @@ Environment:
   DS4_SERVER_LOG=/tmp/ds4-server.log
   DS4_SERVER_PID=/tmp/ds4-server.pid
   DS4_SERVER_TRACE=FILE           Optional trace file
-  DS4_SERVER_FAST_FULL=1          Max-performance preset: device tensors, staged full-copy, best prefill+decode flags
+  DS4_SERVER_FAST_FULL=1          Max-performance preset: high perflevel, device tensors, staged full-copy, best prefill+decode flags
   DS4_SERVER_PREFILL_HEARTBEAT_SEC=2  Prefill heartbeat interval; 0 disables
   DS4_SERVER_PREFILL_CHUNK=N      Set prefill chunk/allocation cap
   DS4_SERVER_DECODE_PREFILL=1     Safest prompt path: prefill via decode kernels
@@ -60,8 +60,8 @@ Environment:
   DS4_SERVER_MOE_Q8K_DOWN_DIRECT=1    Use slower direct sum6 Q8_K-down variant instead of expert-batched
   DS4_SERVER_MOE_Q8K_DOWN_TILE=4|8|16 Expert-batched Q8_K-down pair tile; default 4
   DS4_SERVER_MOE_WMMA_HOT=1      Opt-in hot-bucket Q2_K WMMA MoE path. Enabled by DS4_SERVER_FAST_FULL=1.
-  DS4_SERVER_MOE_WMMA_GATE_HOT=N Gate/up WMMA bucket threshold; FAST_FULL default 16
-  DS4_SERVER_MOE_WMMA_DOWN_HOT=N Down WMMA bucket threshold; FAST_FULL default 16
+  DS4_SERVER_MOE_WMMA_GATE_HOT=N Gate/up WMMA bucket threshold; FAST_FULL default 32
+  DS4_SERVER_MOE_WMMA_DOWN_HOT=N Down WMMA bucket threshold; FAST_FULL default 32
   DS4_SERVER_MOE_WMMA_LAYERS=LIST Restrict WMMA to layers/ranges, e.g. 14-42; diagnostic/experimental
   DS4_SERVER_COPY_MODEL=1        Copy GGUF tensor payload to HIP allocation using staged chunks
   DS4_SERVER_COPY_MODEL_CHUNK_MB=256  Staged full-copy chunk size
@@ -99,6 +99,8 @@ TRACE="${DS4_SERVER_TRACE:-}"
 # One-command max-performance profile.  Individual env vars may still be set
 # by the caller before this script to override these defaults.
 if [[ "${DS4_SERVER_FAST_FULL:-0}" == "1" ]]; then
+  export DS4_SERVER_PERFLEVEL="${DS4_SERVER_PERFLEVEL:-high}"
+  export DS4_SERVER_PREFILL_CHUNK="${DS4_SERVER_PREFILL_CHUNK:-2048}"
   export DS4_SERVER_DEVICE_TENSORS="${DS4_SERVER_DEVICE_TENSORS:-1}"
   export DS4_SERVER_COPY_MODEL="${DS4_SERVER_COPY_MODEL:-1}"
   export DS4_SERVER_COPY_MODEL_CHUNK_MB="${DS4_SERVER_COPY_MODEL_CHUNK_MB:-1024}"
@@ -122,8 +124,8 @@ if [[ "${DS4_SERVER_FAST_FULL:-0}" == "1" ]]; then
   export DS4_SERVER_Q8_REPACK_SPLIT16="${DS4_SERVER_Q8_REPACK_SPLIT16:-1}"
   export DS4_SERVER_Q8_WMMA_FAST="${DS4_SERVER_Q8_WMMA_FAST:-1}"
   export DS4_SERVER_MOE_WMMA_HOT="${DS4_SERVER_MOE_WMMA_HOT:-1}"
-  export DS4_SERVER_MOE_WMMA_GATE_HOT="${DS4_SERVER_MOE_WMMA_GATE_HOT:-16}"
-  export DS4_SERVER_MOE_WMMA_DOWN_HOT="${DS4_SERVER_MOE_WMMA_DOWN_HOT:-16}"
+  export DS4_SERVER_MOE_WMMA_GATE_HOT="${DS4_SERVER_MOE_WMMA_GATE_HOT:-32}"
+  export DS4_SERVER_MOE_WMMA_DOWN_HOT="${DS4_SERVER_MOE_WMMA_DOWN_HOT:-32}"
 fi
 
 if [[ ! -f "$MODEL" ]]; then

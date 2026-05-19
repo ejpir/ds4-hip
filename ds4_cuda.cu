@@ -7608,6 +7608,17 @@ static int routed_moe_launch(
                         counts, offsets, sorted_pairs, wmma_gate_hot_dev, wmma_gate_hot_count,
                         expert_in_dim, expert_mid_dim, gate_expert_bytes, gate_row_bytes, clamp);
                 if (!cuda_ok(cudaGetLastError(), "routed_moe q2 wmma hot gate/up mt4 launch")) return 0;
+            } else if (!cuda_env_flag_any3("DS4_CUDA_MOE_WMMA_NO_GATE_N2", "DS4_HIP_MOE_WMMA_NO_GATE_N2", NULL)) {
+                const dim3 grid((expert_mid_dim + 2u * bn - 1u) / (2u * bn),
+                                (wmma_gate_hot_max + mt * bm - 1u) / (mt * bm),
+                                wmma_gate_hot_count);
+                const size_t shmem_n2 = (mt * bm * bk + 4u * bk * bn) * sizeof(half) +
+                                        (4u * mt * bm * bn) * sizeof(float);
+                moe_gate_up_mid_q2K_hotlist_wmma_n2_kernel<8,16,16,16><<<grid, block, shmem_n2>>>(
+                        (float *)mid->ptr, gate_w, up_w, (const float *)x->ptr, (const float *)weights->ptr,
+                        counts, offsets, sorted_pairs, wmma_gate_hot_dev, wmma_gate_hot_count,
+                        expert_in_dim, expert_mid_dim, gate_expert_bytes, gate_row_bytes, clamp);
+                if (!cuda_ok(cudaGetLastError(), "routed_moe q2 wmma hot gate/up n2 launch")) return 0;
             } else {
                 const dim3 grid(expert_mid_dim / bn, (wmma_gate_hot_max + mt * bm - 1u) / (mt * bm), wmma_gate_hot_count);
                 moe_gate_up_mid_q2K_hotlist_wmma_kernel<8,16,16,16><<<grid, block, shmem>>>(
