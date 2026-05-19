@@ -4023,8 +4023,8 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
             n_tok >= cuda_parse_u32_env_alias("DS4_CUDA_Q8_WMMA_MIN_TOKENS", "DS4_HIP_Q8_WMMA_MIN_TOKENS", 2u, 1u, 65535u) &&
             in_dim <= UINT32_MAX && out_dim <= UINT32_MAX && n_tok <= UINT32_MAX) {
             constexpr uint32_t bm = 16u, bn = 16u, bk = 16u;
-            uint32_t tiles_n = cuda_parse_u32_env_alias("DS4_CUDA_Q8_WMMA_TILES_N", "DS4_HIP_Q8_WMMA_TILES_N", 16u, 4u, 16u);
-            if (tiles_n != 4u && tiles_n != 8u && tiles_n != 16u) tiles_n = 16u;
+            uint32_t tiles_n = cuda_parse_u32_env_alias("DS4_CUDA_Q8_WMMA_TILES_N", "DS4_HIP_Q8_WMMA_TILES_N", 32u, 4u, 32u);
+            if (tiles_n != 4u && tiles_n != 8u && tiles_n != 16u && tiles_n != 32u) tiles_n = 32u;
             const dim3 grid((uint32_t)((out_dim + tiles_n * bn - 1u) / (tiles_n * bn)),
                             (uint32_t)((n_tok + bm - 1u) / bm),
                             1u);
@@ -4041,6 +4041,15 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
                         blocks * 34u);
             } else if (tiles_n == 16u) {
                 matmul_q8_0_f32_batch_wmma_onthefly_kernel<16,16,16,16><<<grid, 512u, shmem>>>(
+                        (float *)out->ptr,
+                        reinterpret_cast<const unsigned char *>(wptr),
+                        (const float *)x->ptr,
+                        (uint32_t)n_tok,
+                        (uint32_t)in_dim,
+                        (uint32_t)out_dim,
+                        blocks * 34u);
+            } else if (tiles_n == 32u) {
+                matmul_q8_0_f32_batch_wmma_onthefly_kernel<32,16,16,16><<<grid, 1024u, shmem>>>(
                         (float *)out->ptr,
                         reinterpret_cast<const unsigned char *>(wptr),
                         (const float *)x->ptr,
@@ -6041,6 +6050,8 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
                 const float alpha = 1.0f;
                 const float beta0 = 0.0f;
                 const float beta1 = 1.0f;
+                const int interleaved_b = getenv("DS4_CUDA_ATTENTION_OUTPUT_INTERLEAVED_B_CUBLAS") != NULL ||
+                                          getenv("DS4_HIP_ATTENTION_OUTPUT_INTERLEAVED_B_CUBLAS") != NULL;
                 cublasStatus_t st = cublasGemmStridedBatchedEx(g_cublas,
                                                                CUBLAS_OP_T,
                                                                CUBLAS_OP_N,
@@ -6059,12 +6070,34 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
                                                                &beta0,
                                                                low_h,
                                                                CUDA_R_16F,
-                                                               (int)rank,
-                                                               (long long)rank * n_tokens,
+                                                               interleaved_b ? (int)low_dim : (int)rank,
+                                                               interleaved_b ? (long long)rank : (long long)rank * n_tokens,
                                                                (int)n_groups,
                                                                CUBLAS_COMPUTE_32F,
                                                                CUBLAS_GEMM_DEFAULT);
-                if (st == CUBLAS_STATUS_SUCCESS) {
+                if (st == CUBLAS_STATUS_SUCCESS && interleaved_b) {
+                    st = cublasGemmEx(g_cublas,
+                                      CUBLAS_OP_T,
+                                      CUBLAS_OP_N,
+                                      (int)out_dim,
+                                      (int)n_tokens,
+                                      (int)low_dim,
+                                      &alpha,
+                                      out_b_f16,
+                                      CUDA_R_16F,
+                                      (int)low_dim,
+                                      low_h,
+                                      CUDA_R_16F,
+                                      (int)low_dim,
+                                      &beta0,
+                                      out->ptr,
+                                      CUDA_R_32F,
+                                      (int)out_dim,
+                                      CUBLAS_COMPUTE_32F,
+                                      CUBLAS_GEMM_DEFAULT);
+                    if (st == CUBLAS_STATUS_SUCCESS) return 1;
+                    fprintf(stderr, "ds4: cuBLAS attention output interleaved B failed: status %d; falling back\n", (int)st);
+                } else if (st == CUBLAS_STATUS_SUCCESS) {
                     int ok_packed_b = 1;
                     for (uint32_t g = 0; g < n_groups; g++) {
                         const float *beta = (g == 0u) ? &beta0 : &beta1;
