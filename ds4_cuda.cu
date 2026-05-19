@@ -7174,10 +7174,10 @@ static int routed_moe_launch(
 #endif
         uint32_t wmma_gate_hot_threshold = cuda_parse_u32_env_alias("DS4_CUDA_MOE_WMMA_GATE_HOT",
                                                                     "DS4_HIP_MOE_WMMA_GATE_HOT",
-                                                                    128u, 1u, 65535u);
+                                                                    24u, 1u, 65535u);
         uint32_t wmma_down_hot_threshold = cuda_parse_u32_env_alias("DS4_CUDA_MOE_WMMA_DOWN_HOT",
                                                                     "DS4_HIP_MOE_WMMA_DOWN_HOT",
-                                                                    64u, 1u, 65535u);
+                                                                    24u, 1u, 65535u);
         uint32_t wmma_mtiles = cuda_parse_u32_env_alias("DS4_CUDA_MOE_WMMA_MTILES",
                                                         "DS4_HIP_MOE_WMMA_MTILES",
                                                         8u, 4u, 16u);
