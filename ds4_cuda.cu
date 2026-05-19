@@ -4022,20 +4022,42 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
             !g_quality_mode && (in_dim % 16u) == 0u && (out_dim % 16u) == 0u &&
             n_tok >= cuda_parse_u32_env_alias("DS4_CUDA_Q8_WMMA_MIN_TOKENS", "DS4_HIP_Q8_WMMA_MIN_TOKENS", 2u, 1u, 65535u) &&
             in_dim <= UINT32_MAX && out_dim <= UINT32_MAX && n_tok <= UINT32_MAX) {
-            constexpr uint32_t tiles_n = 8u, bm = 16u, bn = 16u, bk = 16u;
+            constexpr uint32_t bm = 16u, bn = 16u, bk = 16u;
+            uint32_t tiles_n = cuda_parse_u32_env_alias("DS4_CUDA_Q8_WMMA_TILES_N", "DS4_HIP_Q8_WMMA_TILES_N", 16u, 4u, 16u);
+            if (tiles_n != 4u && tiles_n != 8u && tiles_n != 16u) tiles_n = 16u;
             const dim3 grid((uint32_t)((out_dim + tiles_n * bn - 1u) / (tiles_n * bn)),
                             (uint32_t)((n_tok + bm - 1u) / bm),
                             1u);
             const size_t shmem = (bm * bk + tiles_n * bk * bn) * sizeof(half) +
                                  (tiles_n * bm * bn) * sizeof(float);
-            matmul_q8_0_f32_batch_wmma_onthefly_kernel<8,16,16,16><<<grid, 256u, shmem>>>(
-                    (float *)out->ptr,
-                    reinterpret_cast<const unsigned char *>(wptr),
-                    (const float *)x->ptr,
-                    (uint32_t)n_tok,
-                    (uint32_t)in_dim,
-                    (uint32_t)out_dim,
-                    blocks * 34u);
+            if (tiles_n == 4u) {
+                matmul_q8_0_f32_batch_wmma_onthefly_kernel<4,16,16,16><<<grid, 128u, shmem>>>(
+                        (float *)out->ptr,
+                        reinterpret_cast<const unsigned char *>(wptr),
+                        (const float *)x->ptr,
+                        (uint32_t)n_tok,
+                        (uint32_t)in_dim,
+                        (uint32_t)out_dim,
+                        blocks * 34u);
+            } else if (tiles_n == 16u) {
+                matmul_q8_0_f32_batch_wmma_onthefly_kernel<16,16,16,16><<<grid, 512u, shmem>>>(
+                        (float *)out->ptr,
+                        reinterpret_cast<const unsigned char *>(wptr),
+                        (const float *)x->ptr,
+                        (uint32_t)n_tok,
+                        (uint32_t)in_dim,
+                        (uint32_t)out_dim,
+                        blocks * 34u);
+            } else {
+                matmul_q8_0_f32_batch_wmma_onthefly_kernel<8,16,16,16><<<grid, 256u, shmem>>>(
+                        (float *)out->ptr,
+                        reinterpret_cast<const unsigned char *>(wptr),
+                        (const float *)x->ptr,
+                        (uint32_t)n_tok,
+                        (uint32_t)in_dim,
+                        (uint32_t)out_dim,
+                        blocks * 34u);
+            }
             return cuda_ok(cudaGetLastError(), "matmul_q8_0 f32 batch wmma onfly launch");
         }
 #endif
