@@ -283,6 +283,58 @@ static void log_context_memory(ds4_backend backend, int ctx_size) {
             m.comp_cap);
 }
 
+typedef struct {
+    FILE *fp;
+    uint64_t len;
+} bench_snapshot;
+
+static int bench_snapshot_save(ds4_session *s, bench_snapshot *snap, char *err, size_t errlen) {
+    if (snap->fp) {
+        fclose(snap->fp);
+        snap->fp = NULL;
+    }
+    snap->fp = tmpfile();
+    if (!snap->fp) {
+        snprintf(err, errlen, "failed to create temporary snapshot file: %s", strerror(errno));
+        return 1;
+    }
+    snap->len = ds4_session_payload_bytes(s);
+    if (ds4_session_save_payload(s, snap->fp, err, errlen) != 0) return 1;
+    if (fflush(snap->fp) != 0) {
+        snprintf(err, errlen, "failed to flush temporary snapshot file: %s", strerror(errno));
+        return 1;
+    }
+    rewind(snap->fp);
+    return 0;
+}
+
+static int bench_snapshot_load(ds4_session *s, bench_snapshot *snap, char *err, size_t errlen) {
+    if (!snap->fp) {
+        snprintf(err, errlen, "no snapshot saved");
+        return 1;
+    }
+    rewind(snap->fp);
+    return ds4_session_load_payload(s, snap->fp, snap->len, err, errlen);
+}
+
+static void bench_snapshot_free(bench_snapshot *snap) {
+    if (snap->fp) fclose(snap->fp);
+    snap->fp = NULL;
+    snap->len = 0;
+}
+
+static int session_argmax_excluding(ds4_session *s, int excluded) {
+    ds4_token_score top[16];
+    int n = ds4_session_top_logprobs(s, top, (int)(sizeof(top) / sizeof(top[0])));
+    if (n > 0) {
+        for (int i = 0; i < n; i++) {
+            if (top[i].id != excluded) return top[i].id;
+        }
+    }
+    int token = ds4_session_argmax(s);
+    return token == excluded ? -1 : token;
+}
+
 int main(int argc, char **argv) {
     bench_config cfg = parse_options(argc, argv);
     log_context_memory(cfg.backend, cfg.ctx_alloc);
@@ -339,7 +391,7 @@ int main(int argc, char **argv) {
     fflush(out);
 
     const int eos = ds4_token_eos(engine);
-    ds4_session_snapshot snap = {0};
+    bench_snapshot snap = {0};
     char err[256];
     int previous = 0;
     int rc = 0;
@@ -361,7 +413,7 @@ int main(int argc, char **argv) {
         const double prefill_sec = prefill_t1 - prefill_t0;
         const int prefill_tokens = frontier - previous;
 
-        if (ds4_session_save_snapshot(session, &snap, err, sizeof(err)) != 0) {
+        if (bench_snapshot_save(session, &snap, err, sizeof(err)) != 0) {
             fprintf(stderr, "ds4-bench: snapshot at %d failed: %s\n", frontier, err);
             rc = 1;
             break;
@@ -374,7 +426,7 @@ int main(int argc, char **argv) {
                 rc = 1;
                 break;
             }
-            const int token = ds4_session_argmax_excluding(session, eos);
+            const int token = session_argmax_excluding(session, eos);
             if (token < 0) {
                 fprintf(stderr, "ds4-bench: failed to choose non-EOS token at frontier %d\n", frontier);
                 rc = 1;
@@ -389,7 +441,7 @@ int main(int argc, char **argv) {
         const double gen_t1 = bench_now_sec();
         if (rc != 0) break;
 
-        if (ds4_session_load_snapshot(session, &snap, err, sizeof(err)) != 0) {
+        if (bench_snapshot_load(session, &snap, err, sizeof(err)) != 0) {
             fprintf(stderr, "ds4-bench: restore at %d failed: %s\n", frontier, err);
             rc = 1;
             break;
@@ -411,7 +463,7 @@ int main(int argc, char **argv) {
     }
 
     if (out != stdout) fclose(out);
-    ds4_session_snapshot_free(&snap);
+    bench_snapshot_free(&snap);
     ds4_session_free(session);
     ds4_tokens_free(&prompt);
     ds4_engine_close(engine);
