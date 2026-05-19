@@ -44,6 +44,7 @@ Environment:
   DS4_SERVER_Q8_REPACK=1         Opt-in eager q_b Q8_0 repack for decode; uses ~1.43 GiB VRAM
   DS4_SERVER_Q8_REPACK_SPLIT16=1 Opt-in split-major Q8_0 repack for attn_output/shared-down; uses ~3.2 GiB VRAM
   DS4_SERVER_Q8_WMMA_FAST=1      Opt-in q-side FP16 Q8 WMMA prefill path; uses ~3.35 GiB VRAM
+                                Enabled by DS4_SERVER_FAST_FULL=1.
   DS4_SERVER_Q8_HIPBLASLT=1      Opt-in q-side hipBLASLt xsplit path for small prefill batches
   DS4_SERVER_Q8_HIPBLASLT_MAX_TOKENS=N  Max batch routed to hipBLASLt; default 256
   DS4_SERVER_MOE_EXPERT_BATCH=1  Experimental expert-bucketed Q2_K MoE for faster prefill
@@ -58,9 +59,9 @@ Environment:
   DS4_SERVER_MOE_Q8K_DOWN_LAYERS=LIST Restrict Q8_K down to layers/ranges; overrides >=43 default
   DS4_SERVER_MOE_Q8K_DOWN_DIRECT=1    Use slower direct sum6 Q8_K-down variant instead of expert-batched
   DS4_SERVER_MOE_Q8K_DOWN_TILE=4|8|16 Expert-batched Q8_K-down pair tile; default 4
-  DS4_SERVER_MOE_WMMA_HOT=1      Opt-in hot-bucket Q2_K WMMA MoE path; first-token/perf experimental, multi-token greedy drift observed
-  DS4_SERVER_MOE_WMMA_GATE_HOT=N Gate/up WMMA bucket threshold; default 128
-  DS4_SERVER_MOE_WMMA_DOWN_HOT=N Down WMMA bucket threshold; default 64
+  DS4_SERVER_MOE_WMMA_HOT=1      Opt-in hot-bucket Q2_K WMMA MoE path. Enabled by DS4_SERVER_FAST_FULL=1.
+  DS4_SERVER_MOE_WMMA_GATE_HOT=N Gate/up WMMA bucket threshold; FAST_FULL default 16
+  DS4_SERVER_MOE_WMMA_DOWN_HOT=N Down WMMA bucket threshold; FAST_FULL default 16
   DS4_SERVER_MOE_WMMA_LAYERS=LIST Restrict WMMA to layers/ranges, e.g. 14-42; diagnostic/experimental
   DS4_SERVER_COPY_MODEL=1        Copy GGUF tensor payload to HIP allocation using staged chunks
   DS4_SERVER_COPY_MODEL_CHUNK_MB=256  Staged full-copy chunk size
@@ -119,6 +120,10 @@ if [[ "${DS4_SERVER_FAST_FULL:-0}" == "1" ]]; then
   export DS4_SERVER_MOE_EXPERT_SHARED_MID="${DS4_SERVER_MOE_EXPERT_SHARED_MID:-1}"
   export DS4_SERVER_Q8_REPACK="${DS4_SERVER_Q8_REPACK:-1}"
   export DS4_SERVER_Q8_REPACK_SPLIT16="${DS4_SERVER_Q8_REPACK_SPLIT16:-1}"
+  export DS4_SERVER_Q8_WMMA_FAST="${DS4_SERVER_Q8_WMMA_FAST:-1}"
+  export DS4_SERVER_MOE_WMMA_HOT="${DS4_SERVER_MOE_WMMA_HOT:-1}"
+  export DS4_SERVER_MOE_WMMA_GATE_HOT="${DS4_SERVER_MOE_WMMA_GATE_HOT:-16}"
+  export DS4_SERVER_MOE_WMMA_DOWN_HOT="${DS4_SERVER_MOE_WMMA_DOWN_HOT:-16}"
 fi
 
 if [[ ! -f "$MODEL" ]]; then
