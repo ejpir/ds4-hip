@@ -226,7 +226,14 @@ packed FP16 scratch buffer and accumulates B by group, avoiding the unpack and
 second activation conversion. Combined with the MoE WMMA and attention-output
 hipBLAS opt-ins it reached `89.71 tok/s` zero-copy under stage profiling and
 `91.82 tok/s` with `DS4_CUDA_COPY_MODEL=1`; forced-stream quality passes at
-`/tmp/ds4_rocm_quality_packed_attnout_b`. Forced-stream quality also passes at
+`/tmp/ds4_rocm_quality_packed_attnout_b`. On the current upstream-shaped ROCm
+path, `DS4_CUDA_ATTENTION_OUTPUT_INTERLEAVED_B_CUBLAS=1` plus
+`DS4_CUDA_ATTENTION_OUTPUT_TRANSPOSED_B_CUBLAS=1` stores the attention-output B
+FP16 cache in hipBLAS-friendly column-major form for the one-shot interleaved B
+GEMM; with the Q8 WMMA, MoE WMMA, shared gate/up, and shared-down opt-ins this
+pushes `/tmp/prompt1741.txt --ctx 4096 -n 1` to about `102-104 tok/s`, with
+forced-stream quality at `/tmp/ds4_rocm_quality_transposed_attnout_b_direct`.
+Forced-stream quality also passes at
 `/tmp/ds4_rocm_quality_rowwise_downn2_default`, but exact greedy near-ties move
 more, so keep the fast ROCm profile opt-in. For follow-up profiling, `DS4_CUDA_MOE_PROFILE=1`
 now splits the Q2_K expert-batch path into bucket/gate-scalar/gate-WMMA,
