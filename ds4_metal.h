@@ -35,6 +35,7 @@
 #define ds4_metal_dsv4_topk_mask_tensor ds4_gpu_dsv4_topk_mask_tensor
 #define ds4_metal_matmul_q8_0_tensor ds4_gpu_matmul_q8_0_tensor
 #define ds4_metal_shared_gate_up_swiglu_q8_0_tensor ds4_gpu_shared_gate_up_swiglu_q8_0_tensor
+#define ds4_metal_shared_gate_up_swiglu_q8_0_batch_tensor ds4_gpu_shared_gate_up_swiglu_q8_0_batch_tensor
 #define ds4_metal_matmul_f16_tensor ds4_gpu_matmul_f16_tensor
 #define ds4_metal_matmul_f16_pair_tensor ds4_gpu_matmul_f16_pair_tensor
 #define ds4_metal_matmul_f32_tensor ds4_gpu_matmul_f32_tensor
@@ -232,6 +233,19 @@ int ds4_metal_shared_gate_up_swiglu_q8_0_tensor(
         uint64_t                in_dim,
         uint64_t                out_dim,
         const ds4_metal_tensor *x);
+
+int ds4_metal_shared_gate_up_swiglu_q8_0_batch_tensor(
+        ds4_metal_tensor       *gate,
+        ds4_metal_tensor       *up,
+        ds4_metal_tensor       *mid,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                gate_offset,
+        uint64_t                up_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_metal_tensor *x,
+        uint64_t                n_tok);
 
 int ds4_metal_matmul_f16_tensor(
         ds4_metal_tensor       *out,

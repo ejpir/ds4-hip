@@ -443,6 +443,94 @@ __global__ static void matmul_q8_0_f32_batch_warp8_kernel(
 }
 
 template <uint32_t TOK_TILE, uint32_t BLOCKS_TILE>
+__global__ static void shared_gate_up_swiglu_q8_0_batch_sharedx_w32_kernel(
+        float *gate,
+        float *up,
+        float *mid,
+        const unsigned char *wg,
+        const unsigned char *wu,
+        const float *x,
+        uint32_t n_blocks,
+        uint32_t out_dim,
+        uint32_t n_tok,
+        uint64_t row_bytes,
+        int store_gate_up) {
+    extern __shared__ float shx[];
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t wave = tid >> 5u;
+    const uint32_t rows_per_block = blockDim.x >> 5u;
+    const uint32_t row = blockIdx.x * rows_per_block + wave;
+    const uint32_t t0 = blockIdx.y * TOK_TILE;
+    if (t0 >= n_tok) return;
+    const bool row_valid = row < out_dim;
+    const unsigned char *wgr = wg + (uint64_t)(row_valid ? row : 0u) * row_bytes;
+    const unsigned char *wur = wu + (uint64_t)(row_valid ? row : 0u) * row_bytes;
+    const uint32_t in_dim = n_blocks << 5u;
+    float accg[TOK_TILE];
+    float accu[TOK_TILE];
+#pragma unroll
+    for (uint32_t u = 0; u < TOK_TILE; u++) {
+        accg[u] = 0.0f;
+        accu[u] = 0.0f;
+    }
+
+    for (uint32_t b0 = 0; b0 < n_blocks; b0 += BLOCKS_TILE) {
+        const uint32_t b_count = ((b0 + BLOCKS_TILE) <= n_blocks) ? BLOCKS_TILE : (n_blocks - b0);
+        for (uint32_t j = tid; j < TOK_TILE * BLOCKS_TILE * 32u; j += blockDim.x) {
+            const uint32_t u = j / (BLOCKS_TILE * 32u);
+            const uint32_t r = j - u * (BLOCKS_TILE * 32u);
+            const uint32_t bb = r >> 5u;
+            const uint32_t k = r & 31u;
+            const uint32_t t = t0 + u;
+            shx[j] = (t < n_tok && bb < b_count)
+                ? x[(uint64_t)t * in_dim + ((uint64_t)(b0 + bb) << 5u) + k]
+                : 0.0f;
+        }
+        __syncthreads();
+        if (row_valid) {
+            for (uint32_t bb = 0; bb < b_count; bb++) {
+                const unsigned char *bg = wgr + (uint64_t)(b0 + bb) * 34u;
+                const unsigned char *bu = wur + (uint64_t)(b0 + bb) * 34u;
+                const float dg = q8_0_scale_broadcast_w32(bg);
+                const float du = q8_0_scale_broadcast_w32(bu);
+                const float wvg = dg * (float)((const int8_t *)(bg + 2u))[lane];
+                const float wvu = du * (float)((const int8_t *)(bu + 2u))[lane];
+#pragma unroll
+                for (uint32_t u = 0; u < TOK_TILE; u++) {
+                    const float xv = shx[(u * BLOCKS_TILE + bb) * 32u + lane];
+                    accg[u] += wvg * xv;
+                    accu[u] += wvu * xv;
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (uint32_t u = 0; u < TOK_TILE; u++) {
+        accg[u] = warp_sum_f32(accg[u]);
+        accu[u] = warp_sum_f32(accu[u]);
+    }
+    if (lane == 0u && row_valid) {
+#pragma unroll
+        for (uint32_t u = 0; u < TOK_TILE; u++) {
+            const uint32_t t = t0 + u;
+            if (t < n_tok) {
+                const uint64_t off = (uint64_t)t * out_dim + row;
+                const float g = accg[u];
+                const float uv = accu[u];
+                if (store_gate_up) {
+                    gate[off] = g;
+                    up[off] = uv;
+                }
+                mid[off] = (g / (1.0f + expf(-g))) * uv;
+            }
+        }
+    }
+}
+
+template <uint32_t TOK_TILE, uint32_t BLOCKS_TILE>
 __global__ static void matmul_q8_0_f32_batch_sharedx_warp_rows_w32_toktile_kernel(
         float *out,
         const unsigned char *w,

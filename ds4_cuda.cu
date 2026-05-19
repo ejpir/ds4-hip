@@ -6383,6 +6383,67 @@ extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
                                         up_offset, in_dim, out_dim, x, 1) &&
            ds4_gpu_swiglu_tensor(mid, gate, up, (uint32_t)out_dim, 0.0f, 1.0f);
 }
+extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_batch_tensor(
+        ds4_gpu_tensor       *gate,
+        ds4_gpu_tensor       *up,
+        ds4_gpu_tensor       *mid,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                gate_offset,
+        uint64_t                up_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                n_tok) {
+    if (!gate || !up || !mid || !model_map || !x || n_tok == 0 ||
+        (in_dim & 31u) != 0u || in_dim > UINT32_MAX || out_dim > UINT32_MAX || n_tok > UINT32_MAX ||
+        x->bytes < n_tok * in_dim * sizeof(float) ||
+        gate->bytes < n_tok * out_dim * sizeof(float) ||
+        up->bytes < n_tok * out_dim * sizeof(float) ||
+        mid->bytes < n_tok * out_dim * sizeof(float)) {
+        return 0;
+    }
+    const uint64_t blocks = (in_dim + 31u) / 32u;
+    const uint64_t row_bytes = blocks * 34u;
+    const uint64_t weight_bytes = out_dim * row_bytes;
+    if (gate_offset > model_size || up_offset > model_size ||
+        weight_bytes > model_size - gate_offset || weight_bytes > model_size - up_offset) {
+        return 0;
+    }
+    const char *wg = cuda_model_range_ptr(model_map, gate_offset, weight_bytes, "shared_gate_q8_batch");
+    const char *wu = cuda_model_range_ptr(model_map, up_offset, weight_bytes, "shared_up_q8_batch");
+    if (!wg || !wu) return 0;
+
+    uint32_t rows_per_block = cuda_parse_u32_env_alias("DS4_CUDA_SHARED_GATE_UP_BATCH_RPB", "DS4_HIP_SHARED_GATE_UP_BATCH_RPB", 32u, 1u, 32u);
+    if (rows_per_block == 0u) rows_per_block = 32u;
+    const uint32_t tile = cuda_q8_tile_env("DS4_CUDA_SHARED_GATE_UP_BATCH_TILE", "DS4_HIP_SHARED_GATE_UP_BATCH_TILE", 16u);
+    const uint32_t block_tile = cuda_q8_block_tile_env("DS4_CUDA_SHARED_GATE_UP_BATCH_SHARED_X_BLOCKS", "DS4_HIP_SHARED_GATE_UP_BATCH_SHARED_X_BLOCKS", 16u, tile);
+    const dim3 grid((uint32_t)((out_dim + rows_per_block - 1u) / rows_per_block),
+                    (uint32_t)((n_tok + tile - 1u) / tile),
+                    1u);
+    const size_t shmem = (size_t)tile * block_tile * 32u * sizeof(float);
+    const int store_gate_up = (g_quality_mode || getenv("DS4_METAL_GRAPH_DUMP_PREFIX") != NULL) ? 1 : 0;
+#define DS4_LAUNCH_SHARED_GU_BATCH(TT, BT) \
+    shared_gate_up_swiglu_q8_0_batch_sharedx_w32_kernel<TT, BT><<<grid, rows_per_block * 32u, shmem>>>( \
+            (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr, \
+            reinterpret_cast<const unsigned char *>(wg), reinterpret_cast<const unsigned char *>(wu), \
+            (const float *)x->ptr, (uint32_t)blocks, (uint32_t)out_dim, (uint32_t)n_tok, row_bytes, store_gate_up)
+    if (tile == 8u) {
+        if (block_tile == 8u) { DS4_LAUNCH_SHARED_GU_BATCH(8u, 8u); }
+        else if (block_tile == 32u) { DS4_LAUNCH_SHARED_GU_BATCH(8u, 32u); }
+        else { DS4_LAUNCH_SHARED_GU_BATCH(8u, 16u); }
+    } else if (tile == 32u) {
+        if (block_tile == 8u) { DS4_LAUNCH_SHARED_GU_BATCH(32u, 8u); }
+        else if (block_tile == 32u) { DS4_LAUNCH_SHARED_GU_BATCH(32u, 32u); }
+        else { DS4_LAUNCH_SHARED_GU_BATCH(32u, 16u); }
+    } else {
+        if (block_tile == 8u) { DS4_LAUNCH_SHARED_GU_BATCH(16u, 8u); }
+        else if (block_tile == 32u) { DS4_LAUNCH_SHARED_GU_BATCH(16u, 32u); }
+        else { DS4_LAUNCH_SHARED_GU_BATCH(16u, 16u); }
+    }
+#undef DS4_LAUNCH_SHARED_GU_BATCH
+    return cuda_ok(cudaGetLastError(), "shared gate/up fused q8 batch launch");
+}
 extern "C" int ds4_gpu_add_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *a, const ds4_gpu_tensor *b, uint32_t n) {
     if (!out || !a || !b ||
         out->bytes < (uint64_t)n * sizeof(float) ||

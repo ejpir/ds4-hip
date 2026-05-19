@@ -13116,22 +13116,41 @@ static bool metal_graph_encode_layer_ffn_batch(
                                       (uint64_t)n_tokens * DS4_N_EMBD, il, pos0);
     }
     DS4_METAL_PROFILE_FFN_STAGE("routed_moe");
-    if (ok) ok = ds4_metal_matmul_q8_0_tensor(g->batch_shared_gate,
-                                              model->map,
-                                              model->size,
-                                              layer->ffn_gate_shexp->abs_offset,
-                                              DS4_N_EMBD,
-                                              shared_dim,
-                                              g->batch_ffn_norm,
-                                              n_tokens) != 0;
-    if (ok) ok = ds4_metal_matmul_q8_0_tensor(g->batch_shared_up,
-                                              model->map,
-                                              model->size,
-                                              layer->ffn_up_shexp->abs_offset,
-                                              DS4_N_EMBD,
-                                              shared_dim,
-                                              g->batch_ffn_norm,
-                                              n_tokens) != 0;
+    bool shared_gate_up_fused_batch = false;
+#ifdef DS4_USE_GPU_API
+    if (ok && getenv("DS4_CUDA_SHARED_GATE_UP_BATCH_FUSED") != NULL) {
+        ok = ds4_metal_shared_gate_up_swiglu_q8_0_batch_tensor(g->batch_shared_gate,
+                                                               g->batch_shared_up,
+                                                               g->batch_shared_mid,
+                                                               model->map,
+                                                               model->size,
+                                                               layer->ffn_gate_shexp->abs_offset,
+                                                               layer->ffn_up_shexp->abs_offset,
+                                                               DS4_N_EMBD,
+                                                               shared_dim,
+                                                               g->batch_ffn_norm,
+                                                               n_tokens) != 0;
+        shared_gate_up_fused_batch = ok;
+    }
+#endif
+    if (!shared_gate_up_fused_batch) {
+        if (ok) ok = ds4_metal_matmul_q8_0_tensor(g->batch_shared_gate,
+                                                  model->map,
+                                                  model->size,
+                                                  layer->ffn_gate_shexp->abs_offset,
+                                                  DS4_N_EMBD,
+                                                  shared_dim,
+                                                  g->batch_ffn_norm,
+                                                  n_tokens) != 0;
+        if (ok) ok = ds4_metal_matmul_q8_0_tensor(g->batch_shared_up,
+                                                  model->map,
+                                                  model->size,
+                                                  layer->ffn_up_shexp->abs_offset,
+                                                  DS4_N_EMBD,
+                                                  shared_dim,
+                                                  g->batch_ffn_norm,
+                                                  n_tokens) != 0;
+    }
     DS4_METAL_PROFILE_FFN_STAGE("shared_gate_up");
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_shexp_gate", g->batch_shared_gate,
@@ -13139,12 +13158,14 @@ static bool metal_graph_encode_layer_ffn_batch(
         metal_graph_debug_dump_tensor("ffn_shexp_up", g->batch_shared_up,
                                       (uint64_t)n_tokens * shared_dim, il, pos0);
     }
-    if (ok) ok = ds4_metal_swiglu_tensor(g->batch_shared_mid,
-                                         g->batch_shared_gate,
-                                         g->batch_shared_up,
-                                         (uint32_t)((uint64_t)n_tokens * shared_dim),
-                                         0.0f,
-                                         1.0f) != 0;
+    if (ok && !shared_gate_up_fused_batch) {
+        ok = ds4_metal_swiglu_tensor(g->batch_shared_mid,
+                                     g->batch_shared_gate,
+                                     g->batch_shared_up,
+                                     (uint32_t)((uint64_t)n_tokens * shared_dim),
+                                     0.0f,
+                                     1.0f) != 0;
+    }
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_shexp_mid", g->batch_shared_mid,
                                       (uint64_t)n_tokens * shared_dim, il, pos0);

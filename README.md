@@ -235,7 +235,12 @@ attention-output A/B time, and the CUDA-port Q8 batch tile knobs mirror HIP
 (`DS4_CUDA_Q8_BATCH_TILE`, `DS4_CUDA_Q8_BATCH_SHARED_X_BLOCKS`,
 `DS4_CUDA_Q8_GROUPED_BATCH_TILE`, `DS4_CUDA_Q8_GROUPED_BATCH_SHARED_X_BLOCKS`).
 `DS4_CUDA_ATTN_Q_B_CUBLAS=1` and `DS4_CUDA_SHARED_EXPERT_CUBLAS=1` are available
-as targeted q-path/shared-expert diagnostics.
+as targeted q-path/shared-expert diagnostics. A custom opt-in shared-expert
+batch gate/up+SwiGLU fusion, `DS4_CUDA_SHARED_GATE_UP_BATCH_FUSED=1`, avoids the
+separate gate/up writes in normal prefill (`DS4_CUDA_SHARED_GATE_UP_BATCH_TILE`
+and `DS4_CUDA_SHARED_GATE_UP_BATCH_SHARED_X_BLOCKS` tune it); forced-stream
+quality passes at `/tmp/ds4_rocm_quality_shared_gateup_fused`, but the total
+prefill win is small/noisy so it is not part of the default fast recipe.
 
 For the fastest currently measured long-prompt prefill smoke test, add the
 experimental hot-bucket Q2_K MoE WMMA path on top of the fast profile:
