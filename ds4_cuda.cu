@@ -4023,8 +4023,9 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
             n_tok >= cuda_parse_u32_env_alias("DS4_CUDA_Q8_WMMA_MIN_TOKENS", "DS4_HIP_Q8_WMMA_MIN_TOKENS", 2u, 1u, 65535u) &&
             in_dim <= UINT32_MAX && out_dim <= UINT32_MAX && n_tok <= UINT32_MAX) {
             constexpr uint32_t bm = 16u, bn = 16u, bk = 16u;
-            uint32_t tiles_n = cuda_parse_u32_env_alias("DS4_CUDA_Q8_WMMA_TILES_N", "DS4_HIP_Q8_WMMA_TILES_N", 32u, 4u, 32u);
-            if (tiles_n != 4u && tiles_n != 8u && tiles_n != 16u && tiles_n != 32u) tiles_n = 32u;
+            const uint32_t tiles_n_default = (out_dim >= 8192u) ? 32u : 16u;
+            uint32_t tiles_n = cuda_parse_u32_env_alias("DS4_CUDA_Q8_WMMA_TILES_N", "DS4_HIP_Q8_WMMA_TILES_N", tiles_n_default, 4u, 32u);
+            if (tiles_n != 4u && tiles_n != 8u && tiles_n != 16u && tiles_n != 32u) tiles_n = tiles_n_default;
             const dim3 grid((uint32_t)((out_dim + tiles_n * bn - 1u) / (tiles_n * bn)),
                             (uint32_t)((n_tok + bm - 1u) / bm),
                             1u);
