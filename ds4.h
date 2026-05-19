@@ -15,11 +15,13 @@
  * header narrow so HTTP/CLI code does not depend on tensor internals. */
 
 typedef enum {
-    DS4_BACKEND_METAL,
+    DS4_BACKEND_GPU,
     DS4_BACKEND_CPU,
-    /* Upstream names the GPU backend CUDA; this HIP/ROCm fork routes that
-     * public option through the existing GPU backend abstraction. */
-    DS4_BACKEND_CUDA = DS4_BACKEND_METAL,
+    /* Compatibility names accepted by upstream/fork code.  They refer to the
+     * same logical GPU backend; the actual implementation is selected at build
+     * time (Metal on macOS, HIP/ROCm in this fork, CUDA upstream). */
+    DS4_BACKEND_METAL = DS4_BACKEND_GPU,
+    DS4_BACKEND_CUDA = DS4_BACKEND_GPU,
 } ds4_backend;
 
 typedef enum {

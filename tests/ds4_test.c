@@ -19,7 +19,7 @@ static ds4_engine *test_get_engine(bool quality) {
 
     ds4_engine_options opt = {
         .model_path = test_model_path(),
-        .backend = DS4_BACKEND_METAL,
+        .backend = DS4_BACKEND_GPU,
         .quality = quality,
     };
     TEST_ASSERT(ds4_engine_open(slot, &opt) == 0);

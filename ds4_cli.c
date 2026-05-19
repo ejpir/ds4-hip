@@ -89,14 +89,14 @@ static void usage(FILE *fp) {
         "      Minimum recursive-draft confidence for the fast N=2 verifier. Default: 3\n"
         "  -c, --ctx N\n"
         "      Context size allocated for the session. Default: 32768\n"
-        "  --metal\n"
+        "  --gpu\n"
         "      Use the GPU graph backend. On Linux HIP builds, this selects HIP; on macOS, Metal. Default.\n"
-        "  --hip\n"
-        "      Alias for --metal on HIP builds.\n"
+        "  --metal | --hip | --cuda\n"
+        "      Compatibility aliases for --gpu where applicable.\n"
         "  --cpu\n"
         "      Use the CPU reference/debug backend. Not recommended for normal inference.\n"
         "  --backend NAME\n"
-        "      Select backend explicitly: hip/metal or cpu. Default: GPU backend\n"
+        "      Select backend explicitly: gpu/hip/metal/cuda or cpu. Default: GPU backend\n"
         "  -t, --threads N\n"
         "      CPU helper threads for host-side or reference work.\n"
         "  --quality\n"
@@ -170,7 +170,7 @@ static void usage(FILE *fp) {
         "  ./ds4 --think-max --prompt-file prompt.txt --ctx 393216\n"
         "\n"
         "Notes:\n"
-        "  The CLI keeps KV cache state across interactive turns on the Metal backend.\n"
+        "  The CLI keeps KV cache state across interactive turns on the GPU backend.\n"
         "  Long added input is processed with batched prefill; short continuations use decode.\n"
         "  Startup prints the extra context-buffer memory for the selected context size.\n"
         "\n"
@@ -209,16 +209,18 @@ static float parse_float_range(const char *s, const char *opt, float min, float 
 }
 
 static ds4_backend parse_backend(const char *s) {
-    if (!strcmp(s, "metal")) return DS4_BACKEND_METAL;
+    if (!strcmp(s, "gpu")) return DS4_BACKEND_GPU;
+    if (!strcmp(s, "metal")) return DS4_BACKEND_GPU;
+    if (!strcmp(s, "cuda")) return DS4_BACKEND_GPU;
 #ifdef DS4_USE_HIP
-    if (!strcmp(s, "hip")) return DS4_BACKEND_METAL;
+    if (!strcmp(s, "hip")) return DS4_BACKEND_GPU;
 #endif
     if (!strcmp(s, "cpu")) return DS4_BACKEND_CPU;
     fprintf(stderr, "ds4: invalid backend: %s\n", s);
 #ifdef DS4_USE_HIP
-    fprintf(stderr, "ds4: valid backends are: hip, metal, cpu\n");
+    fprintf(stderr, "ds4: valid backends are: gpu, hip, metal, cuda, cpu\n");
 #else
-    fprintf(stderr, "ds4: valid backends are: metal, cpu\n");
+    fprintf(stderr, "ds4: valid backends are: gpu, metal, cuda, cpu\n");
 #endif
     exit(2);
 }
@@ -443,7 +445,7 @@ static void build_prompt(ds4_engine *engine, const cli_generation_options *gen, 
 static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, const ds4_tokens *prompt) {
     ds4_session *session = NULL;
     if (ds4_session_create(&session, engine, cfg->gen.ctx_size) != 0) {
-        fprintf(stderr, "ds4: sampled CLI generation requires the Metal session backend\n");
+        fprintf(stderr, "ds4: sampled CLI generation requires the GPU session backend\n");
         return 1;
     }
 
@@ -679,7 +681,7 @@ static bool load_forced_tokens_file(const char *path, ds4_tokens *out) {
 static int run_logprob_dump(ds4_engine *engine, const cli_config *cfg, const ds4_tokens *prompt) {
     ds4_session *session = NULL;
     if (ds4_session_create(&session, engine, cfg->gen.ctx_size) != 0) {
-        fprintf(stderr, "ds4: --dump-logprobs requires the Metal session backend\n");
+        fprintf(stderr, "ds4: --dump-logprobs requires the GPU session backend\n");
         return 1;
     }
 
@@ -937,7 +939,7 @@ static void repl_chat_apply_max_prefix(ds4_engine *engine, repl_chat *chat, bool
 static int repl_chat_create_session(ds4_engine *engine, repl_chat *chat, int ctx_size) {
     ds4_session *session = NULL;
     if (ds4_session_create(&session, engine, ctx_size) != 0) {
-        fprintf(stderr, "ds4: interactive chat KV cache requires the Metal backend\n");
+        fprintf(stderr, "ds4: interactive chat KV cache requires the GPU backend\n");
         return 1;
     }
     if (chat->session) ds4_session_free(chat->session);
@@ -1259,7 +1261,7 @@ static cli_config parse_options(int argc, char **argv) {
     cli_config c = {
         .engine = {
             .model_path = "ds4flash.gguf",
-            .backend = DS4_BACKEND_METAL,
+            .backend = DS4_BACKEND_GPU,
             .mtp_draft_tokens = 1,
             .mtp_margin = 3.0f,
         },
@@ -1324,8 +1326,9 @@ static cli_config parse_options(int argc, char **argv) {
             c.engine.backend = parse_backend(need_arg(&i, argc, argv, arg));
         } else if (!strcmp(arg, "--cpu")) {
             c.engine.backend = DS4_BACKEND_CPU;
-        } else if (!strcmp(arg, "--metal") || !strcmp(arg, "--hip")) {
-            c.engine.backend = DS4_BACKEND_METAL;
+        } else if (!strcmp(arg, "--gpu") || !strcmp(arg, "--metal") ||
+                   !strcmp(arg, "--hip") || !strcmp(arg, "--cuda")) {
+            c.engine.backend = DS4_BACKEND_GPU;
         } else if (!strcmp(arg, "--dump-tokens")) {
             c.gen.dump_tokens = true;
         } else if (!strcmp(arg, "--dump-logprobs")) {
@@ -1346,13 +1349,13 @@ static cli_config parse_options(int argc, char **argv) {
             c.gen.first_token_test = true;
         } else if (!strcmp(arg, "--metal-graph-test")) {
             c.gen.metal_graph_test = true;
-            c.engine.backend = DS4_BACKEND_METAL;
+            c.engine.backend = DS4_BACKEND_GPU;
         } else if (!strcmp(arg, "--metal-graph-full-test")) {
             c.gen.metal_graph_full_test = true;
-            c.engine.backend = DS4_BACKEND_METAL;
+            c.engine.backend = DS4_BACKEND_GPU;
         } else if (!strcmp(arg, "--metal-graph-prompt-test")) {
             c.gen.metal_graph_prompt_test = true;
-            c.engine.backend = DS4_BACKEND_METAL;
+            c.engine.backend = DS4_BACKEND_GPU;
         } else if (!strcmp(arg, "--metal-graph-generate")) {
             fprintf(stderr, "ds4: --metal-graph-generate was removed; --metal is the graph path\n");
             exit(2);

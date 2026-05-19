@@ -10342,6 +10342,7 @@ static bool metal_graph_encode_decode_layer(
         !g->quality &&
         getenv("DS4_METAL_DISABLE_SHARED_GATE_UP_SWIGLU_FUSION") == NULL;
     if (ok && fuse_shared_gate_up) {
+#ifdef DS4_USE_GPU_API
         ok = ds4_metal_shared_gate_up_swiglu_q8_0_tensor(g->shared_gate,
                                                          g->shared_up,
                                                          g->shared_mid,
@@ -10353,6 +10354,18 @@ static bool metal_graph_encode_decode_layer(
                                                          shared_dim,
                                                          g->ffn_norm,
                                                          DS4_SWIGLU_CLAMP_EXP) != 0;
+#else
+        ok = ds4_metal_shared_gate_up_swiglu_q8_0_tensor(g->shared_gate,
+                                                         g->shared_up,
+                                                         g->shared_mid,
+                                                         model->map,
+                                                         model->size,
+                                                         layer->ffn_gate_shexp->abs_offset,
+                                                         layer->ffn_up_shexp->abs_offset,
+                                                         DS4_N_EMBD,
+                                                         shared_dim,
+                                                         g->ffn_norm) != 0;
+#endif
     } else {
         if (ok) ok = ds4_metal_matmul_q8_0_tensor(g->shared_gate, model->map, model->size,
                                                   layer->ffn_gate_shexp->abs_offset,
@@ -11246,7 +11259,7 @@ static int metal_graph_first_token_full_test(
  * Metal Release Decode and Prefill.
  * =========================================================================
  *
- * Everything below is the user-facing Metal backend.  It uses the same layer
+ * Everything below is the user-facing GPU backend.  It uses the same layer
  * encoder as diagnostics, but diagnostics are not required for normal command
  * flow and their CPU reads stay outside these generation entry points.
  */
@@ -14331,7 +14344,7 @@ ds4_context_memory ds4_context_memory_estimate(ds4_backend backend, int ctx_size
     ds4_context_memory m = {0};
     uint32_t ctx = ctx_size > 0 ? (uint32_t)ctx_size : 1u;
 
-    if (backend == DS4_BACKEND_METAL) {
+    if (backend == DS4_BACKEND_GPU) {
         m.prefill_cap = metal_graph_prefill_cap_for_prompt((int)ctx);
         m.raw_cap = metal_graph_raw_cap_for_context((int)ctx, m.prefill_cap);
 
@@ -15883,7 +15896,7 @@ ds4_context_memory ds4_context_memory_estimate(ds4_backend backend, int ctx_size
  */
 
 const char *ds4_backend_name(ds4_backend backend) {
-    return backend == DS4_BACKEND_METAL ? DS4_GPU_BACKEND_NAME : "cpu";
+    return backend == DS4_BACKEND_GPU ? DS4_GPU_BACKEND_NAME : "cpu";
 }
 
 bool ds4_think_mode_enabled(ds4_think_mode mode) {
@@ -16689,7 +16702,7 @@ int ds4_engine_generate_argmax(
     const ds4_vocab *vocab = &e->vocab;
     const ds4_weights *weights = &e->weights;
 
-    if (e->backend == DS4_BACKEND_METAL) {
+    if (e->backend == DS4_BACKEND_GPU) {
 #ifndef DS4_NO_METAL
         if (!e->metal_ready) {
             fprintf(stderr, "ds4: %s generation requested but backend is unavailable\n", DS4_GPU_BACKEND_LABEL);
@@ -16970,14 +16983,14 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     ds4_acquire_instance_lock();
 
     model_open(&e->model, opt->model_path,
-               opt->backend == DS4_BACKEND_METAL, true);
+               opt->backend == DS4_BACKEND_GPU, true);
     if (opt->warm_weights) model_warm_weights(&e->model);
     vocab_load(&e->vocab, &e->model);
     config_validate_model(&e->model);
     weights_bind(&e->weights, &e->model);
     if (opt->mtp_path && opt->mtp_path[0]) {
         model_open(&e->mtp_model, opt->mtp_path,
-                   opt->backend == DS4_BACKEND_METAL, true);
+                   opt->backend == DS4_BACKEND_GPU, true);
         mtp_weights_bind(&e->mtp_weights, &e->mtp_model);
         e->mtp_ready = true;
         fprintf(stderr, "ds4: MTP support model loaded: %s (draft=%d)\n",
@@ -16986,7 +16999,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     }
 
 #ifndef DS4_NO_METAL
-    if (e->backend == DS4_BACKEND_METAL) {
+    if (e->backend == DS4_BACKEND_GPU) {
         e->metal_ready = ds4_metal_init() != 0;
         if (!e->metal_ready) {
             fprintf(stderr, "ds4: %s backend unavailable; aborting startup\n", ds4_backend_name(e->backend));
@@ -17036,7 +17049,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         fprintf(stderr, "ds4: %s backend initialized for graph diagnostics\n", ds4_backend_name(e->backend));
     }
 #else
-    if (e->backend == DS4_BACKEND_METAL) {
+    if (e->backend == DS4_BACKEND_GPU) {
         fprintf(stderr, "ds4: %s backend requested but this build has no GPU backend support; aborting startup\n", ds4_backend_name(e->backend));
         ds4_engine_close(e);
         *out = NULL;
@@ -17073,7 +17086,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     (void)ctx_size;
     return 1;
 #else
-    if (e->backend != DS4_BACKEND_METAL || !e->metal_ready) return 1;
+    if (e->backend != DS4_BACKEND_GPU || !e->metal_ready) return 1;
 
     ds4_session *s = xcalloc(1, sizeof(*s));
     s->engine = e;
