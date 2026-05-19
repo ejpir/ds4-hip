@@ -10351,7 +10351,8 @@ static bool metal_graph_encode_decode_layer(
                                                          layer->ffn_up_shexp->abs_offset,
                                                          DS4_N_EMBD,
                                                          shared_dim,
-                                                         g->ffn_norm) != 0;
+                                                         g->ffn_norm,
+                                                         DS4_SWIGLU_CLAMP_EXP) != 0;
     } else {
         if (ok) ok = ds4_metal_matmul_q8_0_tensor(g->shared_gate, model->map, model->size,
                                                   layer->ffn_gate_shexp->abs_offset,
@@ -15341,6 +15342,14 @@ char *ds4_token_text(ds4_engine *e, int token, size_t *len) {
 
 int ds4_token_eos(ds4_engine *e) {
     return e->vocab.eos_id;
+}
+
+int ds4_token_user(ds4_engine *e) {
+    return e->vocab.user_id;
+}
+
+int ds4_token_assistant(ds4_engine *e) {
+    return e->vocab.assistant_id;
 }
 
 static int sample_argmax(const float *logits, uint32_t n_vocab) {

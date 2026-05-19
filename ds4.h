@@ -17,6 +17,9 @@
 typedef enum {
     DS4_BACKEND_METAL,
     DS4_BACKEND_CPU,
+    /* Upstream names the GPU backend CUDA; this HIP/ROCm fork routes that
+     * public option through the existing GPU backend abstraction. */
+    DS4_BACKEND_CUDA = DS4_BACKEND_METAL,
 } ds4_backend;
 
 typedef enum {
@@ -49,6 +52,10 @@ typedef struct {
     float logprob;
 } ds4_token_score;
 
+#define DS4_DEFAULT_TEMPERATURE 1.0f
+#define DS4_DEFAULT_TOP_P 1.0f
+#define DS4_DEFAULT_MIN_P 0.05f
+
 typedef struct ds4_engine ds4_engine;
 typedef struct ds4_session ds4_session;
 
@@ -63,6 +70,9 @@ typedef struct {
     float mtp_margin;
     bool warm_weights;
     bool quality;
+    const char *directional_steering_file;
+    float directional_steering_ffn;
+    float directional_steering_attn;
 } ds4_engine_options;
 
 typedef void (*ds4_token_emit_fn)(void *ud, int token);
@@ -125,6 +135,8 @@ void ds4_chat_append_assistant_prefix(ds4_engine *e, ds4_tokens *tokens, ds4_thi
 
 char *ds4_token_text(ds4_engine *e, int token, size_t *len);
 int ds4_token_eos(ds4_engine *e);
+int ds4_token_user(ds4_engine *e);
+int ds4_token_assistant(ds4_engine *e);
 
 int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size);
 void ds4_session_free(ds4_session *s);

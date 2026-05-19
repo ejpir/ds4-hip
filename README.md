@@ -1,17 +1,27 @@
-# ds4.c
+# DwarfStar 4
 
-`ds4.c` is a small native inference engine for DeepSeek V4 Flash. It is
+DwarfStar 4 is a small native inference engine specific for **DeepSeek V4 Flash**. It is
 intentionally narrow: not a generic GGUF runner, not a wrapper around another
-runtime, and not a framework. The main path is a DeepSeek V4 Flash-specific
-Metal graph executor with DS4-specific loading, prompt rendering, KV state, and
-server API glue.
+runtime: it is completely self-contained. Other than running the model in a
+correct and fast way, the project goal is to provide DS4 specific loading,
+prompt rendering, tool calling, KV state handling (RAM and on-disk), and server
+API, all ready to work with coding agents or with the provided CLI interface.
+There are also tools for GGUF and imatrix generation, and for quality and
+speed testing.
+
+We support the following backends:
+* **Metal** is our primary target. Starting from MacBooks with 96GB of RAM.
+* **NVIDIA CUDA** with special care for the DGX Spark.
+* **AMD ROCm** is only supported in the [rocm](https://github.com/antirez/ds4/tree/rocm) branch. It is kept separate from main since I (antirez) don't have direct hardware access, so the community rebases the branch as needed.
 
 This project would not exist without **llama.cpp and GGML**, make sure to read
 the acknowledgements section, a big thank you to Georgi Gerganov and all the
 other contributors.
 
+## Motivations
+
 Now, back at this project. Why we believe DeepSeek v4 Flash to be a pretty special
-model deserving a stand alone engine? Because after comparing it with powerful smaller
+model deserving a standalone engine? Because after comparing it with powerful smaller
 dense models, we can report that:
 
 1. DeepSeek v4 Flash is faster because of less active parameters.
@@ -20,16 +30,16 @@ dense models, we can report that:
 4. Being so large, it knows more things if you go sampling at the edge of knowledge. For instance asking about Italian show or political questions soon uncovers that 284B parameters are a lot more than 27B or 35B parameters.
 5. It writes much better English and Italian. It *feels* a quasi-frontier model.
 6. The KV cache is incredibly compressed, allowing long context inference on local computers and **on disk KV cache persistence**.
-7. It works well with 2-bit quantization, if quantized in a special way (read later). This allows to run it in MacBooks with 128GB of RAM.
+7. It works well with 2-bit quantization, if quantized in a special way (read later). This allows to run it in MacBooks with 128GB of RAM (and many people reported it working with 96GB as well, even at 250k context window!).
 8. We expect DeepSeek to release **updated versions of v4 Flash** in the future, even better than the current one.
 
 That said, a few important things about this project:
 
-* The local inference landscape contains many excellent projects, but new models are released continuously, and the attention immediately gets captured by the next model to implement. This project takes a deliberately narrow bet: one model at a time, official-vector validation (logits obtained with the official implementation), long-context tests, and enough agent integration to know if it really works. The exact model may change as the landscape evolves, but the constraint remains: local inference credible on high end personal machines or Mac Studios, starting from 128GB of memory.
+* The local inference landscape contains many excellent projects, but new models are released continuously, and the attention immediately gets captured by the next model to implement. This project takes a deliberately narrow bet: one model at a time, official-vector validation (logits obtained with the official implementation), long-context tests, and enough agent integration to know if it really works. The exact model may change as the landscape evolves, but the constraint remains: local inference credible on high end personal machines or Mac Studios, starting from 96/128GB of memory.
 * This software is developed with **strong assistance from GPT 5.5** and with humans leading the ideas, testing, and debugging. We say this openly because it shaped how the project was built. If you are not happy with AI-developed code, this software is not for you. The acknowledgement below is equally important: this would not exist without `llama.cpp` and GGML, largely written by hand.
 * This implementation is based on the idea that compressed KV caches like the one of DeepSeek v4 and the fast SSD disks of modern MacBooks should change our idea that KV cache belongs to RAM. **The KV cache is actually a first-class disk citizen**.
 * Our vision is that local inference should be a set of three things working well together, out of the box: A) inference engine with HTTP API + B) GGUF specially crafted to run well under a given engine and given assumptions + C) testing and validation with coding agents implementations. This inference engine only runs with the GGUF files provided. It gets tested against officially obtained logits at different context sizes. This project exists because we wanted to make one local model feel finished end to end, not just runnable. However this is just alpha quality code, so probably we are not still there.
-* The original fast path is **Metal** on Apple Silicon. This fork also includes a **Linux ROCm/HIP backend** for AMD GPUs. CUDA is not implemented. The CPU path is only for correctness check, but **warning: current macOS versions have a bug in the virtual memory implementation that will crash the kernel** if you try to run the CPU code. Remember? Software sucks. It was not possible to fix the CPU inference to avoid crashing, since each time you have to restart the computer, which is not funny. Help us, if you have the guts.
+* The optimized graph path targets **Metal on macOS** and **CUDA on Linux**. The CPU path is only for correctness checks and model/tokenizer diagnostics. For CPU-only Linux builds, use `make cpu`; it builds the normal `./ds4` and `./ds4-server` binaries without CUDA or Metal. On macOS, **warning: current macOS versions have a bug in the virtual memory implementation that will crash the kernel** if you try to run the CPU code. Remember? Software sucks. It was not possible to fix the CPU inference to avoid crashing, since each time you have to restart the computer, which is not funny. Help us, if you have the guts.
 
 ## Acknowledgements to llama.cpp and GGML
 
@@ -40,9 +50,41 @@ We are thankful and indebted to [`llama.cpp`](https://github.com/ggml-org/llama.
 and its contributors. Their implementation, kernels, tests, and design choices were
 an essential reference while building this DeepSeek V4 Flash-specific inference path.
 Some source-level pieces are retained or adapted here under the MIT license: GGUF
-quant layouts and tables, CPU quant/dot logic, and certain Metal kernels. For this
+quant layouts and tables, CPU quant/dot logic, and certain kernels. For this
 reason, and because we are genuinely grateful, we keep the GGML authors copyright
 notice in our `LICENSE` file.
+
+## Status
+
+The code and GGUF files are to be considered of **alpha quality** because
+inference and model serving is a complicated matter and all this exists
+only for a few days. It will take months to reach a more stable form.
+However, we try to keep the project in a usable state, and we are making
+progresses. If you have issues, make sure to use `--trace` to log the
+sessions, and open issues including the full trace.
+
+## More Documentation
+
+If you are looking for very specific things, we have other
+sub-README files. Otherwise for normal usage keep reading the
+next sections.
+
+- [CONTRIBUTING.md](CONTRIBUTING.md): correctness and speed regression testing
+  guide for contributors. **Read this before sending a pull request**.
+- [gguf-tools/README.md](gguf-tools/README.md): offline GGUF generation,
+  imatrix collection, quantization tooling, and quality checks.
+- [gguf-tools/imatrix/README.md](gguf-tools/imatrix/README.md): how the
+  routed-MoE imatrix is collected and used.
+- [gguf-tools/imatrix/dataset/README.md](gguf-tools/imatrix/dataset/README.md):
+  how the calibration prompt corpus is generated.
+- [gguf-tools/quality-testing/README.md](gguf-tools/quality-testing/README.md):
+  how local GGUFs are scored against official DeepSeek V4 Flash continuations.
+- [dir-steering/README.md](dir-steering/README.md): directional steering data,
+  vector generation, and usage.
+- [speed-bench/README.md](speed-bench/README.md): benchmark CSV files and graph
+  generation.
+- [tests/test-vectors/README.md](tests/test-vectors/README.md): official
+  continuation vectors used for regression checks.
 
 ## Model Weights
 
@@ -56,33 +98,48 @@ experts are quantized, up/gate at `IQ2_XXS`, down at `Q2_K`. They are the
 majority of all the model space: the other components (shared experts,
 projections, routing) are left untouched to guarantee quality.
 
-Download one main model:
+Download one main model. **Prefer the imatrix versions.**
 
 ```sh
-./download_model.sh q2   # 128 GB RAM machines
-./download_model.sh q4   # >= 256 GB RAM machines
+./download_model.sh q2-imatrix   # 96/128 GB RAM machines, imatrix-tuned q2
+./download_model.sh q4-imatrix   # >= 256 GB RAM machines, imatrix-tuned q4
+```
+
+Legacy GGUF files are still available if you specifically need the older
+non-imatrix quants:
+
+```sh
+./download_model.sh q2           # 96/128 GB RAM machines, legacy non-imatrix
+./download_model.sh q4           # >= 256 GB RAM machines, legacy non-imatrix
 ```
 
 The script downloads from `https://huggingface.co/antirez/deepseek-v4-gguf`,
 stores files under `./gguf/`, resumes partial downloads with `curl -C -`, and
-updates `./ds4flash.gguf` to point at the selected q2/q4 model. Authentication
-is optional for public downloads, but `--token TOKEN`, `HF_TOKEN`, or the local
-Hugging Face token cache are used when present.
+updates `./ds4flash.gguf` to point at the selected q2-imatrix/q4-imatrix/q2/q4
+model. The plain q2 XXS weights are produced with the weights importance vector
+only, without an imatrix. The imatrix variants are preferred.
+Authentication is optional for public downloads, but `--token TOKEN`,
+`HF_TOKEN`, or the local Hugging Face token cache are used when present.
+
+If you want to regenerate GGUF files or collect a new imatrix, see
+[gguf-tools/README.md](gguf-tools/README.md). Those tools are meant for offline
+model-building work and can take a long time on the full DeepSeek V4 Flash
+weights.
 
 `./download_model.sh mtp` fetches the optional speculative decoding support
-GGUF. It can be used with both q2 and q4, but must be enabled explicitly with
-`--mtp`. The current MTP/speculative decoding path is still experimental: it is
-correctness-gated and currently provides at most a slight speedup, not a
-meaningful generation-speed win.
+GGUF. It can be used with q2-imatrix, q4-imatrix, q2, and q4, but must be
+enabled explicitly with `--mtp`. The current MTP/speculative decoding path is
+still experimental: it is correctness-gated and currently provides at most a
+slight speedup, not a meaningful generation-speed win.
 
 Then build:
 
 ```sh
-make
+make                  # macOS Metal
+make cuda-spark       # Linux CUDA, DGX Spark / GB10
+make cuda-generic     # Linux CUDA, other local CUDA GPUs
+make cpu              # CPU-only diagnostics build
 ```
-
-On Linux, if `hipcc` is available, the build automatically enables the ROCm/HIP
-backend and compiles `ds4_hip.cpp`. On macOS it builds the Metal backend.
 
 `./ds4flash.gguf` is the default model path used by both binaries. Pass `-m` to
 select another supported GGUF from `./gguf/`. Run `./ds4 --help` and
@@ -105,276 +162,101 @@ Q4 requires the larger-memory machine class, so M3 Max Q4 numbers are `N/A`.
 | Mac Studio M3 Ultra, 512 GB | q2 | 11709 tokens | 468.03 t/s | 27.39 t/s |
 | Mac Studio M3 Ultra, 512 GB | q4 | short | 78.95 t/s | 35.50 t/s |
 | Mac Studio M3 Ultra, 512 GB | q4 | 12018 tokens | 448.82 t/s | 26.62 t/s |
+| DGX Spark GB10, 128 GB | q2 | 7047 tokens | 343.81 t/s | 13.75 t/s |
 
-### ROCm/HIP performance
+![M3 Max t/s](speed-bench/m3_max_ts.svg)
 
-The HIP backend is optimized for the CyberNeurova DeepSeek V4 Flash Q2_K GGUF
-on AMD ROCm. The current tested GPU is an AMD Radeon 8060S (`gfx1151`, wave32,
-124 GiB unified/global memory). Numbers below include zero-copy fast and
-full-copy profiles using fast prefill attention, default-on Q8 shared-X batched
-prefill, default-on indexer qmix scoring, Q2_K expert-batched MoE with LDS reuse,
-Q8 decode repack, and split16 Q8 decode repack. WMMA prefill paths are listed
-separately because they are still experimental opt-in correctness/perf paths.
+## Benchmarking
 
-| Machine | Backend | Quant | Prompt | Prefill | Generation |
-| --- | --- | ---: | ---: | ---: | ---: |
-| AMD Radeon 8060S / ROCm HIP | HIP zero-copy fast | Q2_K | 5707 tokens | 53.59 t/s | n/a (`-n 1`) |
-| AMD Radeon 8060S / ROCm HIP | HIP zero-copy + hot MoE WMMA | Q2_K | 5707 tokens | 58.65 t/s | n/a (`-n 1`) |
-| AMD Radeon 8060S / ROCm HIP | HIP zero-copy fast | Q2_K | 1003 tokens | 33.21 t/s | 7.17 t/s |
-| AMD Radeon 8060S / ROCm HIP | HIP zero-copy fast | Q2_K | 1905 tokens | 32.61 t/s | 8.88 t/s |
-| AMD Radeon 8060S / ROCm HIP | HIP full-copy | Q2_K | 1003 tokens | 33.72 t/s | 9.37 t/s |
-| AMD Radeon 8060S / ROCm HIP | HIP full-copy | Q2_K | 1905 tokens | 33.46 t/s | 9.20 t/s |
-
-The 5707-token rows are prefill-only `--tokens 1 --temp 0` checks; their
-generation numbers are intentionally omitted because the first sampled token
-performs no decode evaluation.
-
-The HIP zero-copy fast profile keeps the 92 GiB GGUF tensor payload mapped from
-host memory and avoids the full model copy, while still using the fast prefill
-kernels and Q8 decode repacks. Q8-WMMA remains experimental and opt-in: the
-current guarded path only applies WMMA to attention/indexer Q-side projections,
-uses FP32 WMMA accumulation, skips small batches by default, and builds about
-3.35 GiB of FP16 Q8 WMMA prefill weights. `DS4_HIP_Q8_HIPBLASLT=1` is a separate
-experimental q-side path that uses hipBLASLt for small prefill batches
-(default `DS4_HIP_Q8_HIPBLASLT_MAX_TOKENS=256`) and falls back to the custom
-path for larger chunks. The Q2_K hot-bucket MoE WMMA path is also opt-in and
-first-token/perf experimental only; it keeps scalar/shared-X kernels for small
-expert buckets and applies WMMA only to large routed expert buckets, but broader
-32-token greedy-logprob checks have shown continuation drift. Full-copy copies
-the GGUF tensor payload into GPU memory at startup and eagerly builds about 4.6
-GiB of Q8 decode repacks.
-Full-copy is therefore opt-in. Conservative HIP server mode keeps zero-copy
-mapped GGUF weights and avoids the full copy.
-
-## ROCm/HIP quick start and max performance
-
-Build on a ROCm machine:
+`ds4-bench` measures instantaneous prefill and generation throughput at context
+frontiers instead of reporting one whole-run average. It loads the model once,
+walks a fixed token sequence to frontiers such as 2048, 4096, 6144, and uses
+incremental prefill so each row measures only the newly-added token interval.
+After each frontier it saves the live KV state to memory, generates a fixed
+greedy non-EOS probe, restores the memory snapshot, and continues prefill.
 
 ```sh
-make ds4 ds4-server
+./ds4-bench \
+  -m ds4flash.gguf \
+  --prompt-file speed-bench/promessi_sposi.txt \
+  --ctx-start 2048 \
+  --ctx-max 65536 \
+  --step-incr 2048 \
+  --gen-tokens 128
 ```
 
-Run the conservative HIP server:
+The example file is a cleaned public-domain Project Gutenberg text of
+Alessandro Manzoni's *I Promessi Sposi* (ebook #45334), with the Gutenberg
+header and footer removed: <https://www.gutenberg.org/ebooks/45334>.
+
+Use `--step-incr N` for different linear spacing, or `--step-mul F` for
+exponential sweeps. Output is CSV with one row per frontier: latest prefill
+interval tokens/sec, generation tokens/sec at that frontier, and
+`kvcache_bytes`.
+
+## Capability Evaluation
+
+`ds4-eval` is a small real-model integration benchmark. It is not a leaderboard
+runner and should not be reported as an official GPQA, SuperGPQA, AIME, or
+security benchmark score: the questions are an embedded 92-item subset chosen
+to make local regression testing useful and visually inspectable. The program
+loads the real GGUF,
+renders DS4 chat prompts, streams sampled tokens in a split-screen TUI, grades
+the final answer, and prints a per-question report with prompt tokens,
+generated tokens, pass/fail state, the model answer, and the correct answer.
 
 ```sh
-DS4_MODEL=/path/to/cyberneurova-DeepSeek-V4-Flash-abliterated-Q2_K.gguf \
-  scripts/start_ds4_server.sh
+./ds4-eval -m ds4flash.gguf --trace /tmp/ds4-eval.txt
 ```
 
-Run the current max-performance HIP profile:
+The default run uses `--tokens 16000`, thinking mode enabled, and a soft/hard
+`</think>` budget cutoff so the model has room to produce a visible answer.
+`ds4-eval` sizes the context internally from the largest selected prompt plus
+the generation budget, and refuses runs that would need more than 1M context
+tokens. Press `p` to pause, `q` to exit and print the report, Up/Down to
+inspect or select another question, and Enter to run the selected question next.
+`--plain` disables the TUI.
 
-```sh
-DS4_MODEL=/path/to/cyberneurova-DeepSeek-V4-Flash-abliterated-Q2_K.gguf \
-DS4_SERVER_FAST_FULL=1 \
-  scripts/start_ds4_server.sh
-```
+The first 75 embedded questions are interleaved as 25 GPQA Diamond, 25 audited
+SuperGPQA, and 25 AIME 2025 problems. The final 17 are an audited COMPSEC
+subset of reduced single-function C/C++ vulnerability-localization questions.
+The model is asked for the single best source line, or the smallest exact line
+set only when the bug cannot be localized to one line; the scorer accepts small
+audited ranges only when adjacent lines are equivalent locations for the same
+bug. The order is
+intentionally progressive: early questions are useful smoke tests, while later
+questions are hard enough that a strong reasoning model should still miss some
+of them. The SuperGPQA slice is curated rather than blind: upstream rows with
+wrong keys, missing figures, or underspecified prompts are replaced with cleaner
+rows.
 
-`DS4_SERVER_FAST_FULL=1` expands to the currently measured best HIP settings:
+For a model like DeepSeek V4 Flash, the set should be treated as a hard
+capability regression suite rather than a pass/fail unit test:
 
-```sh
-DS4_SERVER_DEVICE_TENSORS=1
-DS4_SERVER_COPY_MODEL=1
-DS4_SERVER_COPY_MODEL_CHUNK_MB=1024
+- **GPQA Diamond** contributes graduate-level science questions with
+  multiple-choice answers. DeepSeek's model card reports strong Flash results
+  on full GPQA Diamond in thinking mode, but individual items still require
+  careful physics, chemistry, or biology reasoning and are easy to lose with a
+  small prompt/rendering or sampling regression.
+- **SuperGPQA** contributes broad specialist knowledge and domain-transfer
+  questions. The model-card SuperGPQA number is much lower than GPQA Diamond,
+  so these items are expected to be uneven: some look mundane, others require
+  niche professional knowledge or exact interpretation of a translated-style
+  exam question.
+- **AIME 2025** contributes exact-answer contest math. These are often the most
+  unforgiving items in the set: no multiple-choice prior, no partial credit, and
+  a single arithmetic or algebraic slip changes the grade.
+- **COMPSEC** contributes single-function C/C++ security reasoning items
+  reduced from public CVE writeups. These are not exploit prompts: the task is
+  to identify the best source line where the defensive code flaw is introduced,
+  or return `0` for a safe function.
 
-DS4_SERVER_PREFILL_RAW_FAST=1
-DS4_SERVER_PREFILL_MIXED_FAST=1
-DS4_SERVER_ATTENTION_INDEXED_FUSED_VALUE_GROUP=4
-DS4_SERVER_Q8_BATCH_FAST=1
-DS4_SERVER_Q8_BATCH_SHARED_X=1
-DS4_SERVER_Q8_BATCH_TILE=32
-DS4_SERVER_Q8_BATCH_RPB=32
-DS4_SERVER_Q8_BATCH_SHARED_X_BLOCKS=16
-DS4_SERVER_Q8_GROUPED_BATCH_TILE=32
-DS4_SERVER_MOE_EXPERT_BATCH=1
-DS4_SERVER_MOE_GATE_TILE=16
-DS4_SERVER_MOE_DOWN_TILE=8
-DS4_SERVER_MOE_GATE_RPB=16
-DS4_SERVER_MOE_DOWN_RPB=16
-DS4_SERVER_MOE_EXPERT_SHARED_X=1
-DS4_SERVER_MOE_EXPERT_SHARED_MID=1
-
-DS4_SERVER_Q8_REPACK=1
-DS4_SERVER_Q8_REPACK_SPLIT16=1
-```
-
-The upstream-shaped ROCm/CUDA-port backend is built separately with
-`make rocm-upstream` (`./ds4-rocm-upstream`). Do not run it concurrently with the
-old-HIP server. Its Q2_K/6-expert prefill path now defaults to an old-HIP-style
-expert-batched MoE kernel (`DS4_CUDA_NO_MOE_Q2_EXPERT_BATCH=1` disables it;
-`DS4_CUDA_MOE_GATE_TILE`, `DS4_CUDA_MOE_DOWN_TILE`, `DS4_CUDA_MOE_GATE_RPB`, and
-`DS4_CUDA_MOE_DOWN_RPB` mirror the HIP tuning knobs). On the Radeon 8060S,
-`/tmp/prompt1741.txt --ctx 4096 -n 1` measures about `58.15 tok/s` zero-copy and
-`59.52 tok/s` with `DS4_CUDA_COPY_MODEL=1 DS4_CUDA_COPY_MODEL_CHUNK_MB=1024`,
-with the latter copying the 92.02 GiB tensor payload in about `31.8s`.
-Forced-stream quality reports at `/tmp/ds4_rocm_quality_q2expert_default` pass
-the current conservative logprob-drop thresholds against old-HIP references. An
-opt-in ROCm hot-bucket WMMA MoE profile
-(`DS4_CUDA_MOE_WMMA_HOT=1 DS4_CUDA_MOE_WMMA_GATE_HOT=64 DS4_CUDA_MOE_WMMA_DOWN_HOT=32`)
-raises the same smoke to about `75.21 tok/s` zero-copy and passes the forced-stream
-quality gate at `/tmp/ds4_rocm_quality_wmma_hot_g64d32`; it remains opt-in because
-it moves exact greedy near-ties. Adding `DS4_CUDA_ATTENTION_OUTPUT_CUBLAS_ALL=1`
-preloads the 86 attention-output Q8 tensors as FP16 (~5.38 GiB) and routes both
-attention-output projections through hipBLAS, raising the same zero-copy smoke to
-about `79.7-79.9 tok/s` and `81.07 tok/s` with opt-in staged full-copy
-(`DS4_CUDA_COPY_MODEL=1 DS4_CUDA_COPY_MODEL_CHUNK_MB=1024`, copy ~33.8s).
-The hot WMMA down path now uses a default two-output-tile kernel (`DS4_CUDA_MOE_WMMA_NO_DOWN_N2=1`
-restores the older one-tile down kernel), and its Q2_K tile dequantization is row-oriented;
-with the same MoE+attention-output opt-ins a zero-copy smoke reached `85.28 tok/s`.
-A newer opt-in attention-output hipBLAS variant,
-`DS4_CUDA_ATTENTION_OUTPUT_PACKED_B_CUBLAS=1`, keeps the grouped A output in a
-packed FP16 scratch buffer and accumulates B by group, avoiding the unpack and
-second activation conversion. Combined with the MoE WMMA and attention-output
-hipBLAS opt-ins it reached `89.71 tok/s` zero-copy under stage profiling and
-`91.82 tok/s` with `DS4_CUDA_COPY_MODEL=1`; forced-stream quality passes at
-`/tmp/ds4_rocm_quality_packed_attnout_b`. On the current upstream-shaped ROCm
-path, `DS4_CUDA_ATTENTION_OUTPUT_INTERLEAVED_B_CUBLAS=1` stores the
-attention-output B FP16 cache in hipBLAS-friendly column-major form for the
-one-shot interleaved B GEMM (set
-`DS4_CUDA_ATTENTION_OUTPUT_NO_TRANSPOSED_B_CUBLAS=1` for the older layout); with
-the Q8 WMMA, MoE WMMA, shared gate/up, and shared-down opt-ins this
-pushes `/tmp/prompt1741.txt --ctx 4096 -n 1` to about `102-104 tok/s`, with
-forced-stream quality at `/tmp/ds4_rocm_quality_transposed_attnout_b_direct`.
-Forced-stream quality also passes at
-`/tmp/ds4_rocm_quality_rowwise_downn2_default`, but exact greedy near-ties move
-more, so keep the fast ROCm profile opt-in. For follow-up profiling, `DS4_CUDA_MOE_PROFILE=1`
-now splits the Q2_K expert-batch path into bucket/gate-scalar/gate-WMMA,
-down-scalar/down-WMMA/sum timings; `DS4_CUDA_ATTN_OUT_STAGE_PROFILE=1` splits
-attention-output A/B time, and the CUDA-port Q8 batch tile knobs mirror HIP
-(`DS4_CUDA_Q8_BATCH_TILE`, `DS4_CUDA_Q8_BATCH_SHARED_X_BLOCKS`,
-`DS4_CUDA_Q8_GROUPED_BATCH_TILE`, `DS4_CUDA_Q8_GROUPED_BATCH_SHARED_X_BLOCKS`).
-`DS4_CUDA_ATTN_Q_B_CUBLAS=1` and `DS4_CUDA_SHARED_EXPERT_CUBLAS=1` are available
-as targeted q-path/shared-expert diagnostics. A custom opt-in shared-expert
-batch gate/up+SwiGLU fusion, `DS4_CUDA_SHARED_GATE_UP_BATCH_FUSED=1`, avoids the
-separate gate/up writes in normal prefill (default tuned as tile32/block8;
-`DS4_CUDA_SHARED_GATE_UP_BATCH_TILE` and
-`DS4_CUDA_SHARED_GATE_UP_BATCH_SHARED_X_BLOCKS` override it); forced-stream
-quality passes at `/tmp/ds4_rocm_quality_shared_gateup_fused`, but the total
-prefill win is small/noisy so it is not part of the default fast recipe.
-
-For the fastest currently measured long-prompt prefill smoke test, add the
-experimental hot-bucket Q2_K MoE WMMA path on top of the fast profile:
-
-```sh
-DS4_SERVER_FAST_FULL=1 \
-DS4_SERVER_MOE_WMMA_HOT=1 \
-DS4_SERVER_MOE_WMMA_GATE_HOT=64 \
-DS4_SERVER_MOE_WMMA_DOWN_HOT=32 \
-  scripts/start_ds4_server.sh
-```
-
-The same CLI-only knobs are `DS4_HIP_MOE_WMMA_HOT=1`,
-`DS4_HIP_MOE_WMMA_GATE_HOT=N`, `DS4_HIP_MOE_WMMA_DOWN_HOT=N`, and optional
-`DS4_HIP_MOE_WMMA_LAYERS=LIST` (`14-42`, `7-13,29-42`, etc.). The layer filter
-is a diagnostic mitigation for drift experiments, not a promotion to default.
-A 5707-token/32-token greedy check matched the scalar path with `14-42`, but a
-stronger 128-token check drifted at token 82. The narrower `29-42` filter matched
-two 128-token repeats on the same prompt, but its measured prefill gain was only
-small/noisy (~2-4% relative in throttled A/B runs). Treat the layer filter as a
-profiling/diagnostic tool, not a correctness promotion.
-
-This path is not part of `DS4_SERVER_FAST_FULL` because it uses FP16 WMMA inputs
-for Q2_K expert tiles. The strict first-token smoke above stayed `We`, but
-full-layer 32-token greedy-logprob comparisons against the scalar/shared-X MoE
-path drifted (for example ` prompt` -> ` text` on the 5707-token prompt), so
-leave it off when exact continuation matching matters.
-
-A separate upstream-inspired Q8_K MoE-down path is available behind
-`DS4_HIP_MOE_Q8K_DOWN=1` (`DS4_SERVER_MOE_Q8K_DOWN=1` for the server wrapper).
-It keeps the exact scalar/shared-X Q2_K gate/up path, quantizes the gated mid
-activations to Q8_K, then runs an expert-batched Q2_K x Q8_K down projection with
-packed int8 dot products. Because the mid quantization changes arithmetic, it is
-opt-in. With no explicit layer list it is restricted to `layer_index >= 40`, the
-widest range that passed the current stricter security-style 5464-token/256-token
-greedy gate; all-layer mode drifted by generated step 5, `>=21` drifted by step
-188, and `>=39` drifted by step 16 on that same gate. Override with
-`DS4_HIP_MOE_Q8K_DOWN_LAYERS=LIST`, select the slower direct sum6 variant with
-`DS4_HIP_MOE_Q8K_DOWN_DIRECT=1`, or change the expert tile with
-`DS4_HIP_MOE_Q8K_DOWN_TILE=4|8|16` (default 4). The `40-80` range also matched a
-5635-token/256-token story gate and a 6244-token/256-token Promessi gate. In
-2048-token chunk sweeps on the Radeon 8060S it is a modest/noisy prefill win,
-mostly at mid contexts; keep it off for maximum conservative exactness until
-broader gates pass.
-
-The HIP Q8 shared-X batched prefill matmul is now default-on (tile32 for normal
-Q8 batch matmuls and tile32/RPB32 for grouped `attn_output_a` low projection).
-The Q8 server variables above are kept for reproducible presets and overrides; set
-`DS4_SERVER_Q8_BATCH_FAST=0` or `DS4_HIP_Q8_BATCH_FAST=0` to disable that path.
-The HIP indexer score qmix path is also default-on; set
-`DS4_HIP_INDEXER_QMIX_FAST=0` only for regression comparisons. The mixed-attention
-warprows kernels also use an exact-safe unrolled 512-dim score dot loop. In the
-fast-full preset, indexed mixed attention additionally uses
-`DS4_HIP_ATTENTION_INDEXED_FUSED_VALUE_GROUP=4`: one 1024-thread block computes
-four heads with the same per-head score/softmax reduction order, then immediately
-runs a grouped value pass from LDS weights. This matched the 5707-token/128-token
-greedy-logprob gate and reduced the profiled indexed-attention stage to roughly
-106-128 ms on the Radeon 8060S, without the large global weight scratch needed by
-the older split path. Set the fused group to `0` to disable. The fallback
-`DS4_HIP_ATTENTION_INDEXED_SPLIT_VALUE_GROUP=4` path keeps the score/softmax and
-grouped value pass in separate kernels and may be useful for A/B comparisons. The scalar/shared-X
-Q2_K routed-MoE path now uses separate exact-safe pair tiles by default
-(`DS4_HIP_MOE_GATE_TILE=16`, `DS4_HIP_MOE_DOWN_TILE=8`) because gate/up benefits
-from tile16 while down stays faster at tile8.
-
-For one-shot CLI benchmarking with the same core settings, use the server preset
-above or set the corresponding `DS4_HIP_*` variables directly. The server script
-is recommended because it also handles model path, KV cache, pid/log files, and
-safe restart behavior.
-
-## HIP roadmap
-
-The HIP backend is now at the first stable fast path: zero-copy and full-copy
-loading both work, the non-winning experiments have been removed, and the
-winning Q8 batched prefill path is enabled by default. The remaining safe
-prefill/decode knobs are exposed through `DS4_SERVER_FAST_FULL=1`; the Q8_K
-MoE-down and Q2_K hot-bucket MoE WMMA paths are opt-in separately and currently blocked from
-promotion by multi-token greedy drift. The next work is kernel quality, then
-decode/inference behavior, then KV/cache work:
-
-1. **rocWMMA on dense Q8 projections**
-   - The production opt-in path is currently restricted to the q-side
-     (`attn_q_a`/`attn_q_b` plus indexer q) because output projection WMMA caused
-     worse greedy drift while writing directly into the residual stream.
-   - The standalone dense Q8 microbench validates the raw kernel potential:
-     packed multi-N WMMA is about 2.2-2.6x faster than the current shared-X
-     batched kernel on DS4-like prefill shapes, with rel RMS around `3e-4`.
-   - Use tile-major/repacked layouts suitable for WMMA rather than the raw GGUF
-     row layout, and keep greedy correctness gates on by default.
-
-2. **rocWMMA on Q2_K routed experts**
-   - The current opt-in hot-bucket path uses a compact hot-expert list and WMMA
-     only for large routed buckets, leaving scalar/shared-X expert kernels for
-     small buckets. It improved the 5707-token prefill smoke from ~53.6 t/s to
-     ~58.7 t/s with the same first token, but 32-token greedy-logprob checks now
-     show drift even for down-only/high-threshold variants.
-   - Keep it first-token/perf experimental only. Promotion needs either a
-     precision-neutral Q2_K WMMA formulation or exact-token acceptance criteria
-     that tolerate these continuation changes.
-
-3. **hipBLASLt-quality custom kernels**
-   - The goal is not merely “use WMMA”, but kernels with hipBLASLt-like quality:
-     high occupancy, good LDS usage, coalesced loads, low register pressure,
-     tuned tile shapes, and strict correctness gates.
-   - Keep opt-in/fallback paths until they beat the current scalar/shared-X
-     kernels in real graph tests.
-
-4. **Decode/inference optimization**
-   - After the WMMA/repack kernel work, focus on single-stream decode and server
-     inference: dense projection fusion, output/head behavior, speculative or
-     top-only paths where useful, and reduced memory traffic per generated
-     token.
-
-5. **K/V cache work**
-   - Last in this sequence: improve KV behavior after the compute kernels are
-     better understood. This includes live KV memory layout, disk KV reuse,
-     long-context cache movement, and cache/server ergonomics.
-
-Realistic prefill trajectory for the HIP fast path is roughly: default measured
-long-prompt zero-copy fast path ~53-54 tok/s. Opt-in hot-MoE WMMA reaches
-~58-59 tok/s in first-token smoke tests but is not exact-greedy-safe over longer
-continuations. Indexed mixed attention and Q2_K routed MoE are still the main
-remaining bottlenecks for pushing toward ~80 tok/s. Q8 WMMA, Q2_K hot-bucket
-WMMA, and hipBLASLt remain opt-in diagnostics until they beat the custom fast
-path without quality drift.
+In practice this means `ds4-eval` should not be expected to produce a perfect
+92/92 run. It is meant to answer a more useful engineering question: after a
+kernel, quantization, prompt-rendering, KV-cache, or tool-streaming change, does
+DeepSeek V4 Flash still solve a representative mix of hard science, broad
+knowledge, exact math, and security-code problems while using the same inference
+path users run?
 
 ## CLI
 
@@ -392,7 +274,7 @@ ds4>
 ```
 
 The interactive CLI is a real multi-turn DS4 chat. It keeps the rendered chat
-transcript and the live Metal KV checkpoint, so each turn extends the previous
+transcript and the live graph KV checkpoint, so each turn extends the previous
 conversation. Useful commands are `/help`, `/think`, `/think-max`, `/nothink`,
 `/ctx N`, `/read FILE`, and `/quit`. Ctrl+C interrupts the current generation
 and returns to `ds4>`.
@@ -411,13 +293,15 @@ Start a local OpenAI/Anthropic-compatible server:
 ./ds4-server --ctx 100000 --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 8192
 ```
 
-The server uses Metal on macOS and ROCm/HIP on Linux when built with `hipcc`.
-It keeps one mutable graph/KV checkpoint in memory, so stateless clients that
-resend a longer version of the same prompt can reuse
+Use `--chdir /path/to/ds4` when launching `ds4-server` from another directory,
+so relative runtime files such as `metal/*.metal` resolve from the project tree.
+
+The server keeps one mutable backend/KV checkpoint in memory,
+so stateless clients that resend a longer version of the same prompt can reuse
 the shared prefix instead of pre-filling from token zero.
 
 Request parsing and sockets run in client threads, but inference itself is
-serialized through one Metal worker. The current server does not batch multiple
+serialized through one graph worker. The current server does not batch multiple
 independent requests together; concurrent requests wait their turn on the single
 live graph/session.
 
@@ -426,6 +310,7 @@ Supported endpoints:
 - `GET /v1/models`
 - `GET /v1/models/deepseek-v4-flash`
 - `POST /v1/chat/completions`
+- `POST /v1/responses`
 - `POST /v1/completions`
 - `POST /v1/messages`
 
@@ -435,26 +320,47 @@ Supported endpoints:
 Tool schemas are rendered into DeepSeek's DSML tool format, and generated DSML
 tool calls are mapped back to OpenAI tool calls.
 
+`/v1/responses` accepts OpenAI Responses-style `input`, `instructions`,
+`tools`, `tool_choice`, `max_output_tokens`, `temperature`, `top_p`, `stream`,
+and `reasoning`. It is the preferred endpoint for Codex CLI. The server keeps
+Responses continuations bound to live state when possible, and can fall back to
+the same DSML rendering and KV prefix reuse used by chat completions.
+
 `/v1/messages` is the Anthropic-compatible endpoint used by Claude Code style
 clients. It accepts `system`, `messages`, `tools`, `tool_choice`, `max_tokens`,
 `temperature`, `top_p`, `top_k`, `stream`, `stop_sequences`, and thinking
 controls. Tool uses are returned as Anthropic `tool_use` blocks.
 
-Both APIs support SSE streaming. In thinking mode, reasoning is streamed in the
-native API shape instead of being mixed into final text. OpenAI chat streaming
+Default sampled API generation uses `temperature=1`, `top_p=1`, and
+`min_p=0.05`, so the default filter is relative probability rather than
+nucleus mass. In thinking mode DS4 uses those fixed sampling defaults and
+ignores client sampling knobs, matching DeepSeek's fixed-thinking API behavior.
+
+The chat, Responses, and Anthropic endpoints support SSE streaming. In thinking
+mode, reasoning is streamed in the native API shape instead of being mixed into
+final text. OpenAI chat streaming
 also streams tool calls as soon as the DSML invocation is recognized: the tool
 header is sent first, then parameter bytes are forwarded as
 `tool_calls[].function.arguments` deltas while generation continues. The
 Anthropic endpoint streams thinking and text live, then emits structured
 `tool_use` blocks when the generated tool block is complete.
+The Responses endpoint streams the Responses event lifecycle expected by Codex,
+including `response.output_text.delta`, function-call argument events, and
+terminal `response.completed` / `response.incomplete` / `response.failed`
+events.
+
+For browser JavaScript clients served from another origin, start the server with
+`--cors` to emit `Access-Control-Allow-*` headers. This only changes HTTP
+headers; it does not expose the server on the LAN. Use `--host 0.0.0.0`
+explicitly when remote machines should be able to connect.
 
 ### Tool call handling and canonicalization
 
 DeepSeek V4 Flash emits tool calls as [DSML text](https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro/blob/main/encoding/README.md). Agent clients do not send that
 same text back on the next request: they send normalized OpenAI/Anthropic JSON
 tool-call objects. **If the server re-rendered those objects slightly
-differently, the token prefix would no longer match the live KV checkpoint** and
-the next turn would have to be rebuilt.
+differently, the rendered byte prefix would no longer match the live KV
+checkpoint** and the next turn would have to be rebuilt.
 
 The first line of defense is exact replay. Every tool call gets an unguessable
 API tool ID, and the server remembers `tool id -> exact sampled DSML block` in
@@ -507,7 +413,9 @@ You can use larger context and larger cache if you wish. Full context of
 alone will be like 22GB), so configure a context which makes sense in
 your system. With 128GB of RAM you would run the 2-bit quants, which are
 already 81GB, 26GB are going to be likely too much, so a context window
-of 100~300k tokens is wiser.
+of 100~300k tokens is wiser. However users reported being able to run 2bit
+quants with 250k ctx window in a Macs with just 96GB of system memory: make sure
+to kill processes that use too much memory, if you plan doing so ;)
 
 The `384000` output limit below avoids token caps since the model is able
 to generate very long replies otherwise (up to 384k tokens). The server
@@ -606,6 +514,22 @@ Optionally make it the default Pi model in `~/.pi/agent/settings.json`:
 }
 ```
 
+For **Codex CLI**, use the Responses wire API:
+
+```toml
+[model_providers.ds4]
+name = "DS4"
+base_url = "http://127.0.0.1:8000/v1"
+wire_api = "responses"
+stream_idle_timeout_ms = 1000000
+```
+
+Then run:
+
+```sh
+codex --model deepseek-v4-flash -c model_provider=ds4
+```
+
 For **Claude Code**, use the Anthropic-compatible endpoint. A wrapper like this
 matches the local `~/bin/claude-ds4` setup:
 
@@ -652,10 +576,11 @@ non-thinking model alias such as `deepseek-chat`.
 ## Disk KV Cache
 
 Chat/completion APIs are stateless: agent clients usually resend the whole
-conversation every request. `ds4-server` handles this by comparing the rendered
-token stream with cached token prefixes. The live in-memory checkpoint covers
-the current session; the disk KV cache makes useful prefixes survive session
-switches and server restarts.
+conversation every request. `ds4-server` first tries the cheap exact token-prefix
+check, then falls back to comparing rendered prompt bytes with decoded
+checkpoint bytes. The live in-memory checkpoint covers the current session; the
+disk KV cache makes useful prefixes survive session switches and server
+restarts.
 
 For RAM reasons there is currently only one live KV cache in memory. When a new
 unrelated session replaces it, the old checkpoint can only be resumed without
@@ -669,8 +594,12 @@ Enable it with:
 ./ds4-server --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 8192
 ```
 
-The cache key is the SHA1 of exact token IDs, not raw text. Each token ID is
-hashed as a little-endian 32-bit integer, and files are named `<sha1>.kv`.
+The cache key is the SHA1 of the rendered byte prefix, and files are named
+`<sha1>.kv`. The DS4 payload still stores the exact token IDs and graph state
+for that prefix. This matters for continued chats: the model may have generated
+one token whose decoded text is later sent back by a client as two canonical
+prompt tokens. A rendered byte-prefix hit can still reuse the checkpoint and
+tokenize only the new suffix.
 The file is intentionally written with ordinary `read`/`write` I/O, not
 `mmap`, so restoring cache entries does not add more VM mappings to a process
 that already maps the model.
@@ -710,10 +639,11 @@ The fixed header is little-endian:
 ```
 
 The rendered text is the tokenizer-decoded text for the cached token prefix.
-It is stored only for observability, so humans can inspect a cache directory
-without decoding token IDs. It is not used as the key and it is not trusted
-when loading; after load, the stored checkpoint tokens must still match the
-incoming request prefix.
+It is both the human-inspectable prefix and the lookup identity: its SHA1 is
+the filename, and a file is reusable only when those bytes are a prefix of the
+incoming rendered prompt. After load, the exact checkpoint tokens from the DS4
+payload remain authoritative, and only the incoming text suffix after the cached
+bytes is tokenized.
 
 The optional tool-id map is present only when header extension bit 0 is set.
 Appended sections use fixed bit order, so future extension bits can add fields
@@ -742,7 +672,7 @@ the session payload first, then loads the map if present. Before rendering a
 request, the server can also scan cache files for the tool IDs present in the
 client history and load just those mappings, so an exact DSML replay can survive
 server restarts even when the matching KV snapshot is not the one ultimately
-used for the token-prefix hit.
+used for the rendered-prefix hit.
 
 The DS4 session payload starts with thirteen little-endian `u32` fields:
 
@@ -789,7 +719,7 @@ builds for this model layout.
 The cache stores checkpoints at four moments:
 
 - `cold`: after a long first prompt reaches a stable prefix, before generation.
-- `continued`: when prefill or generation advances the live conversation by the configured interval.
+- `continued`: when prefill or generation reaches the next absolute aligned frontier.
 - `evict`: before an unrelated request replaces the live in-memory session.
 - `shutdown`: when the server exits cleanly.
 
@@ -798,6 +728,12 @@ chunk boundary. This avoids common BPE boundary retokenization misses when a
 future request appends text to the same prompt. The defaults are conservative:
 store prefixes of at least 512 tokens, cold-save prompts up to 30000 tokens,
 trim 32 tail tokens, and align to 2048-token chunks. The important knobs are:
+
+Continued saves use the same alignment and are written only when the live graph
+naturally reaches an absolute frontier. With the defaults this means roughly
+every 10k tokens, independent of where the first cold checkpoint landed, so long
+generations leave restart points behind without persisting the fragile final few
+tokens.
 
 - `--kv-cache-min-tokens`
 - `--kv-cache-cold-max-tokens`
@@ -808,7 +744,7 @@ trim 32 tail tokens, and align to 2048-token chunks. The important knobs are:
 - `--disable-exact-dsml-tool-replay`
 
 By default, checkpoints may be reused across the 2-bit and 4-bit routed-expert
-variants if the token prefix matches. Use `--kv-cache-reject-different-quant`
+variants if the rendered prefix matches. Use `--kv-cache-reject-different-quant`
 when you want strict same-quant reuse only.
 
 The cache directory is disposable. If behavior looks suspicious, stop the
@@ -817,29 +753,48 @@ the kv cache files include the verbatim prompt cached.
 
 ## Backends
 
-On macOS, the production backend is Metal:
+The default graph backend is Metal on macOS and CUDA in CUDA builds:
 
 ```sh
 ./ds4 -p "Hello" --metal
+./ds4 -p "Hello" --cuda
 ```
 
-On Linux/ROCm, this fork builds and uses the HIP backend automatically when
-`hipcc` is present:
+On Linux, plain `make` prints the available build targets instead of selecting a
+CUDA target implicitly. Use `make cuda-spark` for DGX Spark / GB10. It omits an
+explicit `nvcc -arch` because that is currently the fastest path on GB10. Use
+`make cuda-generic` for a normal local CUDA build, or set `CUDA_ARCH` explicitly
+when cross-building or when you need a known target:
 
 ```sh
-make ds4 ds4-server
-./ds4 -p "Hello"
+make cuda CUDA_ARCH=sm_120
+make cuda CUDA_ARCH=native
 ```
 
 There is also a CPU reference/debug path:
 
 ```sh
 ./ds4 -p "Hello" --cpu
+make cpu
+./ds4
+./ds4 -p "Hello"
 ```
 
-Do not treat the CPU path as the production target. The optimized
-implementations live in the Metal graph path on macOS and the HIP graph path on
-ROCm/Linux.
+Do not treat the CPU path as the production target. The CLI and `ds4-server`
+support the CPU backend for reference/debug use and share the same KV session
+and snapshot format as Metal and CUDA, but normal inference should use Metal or
+CUDA.
+
+## Steering
+
+This project supports steering with single-vector activation directions; see the
+`dir-steering` directory for more information. This follows the core idea of the
+[Refusal in Language Models Is Mediated by a Single Direction](https://arxiv.org/abs/2406.11717)
+paper. You can use it to make the model more or less verbose, less likely to
+answer programming questions if it is a chatbot for your car rental web site,
+and so forth, much faster than fine-tuning.
+This is also useful for cybersecurity researchers who want to reduce a model's
+willingness to provide dual-use or offensive security guidance.
 
 ## Test Vectors
 
@@ -866,9 +821,6 @@ first answer:
 ```sh
 ./ds4 --dump-tokens -p "..."
 ./ds4 --dump-logprobs /tmp/out.json --logprobs-top-k 20 --temp 0 -p "..."
-tools/compare_logprobs.py /tmp/base.json /tmp/candidate.json --show-text
-tools/quality_logprob_report.py /tmp/base.json /tmp/candidate-forced.json --candidate-token-field eval
-tools/run_rocm_quality_gate.py --skip-greedy
 ./ds4-server --trace /tmp/ds4-trace.txt ...
 ```
 
@@ -878,20 +830,6 @@ tools/run_rocm_quality_gate.py --skip-greedy
   and `｜DSML｜`.
 - `--dump-logprobs` stores a greedy continuation with the top local
   alternatives at each step, which helps separate sampling choices from
-  logit/model issues. `tools/compare_logprobs.py` compares two such dumps by
-  selected token id and reports the first divergent step.
-- `--force-tokens FILE` replays a known token sequence while preserving the
-  local greedy choice as `selected`, useful for backend drift isolation.
-  `tools/quality_logprob_report.py` treats this as a quality/stability signal:
-  compare the logprob assigned to the same forced reference stream instead of
-  failing only because two near-tie greedy argmax choices differ.
-- `tools/run_rocm_quality_gate.py` runs the ROCm forced-stream quality gate
-  against the saved old-HIP reference JSONs. It refuses to run while the
-  old-HIP server PID file is live unless `--allow-server` is passed.
-- `DS4_METAL_GRAPH_DUMP_PREFIX` / `DS4_METAL_GRAPH_TRACE_FILE` enable gated
-  graph tensor diagnostics. `tools/compare_graph_traces.py` compares compact
-  trace JSONL files; `tools/compare_router_dumps.py` compares router top-k and
-  `ffn_moe_scores` dumps; `tools/compare_fp8_kv_decisions.py` compares
-  `KVrope`/`KVcur` FP8 bucket decisions and near-threshold flips.
+  logit/model issues.
 - `ds4-server --trace` writes the rendered prompts, cache decisions, generated
   text, and tool-parser events for a whole agent session.
