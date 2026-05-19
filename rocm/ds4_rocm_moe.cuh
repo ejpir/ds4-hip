@@ -2116,6 +2116,86 @@ __device__ __forceinline__ static float moe_silu_oldhip(float x) {
     return x * (1.0f / (1.0f + expf(-x)));
 }
 
+__global__ static void moe_q2K_dequant_expert_f16_kernel(
+        __half *out,
+        const char *base,
+        uint32_t expert,
+        uint32_t in_dim,
+        uint32_t out_dim,
+        uint64_t expert_bytes,
+        uint64_t row_bytes) {
+    const uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t total = (uint64_t)out_dim * in_dim;
+    if (idx >= total || expert >= 256u) return;
+    const uint32_t row = (uint32_t)(idx / in_dim);
+    const uint32_t k = (uint32_t)(idx - (uint64_t)row * in_dim);
+    const unsigned char *ew = (const unsigned char *)base + (uint64_t)expert * expert_bytes;
+    const unsigned char *blk = ew + (uint64_t)row * row_bytes + (uint64_t)(k >> 8u) * 84u;
+    out[idx] = __float2half(q2_K_dequant_256_direct(blk, k & 255u));
+}
+
+__global__ static void moe_dense_gather_x_f16_kernel(
+        __half *xh,
+        const float *x,
+        const uint32_t *offsets,
+        const uint32_t *pairs,
+        uint32_t expert,
+        uint32_t count,
+        uint32_t in_dim) {
+    const uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t total = (uint64_t)count * in_dim;
+    if (idx >= total || expert >= 256u) return;
+    const uint32_t bucket_row = (uint32_t)(idx / in_dim);
+    const uint32_t k = (uint32_t)(idx - (uint64_t)bucket_row * in_dim);
+    const uint32_t pair = pairs[offsets[expert] + bucket_row];
+    const uint32_t token = pair / 6u;
+    xh[idx] = __float2half(x[(uint64_t)token * in_dim + k]);
+}
+
+__global__ static void moe_dense_swiglu_f16_kernel(
+        __half *mid_h,
+        const __half *gate_h,
+        const __half *up_h,
+        const float *weights,
+        const uint32_t *offsets,
+        const uint32_t *pairs,
+        uint32_t expert,
+        uint32_t count,
+        uint32_t mid_dim,
+        float clamp) {
+    const uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t total = (uint64_t)count * mid_dim;
+    if (idx >= total || expert >= 256u) return;
+    const uint32_t bucket_row = (uint32_t)(idx / mid_dim);
+    const uint32_t row = (uint32_t)(idx - (uint64_t)bucket_row * mid_dim);
+    const uint32_t pair = pairs[offsets[expert] + bucket_row];
+    float g = __half2float(gate_h[(uint64_t)bucket_row * mid_dim + row]);
+    float u = __half2float(up_h[(uint64_t)bucket_row * mid_dim + row]);
+    if (clamp > 1.0e-6f) {
+        if (g > clamp) g = clamp;
+        if (u > clamp) u = clamp;
+        if (u < -clamp) u = -clamp;
+    }
+    mid_h[idx] = __float2half(moe_silu_oldhip(g) * u * weights[pair]);
+}
+
+__global__ static void moe_dense_scatter_down_f16_kernel(
+        float *down,
+        const __half *down_h,
+        const uint32_t *offsets,
+        const uint32_t *pairs,
+        uint32_t expert,
+        uint32_t count,
+        uint32_t out_dim) {
+    const uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t total = (uint64_t)count * out_dim;
+    if (idx >= total || expert >= 256u) return;
+    const uint32_t bucket_row = (uint32_t)(idx / out_dim);
+    const uint32_t row = (uint32_t)(idx - (uint64_t)bucket_row * out_dim);
+    const uint32_t pair = pairs[offsets[expert] + bucket_row];
+    down[(uint64_t)pair * out_dim + row] = __half2float(down_h[idx]);
+}
+
 __global__ static void moe_gate_up_mid_q2K_rows_w32_kernel(
         float *gate_out,
         float *up_out,

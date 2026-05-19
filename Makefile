@@ -13,7 +13,7 @@ ROCM_PATH ?= /opt/rocm
 ROCM_ARCH ?= gfx1151
 ROCM_HIPCC ?= $(if $(HIPCC),$(HIPCC),$(ROCM_PATH)/bin/hipcc)
 ROCM_CFLAGS ?= -O3 -fno-finite-math-only -pthread -D__HIP_PLATFORM_AMD__ -Wno-unused-command-line-argument --offload-arch=$(ROCM_ARCH)
-ROCM_LDLIBS ?= -lm -pthread -L$(ROCM_PATH)/lib -lhipblas
+ROCM_LDLIBS ?= -lm -pthread -L$(ROCM_PATH)/lib -lhipblas -lhipblaslt
 
 ifeq ($(UNAME_S),Darwin)
 METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal

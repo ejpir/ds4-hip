@@ -29,6 +29,8 @@ Environment:
   DS4_BENCH_GEN_TOKENS=N                 Default gen-tokens; default 32
   DS4_BENCH_CSV=FILE                     Default CSV output path
   DS4_CUDA_MOE_PROFILE=1                 Profile MoE stages in the upstream-shaped backend
+  DS4_CUDA_MOE_DENSE_HOT=1               Prototype dense-hot hipBLASLt MoE path
+  DS4_CUDA_MOE_DENSE_HOT_TOP=1|2|4       Number of hottest experts/layer to route through dense-hot
 
 All DS4_SERVER_* fast-full knobs are translated to both DS4_CUDA_* and DS4_HIP_*
 where the backend has historical aliases, so the upstream-shaped ROCm binary gets
@@ -145,6 +147,11 @@ export_pair_flag MOE_WMMA_HOT "${DS4_SERVER_MOE_WMMA_HOT:-0}"
 export_pair_value MOE_WMMA_GATE_HOT "${DS4_SERVER_MOE_WMMA_GATE_HOT:-}"
 export_pair_value MOE_WMMA_DOWN_HOT "${DS4_SERVER_MOE_WMMA_DOWN_HOT:-}"
 export_pair_value MOE_WMMA_LAYERS "${DS4_SERVER_MOE_WMMA_LAYERS:-}"
+export_pair_flag MOE_DENSE_HOT "${DS4_SERVER_MOE_DENSE_HOT:-0}"
+export_pair_value MOE_DENSE_HOT_TOP "${DS4_SERVER_MOE_DENSE_HOT_TOP:-}"
+export_pair_value MOE_DENSE_HOT_MIN "${DS4_SERVER_MOE_DENSE_HOT_MIN:-}"
+export_pair_value MOE_DENSE_HOT_CACHE_MB "${DS4_SERVER_MOE_DENSE_HOT_CACHE_MB:-}"
+export_pair_flag MOE_DENSE_HOT_NO_CACHE "${DS4_SERVER_MOE_DENSE_HOT_NO_CACHE:-0}"
 export_pair_flag COPY_MODEL "${DS4_SERVER_COPY_MODEL:-0}"
 export_pair_value COPY_MODEL_CHUNK_MB "${DS4_SERVER_COPY_MODEL_CHUNK_MB:-}"
 export_pair_flag CACHE_FINAL_Q8 "${DS4_SERVER_CACHE_FINAL_Q8:-0}"

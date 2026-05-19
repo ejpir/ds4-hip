@@ -1,5 +1,6 @@
 #ifdef __HIP_PLATFORM_AMD__
 #include "ds4_rocm.h"
+#include <hipblaslt/hipblaslt.h>
 
 #define FULL_WARP_MASK 0xFFFFFFFFFFFFFFFFULL
 #define MASK_T uint64_t
@@ -96,6 +97,34 @@ static cudaStream_t g_model_prefetch_stream;
 static cudaStream_t g_model_upload_stream;
 static cublasHandle_t g_cublas;
 static int g_cublas_ready;
+#ifdef __HIP_PLATFORM_AMD__
+static hipblasLtHandle_t g_hipblaslt;
+static int g_hipblaslt_ready;
+struct cuda_moe_dense_hot_cache_entry {
+    const char *base;
+    uint32_t expert;
+    uint32_t in_dim;
+    uint32_t out_dim;
+    uint64_t expert_bytes;
+    uint64_t row_bytes;
+    __half *ptr;
+    uint64_t bytes;
+};
+struct cuda_hipblaslt_gemm_plan {
+    uint32_t out_dim;
+    uint32_t n_tok;
+    uint32_t in_dim;
+    hipblasLtMatmulDesc_t desc;
+    hipblasLtMatrixLayout_t a_desc;
+    hipblasLtMatrixLayout_t b_desc;
+    hipblasLtMatrixLayout_t c_desc;
+    hipblasLtMatrixLayout_t d_desc;
+    hipblasLtMatmulAlgo_t algo;
+};
+static std::vector<cuda_moe_dense_hot_cache_entry> g_moe_dense_hot_cache;
+static uint64_t g_moe_dense_hot_cache_bytes;
+static std::vector<cuda_hipblaslt_gemm_plan> g_hipblaslt_gemm_plans;
+#endif
 static int g_quality_mode;
 
 struct cuda_model_range {
@@ -1377,6 +1406,135 @@ static int cublas_ok(cublasStatus_t st, const char *what) {
     return 0;
 }
 
+#ifdef __HIP_PLATFORM_AMD__
+static void moe_dense_hot_cache_clear(void) {
+    for (size_t i = 0; i < g_moe_dense_hot_cache.size(); i++) {
+        if (g_moe_dense_hot_cache[i].ptr) (void)cudaFree(g_moe_dense_hot_cache[i].ptr);
+    }
+    g_moe_dense_hot_cache.clear();
+    g_moe_dense_hot_cache_bytes = 0;
+}
+
+static void hipblaslt_gemm_plan_clear(void) {
+    for (size_t i = 0; i < g_hipblaslt_gemm_plans.size(); i++) {
+        cuda_hipblaslt_gemm_plan &p = g_hipblaslt_gemm_plans[i];
+        if (p.d_desc) (void)hipblasLtMatrixLayoutDestroy(p.d_desc);
+        if (p.c_desc) (void)hipblasLtMatrixLayoutDestroy(p.c_desc);
+        if (p.b_desc) (void)hipblasLtMatrixLayoutDestroy(p.b_desc);
+        if (p.a_desc) (void)hipblasLtMatrixLayoutDestroy(p.a_desc);
+        if (p.desc) (void)hipblasLtMatmulDescDestroy(p.desc);
+    }
+    g_hipblaslt_gemm_plans.clear();
+}
+
+static int hipblaslt_ok(hipblasStatus_t st, const char *what) {
+    if (st == HIPBLAS_STATUS_SUCCESS) return 1;
+    fprintf(stderr, "ds4: hipBLASLt %s failed: status %d\n", what, (int)st);
+    return 0;
+}
+
+static cuda_hipblaslt_gemm_plan *hipblaslt_gemm_plan_get(
+        uint32_t out_dim,
+        uint32_t n_tok,
+        uint32_t in_dim,
+        const char *label) {
+    for (size_t i = 0; i < g_hipblaslt_gemm_plans.size(); i++) {
+        cuda_hipblaslt_gemm_plan &p = g_hipblaslt_gemm_plans[i];
+        if (p.out_dim == out_dim && p.n_tok == n_tok && p.in_dim == in_dim) return &p;
+    }
+
+    hipblasLtMatmulDesc_t desc = NULL;
+    hipblasLtMatrixLayout_t a_desc = NULL, b_desc = NULL, c_desc = NULL, d_desc = NULL;
+    hipblasLtMatmulPreference_t pref = NULL;
+    hipblasLtMatmulHeuristicResult_t heur[8];
+    int returned = 0;
+    int ok = 0;
+    do {
+        if (!hipblaslt_ok(hipblasLtMatmulDescCreate(&desc, HIPBLAS_COMPUTE_32F, HIP_R_32F),
+                          "matmul desc create")) break;
+        hipblasOperation_t op_a = HIPBLAS_OP_T;
+        hipblasOperation_t op_b = HIPBLAS_OP_N;
+        if (!hipblaslt_ok(hipblasLtMatmulDescSetAttribute(desc, HIPBLASLT_MATMUL_DESC_TRANSA,
+                                                          &op_a, sizeof(op_a)),
+                          "set transA")) break;
+        if (!hipblaslt_ok(hipblasLtMatmulDescSetAttribute(desc, HIPBLASLT_MATMUL_DESC_TRANSB,
+                                                          &op_b, sizeof(op_b)),
+                          "set transB")) break;
+        if (!hipblaslt_ok(hipblasLtMatrixLayoutCreate(&a_desc, HIP_R_16F, in_dim, out_dim, in_dim),
+                          "A layout create")) break;
+        if (!hipblaslt_ok(hipblasLtMatrixLayoutCreate(&b_desc, HIP_R_16F, in_dim, n_tok, in_dim),
+                          "B layout create")) break;
+        if (!hipblaslt_ok(hipblasLtMatrixLayoutCreate(&c_desc, HIP_R_16F, out_dim, n_tok, out_dim),
+                          "C layout create")) break;
+        if (!hipblaslt_ok(hipblasLtMatrixLayoutCreate(&d_desc, HIP_R_16F, out_dim, n_tok, out_dim),
+                          "D layout create")) break;
+        if (!hipblaslt_ok(hipblasLtMatmulPreferenceCreate(&pref), "preference create")) break;
+        const size_t max_workspace = 0;
+        if (!hipblaslt_ok(hipblasLtMatmulPreferenceSetAttribute(
+                                  pref, HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                                  &max_workspace, sizeof(max_workspace)),
+                          "set max workspace")) break;
+        if (!hipblaslt_ok(hipblasLtMatmulAlgoGetHeuristic(g_hipblaslt, desc,
+                                                          a_desc, b_desc, c_desc, d_desc,
+                                                          pref, 8, heur, &returned),
+                          "algo heuristic")) break;
+        if (returned <= 0 || heur[0].state != HIPBLAS_STATUS_SUCCESS) {
+            fprintf(stderr, "ds4: hipBLASLt no algo for %s m=%u n=%u k=%u\n",
+                    label ? label : "gemm", out_dim, n_tok, in_dim);
+            break;
+        }
+        ok = 1;
+    } while (0);
+    if (pref) (void)hipblasLtMatmulPreferenceDestroy(pref);
+    if (!ok) {
+        if (d_desc) (void)hipblasLtMatrixLayoutDestroy(d_desc);
+        if (c_desc) (void)hipblasLtMatrixLayoutDestroy(c_desc);
+        if (b_desc) (void)hipblasLtMatrixLayoutDestroy(b_desc);
+        if (a_desc) (void)hipblasLtMatrixLayoutDestroy(a_desc);
+        if (desc) (void)hipblasLtMatmulDescDestroy(desc);
+        return NULL;
+    }
+
+    cuda_hipblaslt_gemm_plan p;
+    p.out_dim = out_dim;
+    p.n_tok = n_tok;
+    p.in_dim = in_dim;
+    p.desc = desc;
+    p.a_desc = a_desc;
+    p.b_desc = b_desc;
+    p.c_desc = c_desc;
+    p.d_desc = d_desc;
+    p.algo = heur[0].algo;
+    g_hipblaslt_gemm_plans.push_back(p);
+    return &g_hipblaslt_gemm_plans.back();
+}
+
+static int hipblaslt_gemm_tn_f16_out_f16(
+        __half *out,
+        const __half *w_rowmajor_out_in,
+        const __half *x_rowmajor_tok_in,
+        uint32_t out_dim,
+        uint32_t n_tok,
+        uint32_t in_dim,
+        const char *label) {
+    if (!g_hipblaslt_ready || !out || !w_rowmajor_out_in || !x_rowmajor_tok_in ||
+        out_dim == 0 || n_tok == 0 || in_dim == 0) return 0;
+    cuda_hipblaslt_gemm_plan *p = hipblaslt_gemm_plan_get(out_dim, n_tok, in_dim, label);
+    if (!p) return 0;
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    return hipblaslt_ok(hipblasLtMatmul(g_hipblaslt, p->desc, &alpha,
+                                        w_rowmajor_out_in, p->a_desc,
+                                        x_rowmajor_tok_in, p->b_desc,
+                                        &beta,
+                                        out, p->c_desc,
+                                        out, p->d_desc,
+                                        &p->algo,
+                                        NULL, 0, 0),
+                        label ? label : "gemm");
+}
+#endif
+
 extern "C" int ds4_gpu_init(void) {
     int dev = 0;
     if (!cuda_ok(cudaSetDevice(dev), "set device")) return 0;
@@ -1394,16 +1552,34 @@ extern "C" int ds4_gpu_init(void) {
         (void)cublasSetMathMode(g_cublas, math_mode);
         g_cublas_ready = 1;
     }
+#ifdef __HIP_PLATFORM_AMD__
+    if (!g_hipblaslt_ready) {
+        if (hipblaslt_ok(hipblasLtCreate(&g_hipblaslt), "create handle")) {
+            g_hipblaslt_ready = 1;
+        }
+    }
+#endif
     return 1;
 }
 
 extern "C" void ds4_gpu_cleanup(void) {
     (void)cudaDeviceSynchronize();
+#ifdef __HIP_PLATFORM_AMD__
+    moe_dense_hot_cache_clear();
+    hipblaslt_gemm_plan_clear();
+#endif
     if (g_cublas_ready) {
         (void)cublasDestroy(g_cublas);
         g_cublas_ready = 0;
         g_cublas = NULL;
     }
+#ifdef __HIP_PLATFORM_AMD__
+    if (g_hipblaslt_ready) {
+        (void)hipblasLtDestroy(g_hipblaslt);
+        g_hipblaslt_ready = 0;
+        g_hipblaslt = NULL;
+    }
+#endif
     cuda_model_range_release_all();
     cuda_q8_f16_cache_release_all();
     g_q8_f16_disabled_after_oom = 0;
@@ -6832,6 +7008,65 @@ extern "C" int ds4_gpu_router_select_batch_tensor(ds4_gpu_tensor *selected, ds4_
 
 #include "rocm/ds4_rocm_moe.cuh"
 
+#ifdef __HIP_PLATFORM_AMD__
+static __half *moe_dense_weight_f16_cached(
+        const char *base,
+        uint32_t expert,
+        uint32_t in_dim,
+        uint32_t out_dim,
+        uint64_t expert_bytes,
+        uint64_t row_bytes,
+        __half *scratch_w,
+        const char *label,
+        int *ok) {
+    const uint64_t elems = (uint64_t)out_dim * in_dim;
+    const uint64_t bytes = elems * sizeof(__half);
+    const uint32_t cache_limit_mb = cuda_parse_u32_env_alias("DS4_CUDA_MOE_DENSE_HOT_CACHE_MB",
+                                                              "DS4_HIP_MOE_DENSE_HOT_CACHE_MB",
+                                                              6144u, 0u, 1048576u);
+    const uint64_t cache_limit_bytes = (uint64_t)cache_limit_mb * 1024ull * 1024ull;
+    const int dense_no_cache = cuda_env_flag_any3("DS4_CUDA_MOE_DENSE_HOT_NO_CACHE",
+                                                  "DS4_HIP_MOE_DENSE_HOT_NO_CACHE", NULL);
+    if (!dense_no_cache) {
+        for (size_t ci = 0; ci < g_moe_dense_hot_cache.size(); ci++) {
+            cuda_moe_dense_hot_cache_entry &ce = g_moe_dense_hot_cache[ci];
+            if (ce.base == base && ce.expert == expert && ce.in_dim == in_dim &&
+                ce.out_dim == out_dim && ce.expert_bytes == expert_bytes && ce.row_bytes == row_bytes) {
+                return ce.ptr;
+            }
+        }
+        if (cache_limit_bytes == 0 || g_moe_dense_hot_cache_bytes + bytes <= cache_limit_bytes) {
+            __half *cached = NULL;
+            if (cudaMalloc((void **)&cached, bytes) == cudaSuccess && cached != NULL) {
+                moe_q2K_dequant_expert_f16_kernel<<<(elems + 255u) / 256u, 256>>>(
+                        cached, base, expert, in_dim, out_dim, expert_bytes, row_bytes);
+                if (!cuda_ok(cudaGetLastError(), label)) {
+                    (void)cudaFree(cached);
+                    if (ok) *ok = 0;
+                    return scratch_w;
+                }
+                cuda_moe_dense_hot_cache_entry ce;
+                ce.base = base;
+                ce.expert = expert;
+                ce.in_dim = in_dim;
+                ce.out_dim = out_dim;
+                ce.expert_bytes = expert_bytes;
+                ce.row_bytes = row_bytes;
+                ce.ptr = cached;
+                ce.bytes = bytes;
+                g_moe_dense_hot_cache.push_back(ce);
+                g_moe_dense_hot_cache_bytes += bytes;
+                return cached;
+            }
+        }
+    }
+    moe_q2K_dequant_expert_f16_kernel<<<(elems + 255u) / 256u, 256>>>(
+            scratch_w, base, expert, in_dim, out_dim, expert_bytes, row_bytes);
+    if (!cuda_ok(cudaGetLastError(), label) && ok) *ok = 0;
+    return scratch_w;
+}
+#endif
+
 static int routed_moe_launch(
         ds4_gpu_tensor *out,
         ds4_gpu_tensor *gate,
@@ -7364,7 +7599,40 @@ static int routed_moe_launch(
         const uint64_t hot_down_bytes = 256ull * sizeof(uint32_t);
         const uint32_t wmma_tile_capacity = (pair_count + 127u) / 128u + 256u;
         const uint64_t wmma_tile_bytes = (uint64_t)wmma_tile_capacity * sizeof(uint32_t);
-        const uint64_t scratch_bytes = counts_bytes + offsets_bytes + cursors_bytes + sorted_bytes + hot_gate_bytes + hot_down_bytes + 4ull * wmma_tile_bytes;
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+        const int moe_wmma_hot = (getenv("DS4_CUDA_MOE_WMMA_HOT") != NULL ||
+                                  getenv("DS4_HIP_MOE_WMMA_HOT") != NULL) &&
+                                 expert_in_dim % 16u == 0u && expert_mid_dim % 16u == 0u && out_dim % 16u == 0u;
+#else
+        const int moe_wmma_hot = 0;
+#endif
+#ifdef __HIP_PLATFORM_AMD__
+        const int moe_dense_hot = moe_wmma_hot &&
+            cuda_env_flag_any3("DS4_CUDA_MOE_DENSE_HOT", "DS4_HIP_MOE_DENSE_HOT", NULL) &&
+            g_hipblaslt_ready && expert_in_dim == 2048u && expert_mid_dim == 2048u && out_dim == 4096u;
+#else
+        const int moe_dense_hot = 0;
+#endif
+        const uint64_t dense_x_bytes = moe_dense_hot ? (uint64_t)n_tokens * expert_in_dim * sizeof(__half) : 0ull;
+        const uint64_t dense_gate_w_bytes = moe_dense_hot ? (uint64_t)expert_mid_dim * expert_in_dim * sizeof(__half) : 0ull;
+        const uint64_t dense_up_w_bytes = dense_gate_w_bytes;
+        const uint64_t dense_down_w_bytes = moe_dense_hot ? (uint64_t)out_dim * expert_mid_dim * sizeof(__half) : 0ull;
+        const uint64_t dense_gate_bytes = moe_dense_hot ? (uint64_t)n_tokens * expert_mid_dim * sizeof(__half) : 0ull;
+        const uint64_t dense_up_bytes = dense_gate_bytes;
+        const uint64_t dense_down_bytes_h = moe_dense_hot ? (uint64_t)n_tokens * out_dim * sizeof(__half) : 0ull;
+        auto align256 = [](uint64_t v) -> uint64_t { return (v + 255ull) & ~255ull; };
+        uint64_t dense_base = counts_bytes + offsets_bytes + cursors_bytes + sorted_bytes + hot_gate_bytes + hot_down_bytes + 4ull * wmma_tile_bytes;
+        dense_base = align256(dense_base);
+        const uint64_t dense_x_off = dense_base;
+        const uint64_t dense_gate_w_off = align256(dense_x_off + dense_x_bytes);
+        const uint64_t dense_up_w_off = align256(dense_gate_w_off + dense_gate_w_bytes);
+        const uint64_t dense_down_w_off = align256(dense_up_w_off + dense_up_w_bytes);
+        const uint64_t dense_gate_off = align256(dense_down_w_off + dense_down_w_bytes);
+        const uint64_t dense_up_off = align256(dense_gate_off + dense_gate_bytes);
+        const uint64_t dense_down_off = align256(dense_up_off + dense_up_bytes);
+        const uint64_t scratch_bytes = moe_dense_hot
+            ? align256(dense_down_off + dense_down_bytes_h)
+            : dense_base;
         uint8_t *scratch = (uint8_t *)cuda_tmp_alloc(scratch_bytes, "routed_moe q2 expert batch buckets");
         if (!scratch) return 0;
         uint32_t *counts = (uint32_t *)scratch;
@@ -7377,6 +7645,13 @@ static int routed_moe_launch(
         uint32_t *wmma_gate_tile_starts_dev = (uint32_t *)(scratch + counts_bytes + offsets_bytes + cursors_bytes + sorted_bytes + hot_gate_bytes + hot_down_bytes + wmma_tile_bytes);
         uint32_t *wmma_down_tile_experts_dev = (uint32_t *)(scratch + counts_bytes + offsets_bytes + cursors_bytes + sorted_bytes + hot_gate_bytes + hot_down_bytes + 2ull * wmma_tile_bytes);
         uint32_t *wmma_down_tile_starts_dev = (uint32_t *)(scratch + counts_bytes + offsets_bytes + cursors_bytes + sorted_bytes + hot_gate_bytes + hot_down_bytes + 3ull * wmma_tile_bytes);
+        __half *dense_x = moe_dense_hot ? (__half *)(scratch + dense_x_off) : NULL;
+        __half *dense_gate_w = moe_dense_hot ? (__half *)(scratch + dense_gate_w_off) : NULL;
+        __half *dense_up_w = moe_dense_hot ? (__half *)(scratch + dense_up_w_off) : NULL;
+        __half *dense_down_w = moe_dense_hot ? (__half *)(scratch + dense_down_w_off) : NULL;
+        __half *dense_gate_h = moe_dense_hot ? (__half *)(scratch + dense_gate_off) : NULL;
+        __half *dense_up_h = moe_dense_hot ? (__half *)(scratch + dense_up_off) : NULL;
+        __half *dense_down_h = moe_dense_hot ? (__half *)(scratch + dense_down_off) : NULL;
         const uint32_t profile_q2_moe = getenv("DS4_CUDA_MOE_PROFILE") != NULL;
         cudaEvent_t q2_prof[7] = {NULL, NULL, NULL, NULL, NULL, NULL, NULL};
         if (profile_q2_moe) {
@@ -7414,13 +7689,6 @@ static int routed_moe_launch(
         uint32_t wmma_gate_hot_count = 0u, wmma_down_hot_count = 0u;
         uint32_t wmma_gate_hot_max = 0u, wmma_down_hot_max = 0u;
         uint32_t h_counts[256] = {0};
-#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
-        const int moe_wmma_hot = (getenv("DS4_CUDA_MOE_WMMA_HOT") != NULL ||
-                                  getenv("DS4_HIP_MOE_WMMA_HOT") != NULL) &&
-                                 expert_in_dim % 16u == 0u && expert_mid_dim % 16u == 0u && out_dim % 16u == 0u;
-#else
-        const int moe_wmma_hot = 0;
-#endif
         uint32_t wmma_gate_hot_threshold = cuda_parse_u32_env_alias("DS4_CUDA_MOE_WMMA_GATE_HOT",
                                                                     "DS4_HIP_MOE_WMMA_GATE_HOT",
                                                                     16u, 1u, 65535u);
@@ -7436,18 +7704,46 @@ static int routed_moe_launch(
         const uint32_t moe_wmma_tile_hot = moe_wmma_hot &&
             cuda_env_flag_any3("DS4_CUDA_MOE_WMMA_TILE_HOT", "DS4_HIP_MOE_WMMA_TILE_HOT", NULL);
         uint32_t wmma_gate_tile_count = 0u, wmma_down_tile_count = 0u;
-        if (moe_wmma_hot) {
+        uint32_t dense_hot_experts[8] = {0};
+        uint32_t dense_hot_counts[8] = {0};
+        uint8_t dense_hot_mask[256] = {0};
+        uint32_t dense_hot_n = 0u;
+        if (moe_wmma_hot || moe_dense_hot) {
             uint32_t h_gate_hot[256];
             uint32_t h_down_hot[256];
             if (!cuda_ok(cudaMemcpy(h_counts, counts, 256u * sizeof(uint32_t), cudaMemcpyDeviceToHost),
                          "routed_moe q2 wmma counts copy")) return 0;
+            if (moe_dense_hot && moe_wmma_hot) {
+                const uint32_t dense_min = cuda_parse_u32_env_alias("DS4_CUDA_MOE_DENSE_HOT_MIN",
+                                                                     "DS4_HIP_MOE_DENSE_HOT_MIN",
+                                                                     wmma_gate_hot_threshold, 1u, 65535u);
+                uint32_t dense_top = cuda_parse_u32_env_alias("DS4_CUDA_MOE_DENSE_HOT_TOP",
+                                                              "DS4_HIP_MOE_DENSE_HOT_TOP",
+                                                              1u, 1u, 8u);
+                for (uint32_t pick = 0; pick < dense_top; pick++) {
+                    uint32_t best_e = UINT32_MAX;
+                    uint32_t best_c = 0u;
+                    for (uint32_t e = 0; e < 256u; e++) {
+                        const uint32_t c = h_counts[e];
+                        if (!dense_hot_mask[e] && c >= dense_min && c > best_c) {
+                            best_c = c;
+                            best_e = e;
+                        }
+                    }
+                    if (best_e == UINT32_MAX) break;
+                    dense_hot_mask[best_e] = 1u;
+                    dense_hot_experts[dense_hot_n] = best_e;
+                    dense_hot_counts[dense_hot_n] = best_c;
+                    dense_hot_n++;
+                }
+            }
             for (uint32_t e = 0; e < 256u; e++) {
                 const uint32_t c = h_counts[e];
-                if (c >= wmma_gate_hot_threshold) {
+                if (!dense_hot_mask[e] && c >= wmma_gate_hot_threshold) {
                     h_gate_hot[wmma_gate_hot_count++] = e;
                     if (c > wmma_gate_hot_max) wmma_gate_hot_max = c;
                 }
-                if (c >= wmma_down_hot_threshold) {
+                if (!dense_hot_mask[e] && c >= wmma_down_hot_threshold) {
                     h_down_hot[wmma_down_hot_count++] = e;
                     if (c > wmma_down_hot_max) wmma_down_hot_max = c;
                 }
@@ -7471,13 +7767,13 @@ static int routed_moe_launch(
                 down_tile_starts.reserve(wmma_tile_capacity);
                 for (uint32_t e = 0; e < 256u; e++) {
                     const uint32_t c = h_counts[e];
-                    if (c >= wmma_gate_hot_threshold) {
+                    if (!dense_hot_mask[e] && c >= wmma_gate_hot_threshold) {
                         for (uint32_t s = 0; s < c; s += 128u) {
                             gate_tile_experts.push_back(e);
                             gate_tile_starts.push_back(s);
                         }
                     }
-                    if (c >= wmma_down_hot_threshold) {
+                    if (!dense_hot_mask[e] && c >= wmma_down_hot_threshold) {
                         for (uint32_t s = 0; s < c; s += 128u) {
                             down_tile_experts.push_back(e);
                             down_tile_starts.push_back(s);
@@ -7523,8 +7819,8 @@ static int routed_moe_launch(
         const uint32_t down_threads = down_rpb * 32u;
         const size_t gate_shmem = (size_t)gate_tile * 256u * sizeof(float);
         const size_t down_shmem = (size_t)down_tile * 256u * sizeof(float);
-        const uint32_t gate_scalar_max = (moe_wmma_hot && wmma_gate_hot_count != 0u) ? wmma_gate_hot_threshold : 0u;
-        const uint32_t down_scalar_max = (moe_wmma_hot && wmma_down_hot_count != 0u) ? wmma_down_hot_threshold : 0u;
+        const uint32_t gate_scalar_max = ((moe_wmma_hot && wmma_gate_hot_count != 0u) || dense_hot_n != 0u) ? wmma_gate_hot_threshold : 0u;
+        const uint32_t down_scalar_max = ((moe_wmma_hot && wmma_down_hot_count != 0u) || dense_hot_n != 0u) ? wmma_down_hot_threshold : 0u;
         dim3 gate_grid((expert_mid_dim + gate_rpb - 1u) / gate_rpb, 256u, 1);
         if (gate_tile == 4u) {
             moe_gate_up_mid_q2K_expert_batch_sharedx_kernel<4><<<gate_grid, gate_threads, gate_shmem>>>(
@@ -7543,6 +7839,51 @@ static int routed_moe_launch(
                     gate_expert_bytes, gate_row_bytes, clamp);
         }
         if (!cuda_ok(cudaGetLastError(), "routed_moe q2 expert gate/up launch")) return 0;
+#ifdef __HIP_PLATFORM_AMD__
+        if (moe_dense_hot && moe_wmma_hot && dense_hot_n != 0u) {
+            int dense_ok = 1;
+            for (uint32_t di = 0; di < dense_hot_n; di++) {
+                const uint32_t dense_hot_expert = dense_hot_experts[di];
+                const uint32_t dense_hot_count = dense_hot_counts[di];
+                const uint64_t x_elems = (uint64_t)dense_hot_count * expert_in_dim;
+                const uint64_t mid_elems = (uint64_t)dense_hot_count * expert_mid_dim;
+                const uint64_t down_elems = (uint64_t)dense_hot_count * out_dim;
+                __half *gate_w_h = moe_dense_weight_f16_cached(gate_w, dense_hot_expert, expert_in_dim, expert_mid_dim,
+                                                                gate_expert_bytes, gate_row_bytes, dense_gate_w,
+                                                                "routed_moe q2 dense gate dequant launch", &dense_ok);
+                if (!dense_ok) return 0;
+                __half *up_w_h = moe_dense_weight_f16_cached(up_w, dense_hot_expert, expert_in_dim, expert_mid_dim,
+                                                              gate_expert_bytes, gate_row_bytes, dense_up_w,
+                                                              "routed_moe q2 dense up dequant launch", &dense_ok);
+                if (!dense_ok) return 0;
+                __half *down_w_h = moe_dense_weight_f16_cached(down_w, dense_hot_expert, expert_mid_dim, out_dim,
+                                                                down_expert_bytes, down_row_bytes, dense_down_w,
+                                                                "routed_moe q2 dense down dequant launch", &dense_ok);
+                if (!dense_ok) return 0;
+                moe_dense_gather_x_f16_kernel<<<(x_elems + 255u) / 256u, 256>>>(
+                        dense_x, (const float *)x->ptr, offsets, sorted_pairs, dense_hot_expert,
+                        dense_hot_count, expert_in_dim);
+                if (!cuda_ok(cudaGetLastError(), "routed_moe q2 dense gather x launch")) return 0;
+                if (!hipblaslt_gemm_tn_f16_out_f16(dense_gate_h, gate_w_h, dense_x,
+                                                   expert_mid_dim, dense_hot_count, expert_in_dim,
+                                                   "moe dense gate")) return 0;
+                if (!hipblaslt_gemm_tn_f16_out_f16(dense_up_h, up_w_h, dense_x,
+                                                   expert_mid_dim, dense_hot_count, expert_in_dim,
+                                                   "moe dense up")) return 0;
+                moe_dense_swiglu_f16_kernel<<<(mid_elems + 255u) / 256u, 256>>>(
+                        dense_gate_h, dense_gate_h, dense_up_h, (const float *)weights->ptr,
+                        offsets, sorted_pairs, dense_hot_expert, dense_hot_count, expert_mid_dim, clamp);
+                if (!cuda_ok(cudaGetLastError(), "routed_moe q2 dense swiglu launch")) return 0;
+                if (!hipblaslt_gemm_tn_f16_out_f16(dense_down_h, down_w_h, dense_gate_h,
+                                                   out_dim, dense_hot_count, expert_mid_dim,
+                                                   "moe dense down")) return 0;
+                moe_dense_scatter_down_f16_kernel<<<(down_elems + 255u) / 256u, 256>>>(
+                        (float *)down->ptr, dense_down_h, offsets, sorted_pairs, dense_hot_expert,
+                        dense_hot_count, out_dim);
+                if (!cuda_ok(cudaGetLastError(), "routed_moe q2 dense down scatter launch")) return 0;
+            }
+        }
+#endif
         if (q2_prof[2]) (void)cudaEventRecord(q2_prof[2], 0);
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
         if (moe_wmma_hot && wmma_gate_hot_count != 0u) {
@@ -7567,6 +7908,7 @@ static int routed_moe_launch(
                     uint32_t bucket_count = 0u;
                     uint32_t bucket_max = 0u;
                     for (uint32_t e = 0; e < 256u; e++) {
+                        if (dense_hot_mask[e]) continue;
                         const uint32_t c = h_counts[e];
                         if (c >= lo && c < hi) {
                             h_bucket[bucket_count++] = e;
@@ -7673,6 +8015,7 @@ static int routed_moe_launch(
                     uint32_t bucket_count = 0u;
                     uint32_t bucket_max = 0u;
                     for (uint32_t e = 0; e < 256u; e++) {
+                        if (dense_hot_mask[e]) continue;
                         const uint32_t c = h_counts[e];
                         if (c >= lo && c < hi) {
                             h_bucket[bucket_count++] = e;
