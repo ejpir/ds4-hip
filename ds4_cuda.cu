@@ -7790,6 +7790,10 @@ static int routed_moe_launch(
         const uint64_t sorted_bytes = (uint64_t)pair_count * sizeof(uint32_t);
         const uint64_t hot_gate_bytes = 256ull * sizeof(uint32_t);
         const uint64_t hot_down_bytes = 256ull * sizeof(uint32_t);
+        const uint64_t med_gate_bytes = 256ull * sizeof(uint32_t);
+        const uint64_t med_down_bytes = 256ull * sizeof(uint32_t);
+        const uint64_t f16_low_gate_bytes = 256ull * sizeof(uint32_t);
+        const uint64_t f16_low_down_bytes = 256ull * sizeof(uint32_t);
         const uint32_t wmma_tile_capacity = (pair_count + 127u) / 128u + 256u;
         const uint64_t wmma_tile_bytes = (uint64_t)wmma_tile_capacity * sizeof(uint32_t);
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
@@ -7839,7 +7843,7 @@ static int routed_moe_launch(
         const uint64_t dense_up_bytes = dense_gate_bytes;
         const uint64_t dense_down_bytes_h = moe_dense_hot ? (uint64_t)n_tokens * out_dim * sizeof(__half) : 0ull;
         auto align256 = [](uint64_t v) -> uint64_t { return (v + 255ull) & ~255ull; };
-        const uint64_t base_scratch_end = counts_bytes + offsets_bytes + cursors_bytes + sorted_bytes + hot_gate_bytes + hot_down_bytes + 4ull * wmma_tile_bytes;
+        const uint64_t base_scratch_end = counts_bytes + offsets_bytes + cursors_bytes + sorted_bytes + hot_gate_bytes + hot_down_bytes + med_gate_bytes + med_down_bytes + f16_low_gate_bytes + f16_low_down_bytes + 4ull * wmma_tile_bytes;
         const uint64_t f16_mid_off = align256(base_scratch_end);
         const uint64_t f16_down_off = align256(f16_mid_off + f16_mid_bytes);
         const uint64_t f16_pair_mask_off = align256(f16_down_off + f16_down_bytes);
@@ -7860,12 +7864,18 @@ static int routed_moe_launch(
         uint32_t *offsets = (uint32_t *)(scratch + counts_bytes);
         uint32_t *cursors = (uint32_t *)(scratch + counts_bytes + offsets_bytes);
         uint32_t *sorted_pairs = (uint32_t *)(scratch + counts_bytes + offsets_bytes + cursors_bytes);
-        uint32_t *wmma_gate_hot_dev = (uint32_t *)(scratch + counts_bytes + offsets_bytes + cursors_bytes + sorted_bytes);
-        uint32_t *wmma_down_hot_dev = (uint32_t *)(scratch + counts_bytes + offsets_bytes + cursors_bytes + sorted_bytes + hot_gate_bytes);
-        uint32_t *wmma_gate_tile_experts_dev = (uint32_t *)(scratch + counts_bytes + offsets_bytes + cursors_bytes + sorted_bytes + hot_gate_bytes + hot_down_bytes);
-        uint32_t *wmma_gate_tile_starts_dev = (uint32_t *)(scratch + counts_bytes + offsets_bytes + cursors_bytes + sorted_bytes + hot_gate_bytes + hot_down_bytes + wmma_tile_bytes);
-        uint32_t *wmma_down_tile_experts_dev = (uint32_t *)(scratch + counts_bytes + offsets_bytes + cursors_bytes + sorted_bytes + hot_gate_bytes + hot_down_bytes + 2ull * wmma_tile_bytes);
-        uint32_t *wmma_down_tile_starts_dev = (uint32_t *)(scratch + counts_bytes + offsets_bytes + cursors_bytes + sorted_bytes + hot_gate_bytes + hot_down_bytes + 3ull * wmma_tile_bytes);
+        const uint64_t wmma_list_base = counts_bytes + offsets_bytes + cursors_bytes + sorted_bytes;
+        const uint64_t wmma_tile_base = wmma_list_base + hot_gate_bytes + hot_down_bytes + med_gate_bytes + med_down_bytes + f16_low_gate_bytes + f16_low_down_bytes;
+        uint32_t *wmma_gate_hot_dev = (uint32_t *)(scratch + wmma_list_base);
+        uint32_t *wmma_down_hot_dev = (uint32_t *)(scratch + wmma_list_base + hot_gate_bytes);
+        uint32_t *wmma_gate_medium_dev = (uint32_t *)(scratch + wmma_list_base + hot_gate_bytes + hot_down_bytes);
+        uint32_t *wmma_down_medium_dev = (uint32_t *)(scratch + wmma_list_base + hot_gate_bytes + hot_down_bytes + med_gate_bytes);
+        uint32_t *wmma_gate_f16_low_dev = (uint32_t *)(scratch + wmma_list_base + hot_gate_bytes + hot_down_bytes + med_gate_bytes + med_down_bytes);
+        uint32_t *wmma_down_f16_low_dev = (uint32_t *)(scratch + wmma_list_base + hot_gate_bytes + hot_down_bytes + med_gate_bytes + med_down_bytes + f16_low_gate_bytes);
+        uint32_t *wmma_gate_tile_experts_dev = (uint32_t *)(scratch + wmma_tile_base);
+        uint32_t *wmma_gate_tile_starts_dev = (uint32_t *)(scratch + wmma_tile_base + wmma_tile_bytes);
+        uint32_t *wmma_down_tile_experts_dev = (uint32_t *)(scratch + wmma_tile_base + 2ull * wmma_tile_bytes);
+        uint32_t *wmma_down_tile_starts_dev = (uint32_t *)(scratch + wmma_tile_base + 3ull * wmma_tile_bytes);
         __half *wmma_mid_h = moe_wmma_f16_mid ? (__half *)(scratch + f16_mid_off) : NULL;
         __half *wmma_down_h = moe_wmma_f16_down_any ? (__half *)(scratch + f16_down_off) : NULL;
         uint8_t *wmma_f16_pair_mask_dev = (moe_wmma_f16_down && !moe_wmma_f16_down_all) ? (uint8_t *)(scratch + f16_pair_mask_off) : NULL;
@@ -7912,12 +7922,18 @@ static int routed_moe_launch(
 
         uint32_t wmma_gate_hot_count = 0u, wmma_down_hot_count = 0u;
         uint32_t wmma_gate_hot_max = 0u, wmma_down_hot_max = 0u;
+        uint32_t wmma_gate_medium_count = 0u, wmma_down_medium_count = 0u;
+        uint32_t wmma_gate_medium_max = 0u, wmma_down_medium_max = 0u;
         uint32_t wmma_f16_hot_count = 0u, wmma_f16_hot_max = 0u;
+        uint32_t wmma_f16_low_count = 0u, wmma_f16_low_max = 0u;
         uint8_t wmma_f16_hot_mask[256] = {0};
         uint32_t h_counts[256] = {0};
         uint32_t h_gate_hot[256] = {0};
         uint32_t h_down_hot[256] = {0};
+        uint32_t h_gate_medium[256] = {0};
+        uint32_t h_down_medium[256] = {0};
         uint32_t h_f16_hot[256] = {0};
+        uint32_t h_f16_low[256] = {0};
         uint32_t wmma_gate_hot_threshold = cuda_parse_u32_env_alias("DS4_CUDA_MOE_WMMA_GATE_HOT",
                                                                     "DS4_HIP_MOE_WMMA_GATE_HOT",
                                                                     16u, 1u, 65535u);
@@ -7928,6 +7944,24 @@ static int routed_moe_launch(
                                                         "DS4_HIP_MOE_WMMA_MTILES",
                                                         8u, 4u, 16u);
         if (wmma_mtiles != 4u && wmma_mtiles != 8u && wmma_mtiles != 16u) wmma_mtiles = 8u;
+        uint32_t wmma_gate_medium_threshold = cuda_parse_u32_env_alias("DS4_CUDA_MOE_WMMA_GATE_MEDIUM",
+                                                                       "DS4_HIP_MOE_WMMA_GATE_MEDIUM",
+                                                                       12u, 1u, 65535u);
+        uint32_t wmma_down_medium_threshold = cuda_parse_u32_env_alias("DS4_CUDA_MOE_WMMA_DOWN_MEDIUM",
+                                                                       "DS4_HIP_MOE_WMMA_DOWN_MEDIUM",
+                                                                       12u, 1u, 65535u);
+        uint32_t wmma_medium_mtiles = cuda_parse_u32_env_alias("DS4_CUDA_MOE_WMMA_MEDIUM_MTILES",
+                                                               "DS4_HIP_MOE_WMMA_MEDIUM_MTILES",
+                                                               4u, 4u, 8u);
+        if (wmma_medium_mtiles != 4u && wmma_medium_mtiles != 8u) wmma_medium_mtiles = 4u;
+        const uint32_t moe_wmma_medium = moe_wmma_hot &&
+            cuda_env_flag_any3("DS4_CUDA_MOE_WMMA_MEDIUM", "DS4_HIP_MOE_WMMA_MEDIUM", NULL);
+        uint32_t wmma_f16_split_threshold = cuda_parse_u32_env_alias("DS4_CUDA_MOE_WMMA_F16_SPLIT_MIN",
+                                                                     "DS4_HIP_MOE_WMMA_F16_SPLIT_MIN",
+                                                                     64u, 1u, 65535u);
+        const uint32_t moe_wmma_f16_split = moe_wmma_f16_mid &&
+            (!moe_wmma_f16_down || moe_wmma_f16_down_all) &&
+            cuda_env_flag_any3("DS4_CUDA_MOE_WMMA_F16_SPLIT", "DS4_HIP_MOE_WMMA_F16_SPLIT", NULL);
         const uint32_t moe_wmma_split_hot = moe_wmma_hot &&
             cuda_env_flag_any3("DS4_CUDA_MOE_WMMA_SPLIT_HOT", "DS4_HIP_MOE_WMMA_SPLIT_HOT", NULL);
         const uint32_t moe_wmma_tile_hot = moe_wmma_hot &&
@@ -7937,9 +7971,42 @@ static int routed_moe_launch(
         uint32_t dense_hot_counts[8] = {0};
         uint8_t dense_hot_mask[256] = {0};
         uint32_t dense_hot_n = 0u;
-        if (moe_wmma_hot || moe_dense_hot) {
+        uint32_t route_nz = 0u, route_max = 0u;
+        uint32_t route_lt12_e = 0u, route_lt12_p = 0u;
+        uint32_t route_m12_27_e = 0u, route_m12_27_p = 0u;
+        uint32_t route_28_63_e = 0u, route_28_63_p = 0u;
+        uint32_t route_64_127_e = 0u, route_64_127_p = 0u;
+        uint32_t route_128_255_e = 0u, route_128_255_p = 0u;
+        uint32_t route_ge256_e = 0u, route_ge256_p = 0u;
+        if (moe_wmma_hot || moe_dense_hot || profile_q2_moe) {
             if (!cuda_ok(cudaMemcpy(h_counts, counts, 256u * sizeof(uint32_t), cudaMemcpyDeviceToHost),
                          "routed_moe q2 wmma counts copy")) return 0;
+            for (uint32_t e = 0; e < 256u; e++) {
+                const uint32_t c = h_counts[e];
+                if (c != 0u) {
+                    route_nz++;
+                    if (c > route_max) route_max = c;
+                }
+                if (c < 12u) {
+                    if (c != 0u) route_lt12_e++;
+                    route_lt12_p += c;
+                } else if (c < 28u) {
+                    route_m12_27_e++;
+                    route_m12_27_p += c;
+                } else if (c < 64u) {
+                    route_28_63_e++;
+                    route_28_63_p += c;
+                } else if (c < 128u) {
+                    route_64_127_e++;
+                    route_64_127_p += c;
+                } else if (c < 256u) {
+                    route_128_255_e++;
+                    route_128_255_p += c;
+                } else {
+                    route_ge256_e++;
+                    route_ge256_p += c;
+                }
+            }
             if (moe_dense_hot && moe_wmma_hot) {
                 const uint32_t dense_min = cuda_parse_u32_env_alias("DS4_CUDA_MOE_DENSE_HOT_MIN",
                                                                      "DS4_HIP_MOE_DENSE_HOT_MIN",
@@ -7971,8 +8038,13 @@ static int routed_moe_launch(
                     const uint32_t c = h_counts[e];
                     if (!dense_hot_mask[e] && c >= f16_min) {
                         wmma_f16_hot_mask[e] = 1u;
-                        h_f16_hot[wmma_f16_hot_count++] = e;
-                        if (c > wmma_f16_hot_max) wmma_f16_hot_max = c;
+                        if (moe_wmma_f16_split && c < wmma_f16_split_threshold) {
+                            h_f16_low[wmma_f16_low_count++] = e;
+                            if (c > wmma_f16_low_max) wmma_f16_low_max = c;
+                        } else {
+                            h_f16_hot[wmma_f16_hot_count++] = e;
+                            if (c > wmma_f16_hot_max) wmma_f16_hot_max = c;
+                        }
                     }
                 }
             }
@@ -7981,10 +8053,18 @@ static int routed_moe_launch(
                 if (!dense_hot_mask[e] && !wmma_f16_hot_mask[e] && c >= wmma_gate_hot_threshold) {
                     h_gate_hot[wmma_gate_hot_count++] = e;
                     if (c > wmma_gate_hot_max) wmma_gate_hot_max = c;
+                } else if (moe_wmma_medium && !dense_hot_mask[e] && !wmma_f16_hot_mask[e] &&
+                           c >= wmma_gate_medium_threshold && c < wmma_gate_hot_threshold) {
+                    h_gate_medium[wmma_gate_medium_count++] = e;
+                    if (c > wmma_gate_medium_max) wmma_gate_medium_max = c;
                 }
                 if (!dense_hot_mask[e] && !wmma_f16_hot_mask[e] && c >= wmma_down_hot_threshold) {
                     h_down_hot[wmma_down_hot_count++] = e;
                     if (c > wmma_down_hot_max) wmma_down_hot_max = c;
+                } else if (moe_wmma_medium && !dense_hot_mask[e] && !wmma_f16_hot_mask[e] &&
+                           c >= wmma_down_medium_threshold && c < wmma_down_hot_threshold) {
+                    h_down_medium[wmma_down_medium_count++] = e;
+                    if (c > wmma_down_medium_max) wmma_down_medium_max = c;
                 }
             }
             if (wmma_gate_hot_count != 0u &&
@@ -7995,6 +8075,14 @@ static int routed_moe_launch(
                 !cuda_ok(cudaMemcpy(wmma_down_hot_dev, h_down_hot,
                                     wmma_down_hot_count * sizeof(uint32_t), cudaMemcpyHostToDevice),
                          "routed_moe q2 wmma down hot copy")) return 0;
+            if (wmma_gate_medium_count != 0u &&
+                !cuda_ok(cudaMemcpy(wmma_gate_medium_dev, h_gate_medium,
+                                    wmma_gate_medium_count * sizeof(uint32_t), cudaMemcpyHostToDevice),
+                         "routed_moe q2 wmma gate medium copy")) return 0;
+            if (wmma_down_medium_count != 0u &&
+                !cuda_ok(cudaMemcpy(wmma_down_medium_dev, h_down_medium,
+                                    wmma_down_medium_count * sizeof(uint32_t), cudaMemcpyHostToDevice),
+                         "routed_moe q2 wmma down medium copy")) return 0;
             if (moe_wmma_tile_hot) {
                 std::vector<uint32_t> gate_tile_experts;
                 std::vector<uint32_t> gate_tile_starts;
@@ -8058,8 +8146,10 @@ static int routed_moe_launch(
         const uint32_t down_threads = down_rpb * 32u;
         const size_t gate_shmem = (size_t)gate_tile * 256u * sizeof(float);
         const size_t down_shmem = (size_t)down_tile * 256u * sizeof(float);
-        const uint32_t gate_scalar_max = ((moe_wmma_hot && (wmma_gate_hot_count != 0u || wmma_f16_hot_count != 0u)) || dense_hot_n != 0u) ? wmma_gate_hot_threshold : 0u;
-        const uint32_t down_scalar_max = ((moe_wmma_hot && (wmma_down_hot_count != 0u || wmma_f16_hot_count != 0u)) || dense_hot_n != 0u) ? wmma_down_hot_threshold : 0u;
+        const uint32_t gate_scalar_max = ((moe_wmma_hot && (wmma_gate_medium_count != 0u || wmma_gate_hot_count != 0u || wmma_f16_low_count != 0u || wmma_f16_hot_count != 0u)) || dense_hot_n != 0u)
+            ? (wmma_gate_medium_count != 0u ? wmma_gate_medium_threshold : wmma_gate_hot_threshold) : 0u;
+        const uint32_t down_scalar_max = ((moe_wmma_hot && (wmma_down_medium_count != 0u || wmma_down_hot_count != 0u || wmma_f16_low_count != 0u || wmma_f16_hot_count != 0u)) || dense_hot_n != 0u)
+            ? (wmma_down_medium_count != 0u ? wmma_down_medium_threshold : wmma_down_hot_threshold) : 0u;
         dim3 gate_grid((expert_mid_dim + gate_rpb - 1u) / gate_rpb, 256u, 1);
         if (gate_tile == 4u) {
             if (moe_wmma_f16_mid_all) {
@@ -8146,6 +8236,23 @@ static int routed_moe_launch(
 #endif
         if (q2_prof[2]) (void)cudaEventRecord(q2_prof[2], 0);
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+        if (moe_wmma_f16_mid && wmma_f16_low_count != 0u) {
+            constexpr uint32_t mt4 = 4u, bm = 16u, bn = 16u, bk = 16u;
+            const dim3 block(32u * mt4, 1u, 1u);
+            const dim3 grid((expert_mid_dim + 2u * bn - 1u) / (2u * bn),
+                            (wmma_f16_low_max + mt4 * bm - 1u) / (mt4 * bm),
+                            wmma_f16_low_count);
+            const size_t shmem_n2 = (mt4 * bm * bk + 4u * bk * bn) * sizeof(half) +
+                                    (4u * mt4 * bm * bn) * sizeof(float);
+            if (!cuda_ok(cudaMemcpy(wmma_gate_f16_low_dev, h_f16_low,
+                                    wmma_f16_low_count * sizeof(uint32_t), cudaMemcpyHostToDevice),
+                         "routed_moe q2 wmma f16-low hot copy")) return 0;
+            moe_gate_up_mid_q2K_hotlist_wmma_n2_kernel<4,16,16,16,true><<<grid, block, shmem_n2>>>(
+                    NULL, wmma_mid_h, gate_w, up_w, (const float *)x->ptr, (const float *)weights->ptr,
+                    counts, offsets, sorted_pairs, wmma_gate_f16_low_dev, wmma_f16_low_count,
+                    expert_in_dim, expert_mid_dim, gate_expert_bytes, gate_row_bytes, clamp);
+            if (!cuda_ok(cudaGetLastError(), "routed_moe q2 wmma f16-low gate/up launch")) return 0;
+        }
         if (moe_wmma_f16_mid && wmma_f16_hot_count != 0u) {
             constexpr uint32_t mt = 8u, bm = 16u, bn = 16u, bk = 16u;
             const dim3 block(32u * mt, 1u, 1u);
@@ -8162,6 +8269,35 @@ static int routed_moe_launch(
                     counts, offsets, sorted_pairs, wmma_gate_hot_dev, wmma_f16_hot_count,
                     expert_in_dim, expert_mid_dim, gate_expert_bytes, gate_row_bytes, clamp);
             if (!cuda_ok(cudaGetLastError(), "routed_moe q2 wmma f16-mid gate/up launch")) return 0;
+        }
+        if (moe_wmma_medium && wmma_gate_medium_count != 0u) {
+            constexpr uint32_t bm = 16u, bn = 16u, bk = 16u;
+            if (wmma_medium_mtiles == 8u) {
+                constexpr uint32_t mt8 = 8u;
+                const dim3 block(32u * mt8, 1u, 1u);
+                const dim3 grid((expert_mid_dim + 2u * bn - 1u) / (2u * bn),
+                                (wmma_gate_medium_max + mt8 * bm - 1u) / (mt8 * bm),
+                                wmma_gate_medium_count);
+                const size_t shmem_n2 = (mt8 * bm * bk + 4u * bk * bn) * sizeof(half) +
+                                        (4u * mt8 * bm * bn) * sizeof(float);
+                moe_gate_up_mid_q2K_hotlist_wmma_n2_kernel<8,16,16,16><<<grid, block, shmem_n2>>>(
+                        (float *)mid->ptr, NULL, gate_w, up_w, (const float *)x->ptr, (const float *)weights->ptr,
+                        counts, offsets, sorted_pairs, wmma_gate_medium_dev, wmma_gate_medium_count,
+                        expert_in_dim, expert_mid_dim, gate_expert_bytes, gate_row_bytes, clamp);
+            } else {
+                constexpr uint32_t mt4 = 4u;
+                const dim3 block(32u * mt4, 1u, 1u);
+                const dim3 grid((expert_mid_dim + 2u * bn - 1u) / (2u * bn),
+                                (wmma_gate_medium_max + mt4 * bm - 1u) / (mt4 * bm),
+                                wmma_gate_medium_count);
+                const size_t shmem_n2 = (mt4 * bm * bk + 4u * bk * bn) * sizeof(half) +
+                                        (4u * mt4 * bm * bn) * sizeof(float);
+                moe_gate_up_mid_q2K_hotlist_wmma_n2_kernel<4,16,16,16><<<grid, block, shmem_n2>>>(
+                        (float *)mid->ptr, NULL, gate_w, up_w, (const float *)x->ptr, (const float *)weights->ptr,
+                        counts, offsets, sorted_pairs, wmma_gate_medium_dev, wmma_gate_medium_count,
+                        expert_in_dim, expert_mid_dim, gate_expert_bytes, gate_row_bytes, clamp);
+            }
+            if (!cuda_ok(cudaGetLastError(), "routed_moe q2 wmma medium gate/up launch")) return 0;
         }
         if (moe_wmma_hot && wmma_gate_hot_count != 0u) {
             constexpr uint32_t mt = 8u, bm = 16u, bn = 16u, bk = 16u;
@@ -8386,6 +8522,35 @@ static int routed_moe_launch(
         if (!cuda_ok(cudaGetLastError(), "routed_moe q2 expert down launch")) return 0;
         if (q2_prof[4]) (void)cudaEventRecord(q2_prof[4], 0);
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+        if (moe_wmma_f16_mid && wmma_f16_low_count != 0u) {
+            constexpr uint32_t mt4 = 4u, bm = 16u, bn = 16u, bk = 16u;
+            const dim3 block(32u * mt4, 1u, 1u);
+            const dim3 grid((out_dim + 2u * bn - 1u) / (2u * bn),
+                            (wmma_f16_low_max + mt4 * bm - 1u) / (mt4 * bm),
+                            wmma_f16_low_count);
+            const size_t shmem_n2 = (mt4 * bm * bk + 2u * bk * bn) * sizeof(half) +
+                                    (2u * mt4 * bm * bn) * sizeof(float);
+            if (!cuda_ok(cudaMemcpy(wmma_down_f16_low_dev, h_f16_low,
+                                    wmma_f16_low_count * sizeof(uint32_t), cudaMemcpyHostToDevice),
+                         "routed_moe q2 wmma f16-low down hot copy")) return 0;
+            if (moe_wmma_direct_sum) {
+                moe_down_q2K_hotlist_wmma_n2_kernel<4,16,16,16,true,false,true><<<grid, block, shmem_n2>>>(
+                        (float *)out->ptr, NULL, down_w, NULL, wmma_mid_h,
+                        counts, offsets, sorted_pairs, wmma_down_f16_low_dev, wmma_f16_low_count,
+                        expert_mid_dim, out_dim, down_expert_bytes, down_row_bytes);
+            } else if (moe_wmma_f16_down_any) {
+                moe_down_q2K_hotlist_wmma_n2_kernel<4,16,16,16,true,true><<<grid, block, shmem_n2>>>(
+                        NULL, wmma_down_h, down_w, NULL, wmma_mid_h,
+                        counts, offsets, sorted_pairs, wmma_down_f16_low_dev, wmma_f16_low_count,
+                        expert_mid_dim, out_dim, down_expert_bytes, down_row_bytes);
+            } else {
+                moe_down_q2K_hotlist_wmma_n2_kernel<4,16,16,16,true><<<grid, block, shmem_n2>>>(
+                        (float *)down->ptr, NULL, down_w, NULL, wmma_mid_h,
+                        counts, offsets, sorted_pairs, wmma_down_f16_low_dev, wmma_f16_low_count,
+                        expert_mid_dim, out_dim, down_expert_bytes, down_row_bytes);
+            }
+            if (!cuda_ok(cudaGetLastError(), "routed_moe q2 wmma f16-low down launch")) return 0;
+        }
         if (moe_wmma_f16_mid && wmma_f16_hot_count != 0u) {
             constexpr uint32_t mt = 8u, bm = 16u, bn = 16u, bk = 16u;
             const dim3 block(32u * mt, 1u, 1u);
@@ -8423,6 +8588,59 @@ static int routed_moe_launch(
                         wmma_down_hot_dev, wmma_f16_hot_count);
                 if (!cuda_ok(cudaGetLastError(), "routed_moe q2 wmma f16 pair mask mark")) return 0;
             }
+        }
+        if (moe_wmma_medium && wmma_down_medium_count != 0u) {
+            constexpr uint32_t bm = 16u, bn = 16u, bk = 16u;
+            if (wmma_medium_mtiles == 8u) {
+                constexpr uint32_t mt8 = 8u;
+                const dim3 block(32u * mt8, 1u, 1u);
+                const dim3 grid((out_dim + 2u * bn - 1u) / (2u * bn),
+                                (wmma_down_medium_max + mt8 * bm - 1u) / (mt8 * bm),
+                                wmma_down_medium_count);
+                const size_t shmem_n2 = (mt8 * bm * bk + 2u * bk * bn) * sizeof(half) +
+                                        (2u * mt8 * bm * bn) * sizeof(float);
+                if (moe_wmma_direct_sum) {
+                    moe_down_q2K_hotlist_wmma_n2_kernel<8,16,16,16,false,false,true><<<grid, block, shmem_n2>>>(
+                            (float *)out->ptr, NULL, down_w, (const float *)mid->ptr, NULL,
+                            counts, offsets, sorted_pairs, wmma_down_medium_dev, wmma_down_medium_count,
+                            expert_mid_dim, out_dim, down_expert_bytes, down_row_bytes);
+                } else if (moe_wmma_f16_down_all) {
+                    moe_down_q2K_hotlist_wmma_n2_kernel<8,16,16,16,false,true><<<grid, block, shmem_n2>>>(
+                            NULL, wmma_down_h, down_w, (const float *)mid->ptr, NULL,
+                            counts, offsets, sorted_pairs, wmma_down_medium_dev, wmma_down_medium_count,
+                            expert_mid_dim, out_dim, down_expert_bytes, down_row_bytes);
+                } else {
+                    moe_down_q2K_hotlist_wmma_n2_kernel<8,16,16,16><<<grid, block, shmem_n2>>>(
+                            (float *)down->ptr, NULL, down_w, (const float *)mid->ptr, NULL,
+                            counts, offsets, sorted_pairs, wmma_down_medium_dev, wmma_down_medium_count,
+                            expert_mid_dim, out_dim, down_expert_bytes, down_row_bytes);
+                }
+            } else {
+                constexpr uint32_t mt4 = 4u;
+                const dim3 block(32u * mt4, 1u, 1u);
+                const dim3 grid((out_dim + 2u * bn - 1u) / (2u * bn),
+                                (wmma_down_medium_max + mt4 * bm - 1u) / (mt4 * bm),
+                                wmma_down_medium_count);
+                const size_t shmem_n2 = (mt4 * bm * bk + 2u * bk * bn) * sizeof(half) +
+                                        (2u * mt4 * bm * bn) * sizeof(float);
+                if (moe_wmma_direct_sum) {
+                    moe_down_q2K_hotlist_wmma_n2_kernel<4,16,16,16,false,false,true><<<grid, block, shmem_n2>>>(
+                            (float *)out->ptr, NULL, down_w, (const float *)mid->ptr, NULL,
+                            counts, offsets, sorted_pairs, wmma_down_medium_dev, wmma_down_medium_count,
+                            expert_mid_dim, out_dim, down_expert_bytes, down_row_bytes);
+                } else if (moe_wmma_f16_down_all) {
+                    moe_down_q2K_hotlist_wmma_n2_kernel<4,16,16,16,false,true><<<grid, block, shmem_n2>>>(
+                            NULL, wmma_down_h, down_w, (const float *)mid->ptr, NULL,
+                            counts, offsets, sorted_pairs, wmma_down_medium_dev, wmma_down_medium_count,
+                            expert_mid_dim, out_dim, down_expert_bytes, down_row_bytes);
+                } else {
+                    moe_down_q2K_hotlist_wmma_n2_kernel<4,16,16,16><<<grid, block, shmem_n2>>>(
+                            (float *)down->ptr, NULL, down_w, (const float *)mid->ptr, NULL,
+                            counts, offsets, sorted_pairs, wmma_down_medium_dev, wmma_down_medium_count,
+                            expert_mid_dim, out_dim, down_expert_bytes, down_row_bytes);
+                }
+            }
+            if (!cuda_ok(cudaGetLastError(), "routed_moe q2 wmma medium down launch")) return 0;
         }
         if (moe_wmma_hot && wmma_down_hot_count != 0u) {
             constexpr uint32_t mt = 8u, bm = 16u, bn = 16u, bk = 16u;
@@ -8574,10 +8792,15 @@ static int routed_moe_launch(
                 (void)cudaEventElapsedTime(&ms_sum, q2_prof[5], q2_prof[6]);
                 (void)cudaEventElapsedTime(&ms_total, q2_prof[0], q2_prof[6]);
                 fprintf(stderr,
-                        "ds4: CUDA MoE q2 expert profile tokens=%u pairs=%u hot_gate=%u/%u tiles=%u hot_down=%u/%u tiles=%u f16_hot=%u/%u direct=%u f16_mid_all=%u f16_all=%u bucket=%.3f gate_scalar=%.3f gate_wmma=%.3f down_scalar=%.3f down_wmma=%.3f sum=%.3f total=%.3f ms\n",
+                        "ds4: CUDA MoE q2 expert profile tokens=%u pairs=%u hot_gate=%u/%u tiles=%u hot_down=%u/%u tiles=%u med_gate=%u/%u med_down=%u/%u f16_low=%u/%u f16_hot=%u/%u route_nz=%u max=%u lt12=%u/%u m12_27=%u/%u c28_63=%u/%u c64_127=%u/%u c128_255=%u/%u ge256=%u/%u direct=%u f16_mid_all=%u f16_all=%u bucket=%.3f gate_scalar=%.3f gate_wmma=%.3f down_scalar=%.3f down_wmma=%.3f sum=%.3f total=%.3f ms\n",
                         n_tokens, pair_count, wmma_gate_hot_count, wmma_gate_hot_max, wmma_gate_tile_count,
                         wmma_down_hot_count, wmma_down_hot_max, wmma_down_tile_count,
-                        wmma_f16_hot_count, wmma_f16_hot_max,
+                        wmma_gate_medium_count, wmma_gate_medium_max, wmma_down_medium_count, wmma_down_medium_max,
+                        wmma_f16_low_count, wmma_f16_low_max, wmma_f16_hot_count, wmma_f16_hot_max,
+                        route_nz, route_max, route_lt12_e, route_lt12_p,
+                        route_m12_27_e, route_m12_27_p,
+                        route_28_63_e, route_28_63_p, route_64_127_e, route_64_127_p,
+                        route_128_255_e, route_128_255_p, route_ge256_e, route_ge256_p,
                         (uint32_t)moe_wmma_direct_sum, (uint32_t)moe_wmma_f16_mid_all,
                         (uint32_t)moe_wmma_f16_down_all, ms_bucket, ms_gate_scalar, ms_gate_wmma,
                         ms_down_scalar, ms_down_wmma, ms_sum, ms_total);

@@ -37,6 +37,8 @@ Environment:
   DS4_CUDA_MOE_WMMA_F16_MID_ALL=1        Store scalar/cold routed mid scratch as f16 too
   DS4_CUDA_MOE_WMMA_F16_DOWN=1           Hot MoE WMMA writes hot down as f16 and mixed-sums
   DS4_CUDA_MOE_WMMA_F16_DOWN_ALL=1       Store all routed MoE down scratch as f16
+  DS4_CUDA_MOE_WMMA_F16_SPLIT=1          Split low-count f16-hot MoE buckets to MTILES=4
+  DS4_CUDA_MOE_WMMA_F16_SPLIT_MIN=64     Count cutoff for the f16-hot split path
   DS4_CUDA_MOE_WMMA_DIRECT_SUM=1         Atomic-add routed MoE down directly to output
   DS4_CUDA_MOE_DENSE_HOT=1               Prototype dense-hot hipBLASLt MoE path
   DS4_CUDA_MOE_DENSE_HOT_TOP=1|2|4       Number of hottest experts/layer to route through dense-hot
@@ -104,6 +106,8 @@ if [[ "${DS4_SERVER_FAST_FULL:-0}" == "1" ]]; then
   export DS4_SERVER_MOE_WMMA_DOWN_HOT="${DS4_SERVER_MOE_WMMA_DOWN_HOT:-28}"
   export DS4_SERVER_MOE_WMMA_MTILES="${DS4_SERVER_MOE_WMMA_MTILES:-16}"
   export DS4_SERVER_MOE_WMMA_F16_DOWN_ALL="${DS4_SERVER_MOE_WMMA_F16_DOWN_ALL:-1}"
+  export DS4_SERVER_MOE_WMMA_F16_SPLIT="${DS4_SERVER_MOE_WMMA_F16_SPLIT:-1}"
+  export DS4_SERVER_MOE_WMMA_F16_SPLIT_MIN="${DS4_SERVER_MOE_WMMA_F16_SPLIT_MIN:-64}"
 
   # Upstream-shaped extras that are not consumed by the old HIP server path but
   # were part of the fastest ROCm CLI recipe.
@@ -171,6 +175,8 @@ export_pair_flag MOE_WMMA_F16_MID "${DS4_SERVER_MOE_WMMA_F16_MID:-0}"
 export_pair_flag MOE_WMMA_F16_MID_ALL "${DS4_SERVER_MOE_WMMA_F16_MID_ALL:-0}"
 export_pair_flag MOE_WMMA_F16_DOWN "${DS4_SERVER_MOE_WMMA_F16_DOWN:-0}"
 export_pair_flag MOE_WMMA_F16_DOWN_ALL "${DS4_SERVER_MOE_WMMA_F16_DOWN_ALL:-0}"
+export_pair_flag MOE_WMMA_F16_SPLIT "${DS4_SERVER_MOE_WMMA_F16_SPLIT:-0}"
+export_pair_value MOE_WMMA_F16_SPLIT_MIN "${DS4_SERVER_MOE_WMMA_F16_SPLIT_MIN:-}"
 export_pair_flag MOE_WMMA_DIRECT_SUM "${DS4_SERVER_MOE_WMMA_DIRECT_SUM:-0}"
 export_pair_flag MOE_DENSE_HOT "${DS4_SERVER_MOE_DENSE_HOT:-0}"
 export_pair_value MOE_DENSE_HOT_TOP "${DS4_SERVER_MOE_DENSE_HOT_TOP:-}"
