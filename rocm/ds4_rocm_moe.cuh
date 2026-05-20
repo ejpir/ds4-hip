@@ -3016,17 +3016,30 @@ __global__ static void moe_down_q2K_hotlist_wmma_n2_kernel(
 
     const unsigned char *dew = (const unsigned char *)down_base + (uint64_t)expert * down_expert_bytes;
     for (uint32_t k0 = 0; k0 < expert_mid_dim; k0 += BK) {
-        for (uint32_t j = tid; j < MTILES * BM * BK; j += blockDim.x) {
-            const uint32_t mt = j / (BM * BK);
-            const uint32_t rem = j - mt * BM * BK;
-            const uint32_t mm = rem / BK;
-            const uint32_t kk = rem - mm * BK;
-            const uint32_t pair = shPair[mt * BM + mm];
-            if (pair != UINT32_MAX) {
-                if (MID_F16) shA[j] = mid_h[(uint64_t)pair * expert_mid_dim + k0 + kk];
-                else shA[j] = __float2half(mid[(uint64_t)pair * expert_mid_dim + k0 + kk]);
-            } else {
-                shA[j] = __float2half(0.0f);
+        if (MID_F16) {
+            for (uint32_t j = tid; j < MTILES * BM * (BK / 2); j += blockDim.x) {
+                const uint32_t pair_row = j / (BK / 2);
+                const uint32_t kk2 = j - pair_row * (BK / 2);
+                const uint32_t pair = shPair[pair_row];
+                uint32_t v = 0u;
+                if (pair != UINT32_MAX) {
+                    const uint64_t moff = (uint64_t)pair * expert_mid_dim + k0 + kk2 * 2u;
+                    v = *reinterpret_cast<const uint32_t *>(mid_h + moff);
+                }
+                *reinterpret_cast<uint32_t *>(shA + pair_row * BK + kk2 * 2u) = v;
+            }
+        } else {
+            for (uint32_t j = tid; j < MTILES * BM * BK; j += blockDim.x) {
+                const uint32_t mt = j / (BM * BK);
+                const uint32_t rem = j - mt * BM * BK;
+                const uint32_t mm = rem / BK;
+                const uint32_t kk = rem - mm * BK;
+                const uint32_t pair = shPair[mt * BM + mm];
+                if (pair != UINT32_MAX) {
+                    shA[j] = __float2half(mid[(uint64_t)pair * expert_mid_dim + k0 + kk]);
+                } else {
+                    shA[j] = __float2half(0.0f);
+                }
             }
         }
         q2_K_dequant_tile_half_rowwise<BN, BK>(
