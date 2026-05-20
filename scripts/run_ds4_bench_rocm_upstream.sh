@@ -39,6 +39,7 @@ Environment:
   DS4_CUDA_MOE_WMMA_F16_DOWN_ALL=1       Store all routed MoE down scratch as f16
   DS4_CUDA_MOE_WMMA_F16_SPLIT=1          Split low-count f16-hot MoE buckets to MTILES=4
   DS4_CUDA_MOE_WMMA_F16_SPLIT_MIN=64     Count cutoff for the f16-hot split path
+  DS4_CUDA_MOE_WMMA_X_F16=1              Preconvert MoE gate/up input activations to f16 once per chunk
   DS4_CUDA_MOE_SLOT_PARTIAL=1            Route-slot partial down layout [slot, token, dim]
   DS4_CUDA_MOE_WMMA_DIRECT_SUM=1         Atomic-add routed MoE down directly to output
   DS4_CUDA_MOE_DENSE_HOT=1               Prototype dense-hot hipBLASLt MoE path
@@ -109,6 +110,7 @@ if [[ "${DS4_SERVER_FAST_FULL:-0}" == "1" ]]; then
   export DS4_SERVER_MOE_WMMA_F16_DOWN_ALL="${DS4_SERVER_MOE_WMMA_F16_DOWN_ALL:-1}"
   export DS4_SERVER_MOE_WMMA_F16_SPLIT="${DS4_SERVER_MOE_WMMA_F16_SPLIT:-1}"
   export DS4_SERVER_MOE_WMMA_F16_SPLIT_MIN="${DS4_SERVER_MOE_WMMA_F16_SPLIT_MIN:-64}"
+  export DS4_SERVER_MOE_WMMA_X_F16="${DS4_SERVER_MOE_WMMA_X_F16:-1}"
 
   # Upstream-shaped extras that are not consumed by the old HIP server path but
   # were part of the fastest ROCm CLI recipe.
@@ -178,6 +180,7 @@ export_pair_flag MOE_WMMA_F16_DOWN "${DS4_SERVER_MOE_WMMA_F16_DOWN:-0}"
 export_pair_flag MOE_WMMA_F16_DOWN_ALL "${DS4_SERVER_MOE_WMMA_F16_DOWN_ALL:-0}"
 export_pair_flag MOE_WMMA_F16_SPLIT "${DS4_SERVER_MOE_WMMA_F16_SPLIT:-0}"
 export_pair_value MOE_WMMA_F16_SPLIT_MIN "${DS4_SERVER_MOE_WMMA_F16_SPLIT_MIN:-}"
+export_pair_flag MOE_WMMA_X_F16 "${DS4_SERVER_MOE_WMMA_X_F16:-0}"
 export_pair_flag MOE_SLOT_PARTIAL "${DS4_SERVER_MOE_SLOT_PARTIAL:-0}"
 export_pair_flag MOE_WMMA_DIRECT_SUM "${DS4_SERVER_MOE_WMMA_DIRECT_SUM:-0}"
 export_pair_flag MOE_DENSE_HOT "${DS4_SERVER_MOE_DENSE_HOT:-0}"

@@ -2718,13 +2718,14 @@ __global__ static void moe_gate_up_mid_q2K_hotlist_wmma_kernel(
     }
 }
 
-template <int MTILES=8, int BM=16, int BN=16, int BK=16, bool OUT_F16=false>
+template <int MTILES=8, int BM=16, int BN=16, int BK=16, bool OUT_F16=false, bool X_F16=false>
 __global__ static void moe_gate_up_mid_q2K_hotlist_wmma_n2_kernel(
         float *mid_out,
         half *mid_out_h,
         const char *gate_base,
         const char *up_base,
         const float *x,
+        const half *x_h,
         const float *weights,
         const uint32_t *counts,
         const uint32_t *offsets,
@@ -2794,7 +2795,8 @@ __global__ static void moe_gate_up_mid_q2K_hotlist_wmma_n2_kernel(
             const uint32_t pair = shPair[mt * BM + mm];
             if (pair != UINT32_MAX) {
                 const uint32_t token = pair / 6u;
-                shA[j] = __float2half(x[(uint64_t)token * expert_in_dim + k0 + kk]);
+                shA[j] = X_F16 ? x_h[(uint64_t)token * expert_in_dim + k0 + kk]
+                               : __float2half(x[(uint64_t)token * expert_in_dim + k0 + kk]);
             } else {
                 shA[j] = __float2half(0.0f);
             }

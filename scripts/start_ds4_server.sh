@@ -68,6 +68,7 @@ Environment:
   DS4_SERVER_MOE_WMMA_F16_DOWN_ALL=1 Store routed MoE down scratch as f16 in upstream-shaped ROCm; FAST_FULL default 1
   DS4_SERVER_MOE_WMMA_F16_SPLIT=1 Split low-count f16-hot MoE buckets to MTILES=4; FAST_FULL default 1
   DS4_SERVER_MOE_WMMA_F16_SPLIT_MIN=64 Count cutoff for the f16-hot split path; FAST_FULL default 64
+  DS4_SERVER_MOE_WMMA_X_F16=1 Preconvert MoE gate/up input activations to f16 once per chunk; FAST_FULL default 1
   DS4_SERVER_MOE_SLOT_PARTIAL=1 Route-slot partial down layout [slot, token, dim]; experimental/off by default
   DS4_SERVER_MOE_WMMA_LAYERS=LIST Restrict WMMA to layers/ranges, e.g. 14-42; diagnostic/experimental
   DS4_SERVER_COPY_MODEL=1        Copy GGUF tensor payload to HIP allocation using staged chunks
@@ -139,6 +140,7 @@ if [[ "${DS4_SERVER_FAST_FULL:-0}" == "1" ]]; then
   export DS4_SERVER_MOE_WMMA_F16_DOWN_ALL="${DS4_SERVER_MOE_WMMA_F16_DOWN_ALL:-1}"
   export DS4_SERVER_MOE_WMMA_F16_SPLIT="${DS4_SERVER_MOE_WMMA_F16_SPLIT:-1}"
   export DS4_SERVER_MOE_WMMA_F16_SPLIT_MIN="${DS4_SERVER_MOE_WMMA_F16_SPLIT_MIN:-64}"
+  export DS4_SERVER_MOE_WMMA_X_F16="${DS4_SERVER_MOE_WMMA_X_F16:-1}"
 fi
 
 if [[ ! -f "$MODEL" ]]; then
@@ -335,6 +337,10 @@ fi
 if [[ -n "${DS4_SERVER_MOE_WMMA_F16_SPLIT_MIN:-}" ]]; then
   export DS4_CUDA_MOE_WMMA_F16_SPLIT_MIN="$DS4_SERVER_MOE_WMMA_F16_SPLIT_MIN"
   export DS4_HIP_MOE_WMMA_F16_SPLIT_MIN="$DS4_SERVER_MOE_WMMA_F16_SPLIT_MIN"
+fi
+if [[ "${DS4_SERVER_MOE_WMMA_X_F16:-0}" == "1" ]]; then
+  export DS4_CUDA_MOE_WMMA_X_F16=1
+  export DS4_HIP_MOE_WMMA_X_F16=1
 fi
 if [[ "${DS4_SERVER_MOE_SLOT_PARTIAL:-0}" == "1" ]]; then
   export DS4_CUDA_MOE_SLOT_PARTIAL=1
