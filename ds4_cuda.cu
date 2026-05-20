@@ -7638,15 +7638,19 @@ static int routed_moe_launch(
             cuda_env_flag_any3("DS4_CUDA_MOE_WMMA_F16_DOWN", "DS4_HIP_MOE_WMMA_F16_DOWN", NULL);
         const int moe_wmma_f16_down_all_req =
             cuda_env_flag_any3("DS4_CUDA_MOE_WMMA_F16_DOWN_ALL", "DS4_HIP_MOE_WMMA_F16_DOWN_ALL", NULL);
+        const int moe_wmma_direct_sum_req =
+            cuda_env_flag_any3("DS4_CUDA_MOE_WMMA_DIRECT_SUM", "DS4_HIP_MOE_WMMA_DIRECT_SUM", NULL);
         const int moe_wmma_f16_mid = moe_wmma_hot && !moe_dense_hot &&
             (cuda_env_flag_any3("DS4_CUDA_MOE_WMMA_F16_MID", "DS4_HIP_MOE_WMMA_F16_MID", NULL) ||
-             moe_wmma_f16_down_req || moe_wmma_f16_down_all_req) &&
+             moe_wmma_f16_down_req || moe_wmma_f16_down_all_req || moe_wmma_direct_sum_req) &&
             n_expert == 6u && expert_in_dim % 16u == 0u && expert_mid_dim % 16u == 0u && out_dim % 16u == 0u;
-        const int moe_wmma_f16_down = moe_wmma_f16_mid && moe_wmma_f16_down_req;
-        const int moe_wmma_f16_down_all = moe_wmma_f16_mid && moe_wmma_f16_down_all_req;
+        const int moe_wmma_direct_sum = moe_wmma_f16_mid && moe_wmma_direct_sum_req;
+        const int moe_wmma_f16_down = moe_wmma_f16_mid && !moe_wmma_direct_sum && moe_wmma_f16_down_req;
+        const int moe_wmma_f16_down_all = moe_wmma_f16_mid && !moe_wmma_direct_sum && moe_wmma_f16_down_all_req;
 #else
         const int moe_dense_hot = 0;
         const int moe_wmma_f16_mid = 0;
+        const int moe_wmma_direct_sum = 0;
         const int moe_wmma_f16_down = 0;
         const int moe_wmma_f16_down_all = 0;
 #endif
@@ -8056,9 +8060,17 @@ static int routed_moe_launch(
 #endif
         if (q2_prof[3]) (void)cudaEventRecord(q2_prof[3], 0);
 
+        if (moe_wmma_direct_sum &&
+            !cuda_ok(cudaMemset(out->ptr, 0, (uint64_t)n_tokens * out_dim * sizeof(float)),
+                     "routed_moe q2 direct sum output clear")) return 0;
         dim3 down_grid((out_dim + down_rpb - 1u) / down_rpb, 256u, 1);
         if (down_tile == 4u) {
-            if (moe_wmma_f16_down_all) {
+            if (moe_wmma_direct_sum) {
+                moe_down_q2K_expert_batch_sharedmid_kernel<4,false,true><<<down_grid, down_threads, down_shmem>>>(
+                        (float *)out->ptr, NULL, down_w, (const float *)mid->ptr,
+                        counts, offsets, sorted_pairs, 1u, down_scalar_max, expert_mid_dim, out_dim,
+                        down_expert_bytes, down_row_bytes);
+            } else if (moe_wmma_f16_down_all) {
                 moe_down_q2K_expert_batch_sharedmid_kernel<4,true><<<down_grid, down_threads, down_shmem>>>(
                         NULL, wmma_down_h, down_w, (const float *)mid->ptr,
                         counts, offsets, sorted_pairs, 1u, down_scalar_max, expert_mid_dim, out_dim,
@@ -8070,7 +8082,12 @@ static int routed_moe_launch(
                         down_expert_bytes, down_row_bytes);
             }
         } else if (down_tile == 8u) {
-            if (moe_wmma_f16_down_all) {
+            if (moe_wmma_direct_sum) {
+                moe_down_q2K_expert_batch_sharedmid_kernel<8,false,true><<<down_grid, down_threads, down_shmem>>>(
+                        (float *)out->ptr, NULL, down_w, (const float *)mid->ptr,
+                        counts, offsets, sorted_pairs, 1u, down_scalar_max, expert_mid_dim, out_dim,
+                        down_expert_bytes, down_row_bytes);
+            } else if (moe_wmma_f16_down_all) {
                 moe_down_q2K_expert_batch_sharedmid_kernel<8,true><<<down_grid, down_threads, down_shmem>>>(
                         NULL, wmma_down_h, down_w, (const float *)mid->ptr,
                         counts, offsets, sorted_pairs, 1u, down_scalar_max, expert_mid_dim, out_dim,
@@ -8082,7 +8099,12 @@ static int routed_moe_launch(
                         down_expert_bytes, down_row_bytes);
             }
         } else {
-            if (moe_wmma_f16_down_all) {
+            if (moe_wmma_direct_sum) {
+                moe_down_q2K_expert_batch_sharedmid_kernel<16,false,true><<<down_grid, down_threads, down_shmem>>>(
+                        (float *)out->ptr, NULL, down_w, (const float *)mid->ptr,
+                        counts, offsets, sorted_pairs, 1u, down_scalar_max, expert_mid_dim, out_dim,
+                        down_expert_bytes, down_row_bytes);
+            } else if (moe_wmma_f16_down_all) {
                 moe_down_q2K_expert_batch_sharedmid_kernel<16,true><<<down_grid, down_threads, down_shmem>>>(
                         NULL, wmma_down_h, down_w, (const float *)mid->ptr,
                         counts, offsets, sorted_pairs, 1u, down_scalar_max, expert_mid_dim, out_dim,
@@ -8108,7 +8130,12 @@ static int routed_moe_launch(
             if (!cuda_ok(cudaMemcpy(wmma_down_hot_dev, h_f16_hot,
                                     wmma_f16_hot_count * sizeof(uint32_t), cudaMemcpyHostToDevice),
                          "routed_moe q2 wmma f16-mid down hot copy")) return 0;
-            if (moe_wmma_f16_down_any) {
+            if (moe_wmma_direct_sum) {
+                moe_down_q2K_hotlist_wmma_n2_kernel<8,16,16,16,true,false,true><<<grid, block, shmem_n2>>>(
+                        (float *)out->ptr, NULL, down_w, NULL, wmma_mid_h,
+                        counts, offsets, sorted_pairs, wmma_down_hot_dev, wmma_f16_hot_count,
+                        expert_mid_dim, out_dim, down_expert_bytes, down_row_bytes);
+            } else if (moe_wmma_f16_down_any) {
                 moe_down_q2K_hotlist_wmma_n2_kernel<8,16,16,16,true,true><<<grid, block, shmem_n2>>>(
                         NULL, wmma_down_h, down_w, NULL, wmma_mid_h,
                         counts, offsets, sorted_pairs, wmma_down_hot_dev, wmma_f16_hot_count,
@@ -8139,7 +8166,18 @@ static int routed_moe_launch(
                 !cuda_ok(cudaMemcpy(wmma_down_hot_dev, h_down_hot,
                                     wmma_down_hot_count * sizeof(uint32_t), cudaMemcpyHostToDevice),
                          "routed_moe q2 wmma down hot recopy")) return 0;
-            if (moe_wmma_f16_down_all) {
+            if (moe_wmma_direct_sum) {
+                const dim3 grid((out_dim + 2u * bn - 1u) / (2u * bn),
+                                (wmma_down_hot_max + mt * bm - 1u) / (mt * bm),
+                                wmma_down_hot_count);
+                const size_t shmem_n2 = (mt * bm * bk + 2u * bk * bn) * sizeof(half) +
+                                        (2u * mt * bm * bn) * sizeof(float);
+                moe_down_q2K_hotlist_wmma_n2_kernel<8,16,16,16,false,false,true><<<grid, block, shmem_n2>>>(
+                        (float *)out->ptr, NULL, down_w, (const float *)mid->ptr, NULL,
+                        counts, offsets, sorted_pairs, wmma_down_hot_dev, wmma_down_hot_count,
+                        expert_mid_dim, out_dim, down_expert_bytes, down_row_bytes);
+                if (!cuda_ok(cudaGetLastError(), "routed_moe q2 wmma hot down direct-sum launch")) return 0;
+            } else if (moe_wmma_f16_down_all) {
                 const dim3 grid((out_dim + 2u * bn - 1u) / (2u * bn),
                                 (wmma_down_hot_max + mt * bm - 1u) / (mt * bm),
                                 wmma_down_hot_count);
@@ -8232,7 +8270,9 @@ static int routed_moe_launch(
 #endif
         if (q2_prof[5]) (void)cudaEventRecord(q2_prof[5], 0);
         const uint64_t n = (uint64_t)n_tokens * out_dim;
-        if (moe_wmma_f16_down_all) {
+        if (moe_wmma_direct_sum) {
+            ok = 1;
+        } else if (moe_wmma_f16_down_all) {
             moe_sum_f16_kernel<<<(n + 255u) / 256u, 256>>>(
                     (float *)out->ptr, wmma_down_h, out_dim, n_expert, n_tokens);
         } else if (moe_wmma_f16_down && wmma_f16_hot_count != 0u) {
@@ -8257,11 +8297,12 @@ static int routed_moe_launch(
                 (void)cudaEventElapsedTime(&ms_sum, q2_prof[5], q2_prof[6]);
                 (void)cudaEventElapsedTime(&ms_total, q2_prof[0], q2_prof[6]);
                 fprintf(stderr,
-                        "ds4: CUDA MoE q2 expert profile tokens=%u pairs=%u hot_gate=%u/%u tiles=%u hot_down=%u/%u tiles=%u f16_hot=%u/%u bucket=%.3f gate_scalar=%.3f gate_wmma=%.3f down_scalar=%.3f down_wmma=%.3f sum=%.3f total=%.3f ms\n",
+                        "ds4: CUDA MoE q2 expert profile tokens=%u pairs=%u hot_gate=%u/%u tiles=%u hot_down=%u/%u tiles=%u f16_hot=%u/%u direct=%u f16_all=%u bucket=%.3f gate_scalar=%.3f gate_wmma=%.3f down_scalar=%.3f down_wmma=%.3f sum=%.3f total=%.3f ms\n",
                         n_tokens, pair_count, wmma_gate_hot_count, wmma_gate_hot_max, wmma_gate_tile_count,
                         wmma_down_hot_count, wmma_down_hot_max, wmma_down_tile_count,
-                        wmma_f16_hot_count, wmma_f16_hot_max, ms_bucket, ms_gate_scalar,
-                        ms_gate_wmma, ms_down_scalar, ms_down_wmma, ms_sum, ms_total);
+                        wmma_f16_hot_count, wmma_f16_hot_max,
+                        (uint32_t)moe_wmma_direct_sum, (uint32_t)moe_wmma_f16_down_all,
+                        ms_bucket, ms_gate_scalar, ms_gate_wmma, ms_down_scalar, ms_down_wmma, ms_sum, ms_total);
             }
             for (uint32_t i = 0; i < 7u; i++) (void)cudaEventDestroy(q2_prof[i]);
         }
