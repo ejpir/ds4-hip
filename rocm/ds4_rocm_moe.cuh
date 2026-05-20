@@ -1998,6 +1998,19 @@ __global__ static void moe_sum_f16_kernel(float *out, const half *down_h, uint32
     out[gid] = acc;
 }
 
+__global__ static void moe_sum_slot_f16_kernel(float *out, const half *down_h, uint32_t out_dim, uint32_t n_expert, uint32_t n_tokens) {
+    uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t n = (uint64_t)n_tokens * out_dim;
+    if (gid >= n) return;
+    uint32_t tok = gid / out_dim;
+    uint32_t row = gid - (uint64_t)tok * out_dim;
+    float acc = 0.0f;
+    for (uint32_t slot = 0; slot < n_expert; slot++) {
+        acc += __half2float(down_h[((uint64_t)slot * n_tokens + tok) * out_dim + row]);
+    }
+    out[gid] = acc;
+}
+
 __global__ static void moe_mark_hot_pairs_kernel(
         uint8_t *hot_pair_mask,
         const uint32_t *counts,
@@ -2461,7 +2474,7 @@ __global__ static void moe_gate_up_mid_q2K_expert_batch_sharedx_kernel(
     }
 }
 
-template <uint32_t PAIR_TILE, bool MID_F16=false, bool OUT_F16=false, bool DIRECT_OUT=false>
+template <uint32_t PAIR_TILE, bool MID_F16=false, bool OUT_F16=false, bool DIRECT_OUT=false, bool SLOT_MAJOR=false>
 __global__ static void moe_down_q2K_expert_batch_sharedmid_kernel(
         float *down_out,
         half *down_out_h,
@@ -2476,7 +2489,8 @@ __global__ static void moe_down_q2K_expert_batch_sharedmid_kernel(
         uint32_t expert_mid_dim,
         uint32_t out_dim,
         uint64_t down_expert_bytes,
-        uint64_t down_row_bytes) {
+        uint64_t down_row_bytes,
+        uint32_t n_tokens = 0u) {
     extern __shared__ float shmid[];
     const uint32_t tid = threadIdx.x;
     const uint32_t lane = tid & 31u;
@@ -2536,9 +2550,21 @@ __global__ static void moe_down_q2K_expert_batch_sharedmid_kernel(
                         const uint32_t tok = pair[u] / 6u;
                         atomicAdd(down_out + (uint64_t)tok * out_dim + row, acc[u]);
                     } else if (OUT_F16) {
-                        down_out_h[(uint64_t)pair[u] * out_dim + row] = __float2half(acc[u]);
+                        uint64_t dst = (uint64_t)pair[u] * out_dim + row;
+                        if (SLOT_MAJOR) {
+                            const uint32_t tok = pair[u] / 6u;
+                            const uint32_t slot = pair[u] - tok * 6u;
+                            dst = ((uint64_t)slot * n_tokens + tok) * out_dim + row;
+                        }
+                        down_out_h[dst] = __float2half(acc[u]);
                     } else {
-                        down_out[(uint64_t)pair[u] * out_dim + row] = acc[u];
+                        uint64_t dst = (uint64_t)pair[u] * out_dim + row;
+                        if (SLOT_MAJOR) {
+                            const uint32_t tok = pair[u] / 6u;
+                            const uint32_t slot = pair[u] - tok * 6u;
+                            dst = ((uint64_t)slot * n_tokens + tok) * out_dim + row;
+                        }
+                        down_out[dst] = acc[u];
                     }
                 }
             }
@@ -2874,7 +2900,7 @@ __global__ static void moe_down_q2K_hotlist_wmma_kernel(
     }
 }
 
-template <int MTILES=8, int BM=16, int BN=16, int BK=16, bool MID_F16=false, bool OUT_F16=false, bool DIRECT_OUT=false>
+template <int MTILES=8, int BM=16, int BN=16, int BK=16, bool MID_F16=false, bool OUT_F16=false, bool DIRECT_OUT=false, bool SLOT_MAJOR=false>
 __global__ static void moe_down_q2K_hotlist_wmma_n2_kernel(
         float *down_out,
         half *down_out_h,
@@ -2889,7 +2915,8 @@ __global__ static void moe_down_q2K_hotlist_wmma_n2_kernel(
         uint32_t expert_mid_dim,
         uint32_t out_dim,
         uint64_t down_expert_bytes,
-        uint64_t down_row_bytes) {
+        uint64_t down_row_bytes,
+        uint32_t n_tokens = 0u) {
     extern __shared__ unsigned char raw_sh[];
     half *shA = reinterpret_cast<half *>(raw_sh);
     half *shB0 = shA + MTILES * BM * BK;
@@ -2967,19 +2994,33 @@ __global__ static void moe_down_q2K_hotlist_wmma_n2_kernel(
             const uint32_t pair = pairs[first + bucket_row];
             const uint32_t row0 = n0 + nn;
             const uint32_t row1 = n0 + BN + nn;
+            const uint32_t tok = pair / 6u;
+            const uint32_t slot = pair - tok * 6u;
             if (row0 < out_dim) {
                 if (DIRECT_OUT) {
-                    const uint32_t tok = pair / 6u;
                     atomicAdd(down_out + (uint64_t)tok * out_dim + row0, shC0[j]);
-                } else if (OUT_F16) down_out_h[(uint64_t)pair * out_dim + row0] = __float2half(shC0[j]);
-                else down_out[(uint64_t)pair * out_dim + row0] = shC0[j];
+                } else if (OUT_F16) {
+                    uint64_t dst = (uint64_t)pair * out_dim + row0;
+                    if (SLOT_MAJOR) dst = ((uint64_t)slot * n_tokens + tok) * out_dim + row0;
+                    down_out_h[dst] = __float2half(shC0[j]);
+                } else {
+                    uint64_t dst = (uint64_t)pair * out_dim + row0;
+                    if (SLOT_MAJOR) dst = ((uint64_t)slot * n_tokens + tok) * out_dim + row0;
+                    down_out[dst] = shC0[j];
+                }
             }
             if (row1 < out_dim) {
                 if (DIRECT_OUT) {
-                    const uint32_t tok = pair / 6u;
                     atomicAdd(down_out + (uint64_t)tok * out_dim + row1, shC1[j]);
-                } else if (OUT_F16) down_out_h[(uint64_t)pair * out_dim + row1] = __float2half(shC1[j]);
-                else down_out[(uint64_t)pair * out_dim + row1] = shC1[j];
+                } else if (OUT_F16) {
+                    uint64_t dst = (uint64_t)pair * out_dim + row1;
+                    if (SLOT_MAJOR) dst = ((uint64_t)slot * n_tokens + tok) * out_dim + row1;
+                    down_out_h[dst] = __float2half(shC1[j]);
+                } else {
+                    uint64_t dst = (uint64_t)pair * out_dim + row1;
+                    if (SLOT_MAJOR) dst = ((uint64_t)slot * n_tokens + tok) * out_dim + row1;
+                    down_out[dst] = shC1[j];
+                }
             }
         }
     }
