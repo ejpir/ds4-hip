@@ -4305,11 +4305,14 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
     if (weight_bytes > model_size - weight_offset) return 0;
     if (x->bytes < n_tok * in_dim * sizeof(float) ||
         out->bytes < n_tok * out_dim * sizeof(float)) return 0;
-    if (n_tok > 1 && label && strstr(label, "attn_q_b") != NULL &&
+    const int attn_q_b_shape = (in_dim == 1024u && out_dim == 32768u);
+    if (n_tok > 1 &&
+        ((label && strstr(label, "attn_q_b") != NULL) || attn_q_b_shape) &&
         !g_quality_mode &&
-        (getenv("DS4_CUDA_ATTN_Q_B_CUBLAS") != NULL || getenv("DS4_CUDA_Q_PATH_CUBLAS") != NULL) &&
+        (cuda_env_flag_any3("DS4_CUDA_ATTN_Q_B_CUBLAS", "DS4_HIP_ATTN_Q_B_CUBLAS", NULL) ||
+         cuda_env_flag_any3("DS4_CUDA_Q_PATH_CUBLAS", "DS4_HIP_Q_PATH_CUBLAS", NULL)) &&
         cuda_matmul_q8_0_tensor_f16_gemm(out, model_map, model_size, weight_offset,
-                                         in_dim, out_dim, x, n_tok, label)) {
+                                         in_dim, out_dim, x, n_tok, label ? label : "attn_q_b")) {
         return 1;
     }
     if (n_tok > 1 && !g_quality_mode &&

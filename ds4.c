@@ -16924,7 +16924,8 @@ static bool accelerator_cuda_preload_q8_f16_tensors(const ds4_model *m) {
     const bool preload_attn_out = getenv("DS4_CUDA_ATTENTION_OUTPUT_PRELOAD") != NULL ||
                                   getenv("DS4_CUDA_ATTENTION_OUTPUT_CUBLAS") != NULL ||
                                   getenv("DS4_CUDA_ATTENTION_OUTPUT_CUBLAS_ALL") != NULL;
-    const bool preload_q_b = getenv("DS4_CUDA_ATTN_Q_B_PRELOAD") != NULL;
+    const bool preload_q_b = getenv("DS4_CUDA_ATTN_Q_B_PRELOAD") != NULL ||
+                             getenv("DS4_HIP_ATTN_Q_B_PRELOAD") != NULL;
     const bool preload_shared = getenv("DS4_CUDA_SHARED_EXPERT_CUBLAS") != NULL ||
                                 getenv("DS4_CUDA_SHARED_EXPERT_PRELOAD") != NULL;
     const bool preload_shared_down = getenv("DS4_CUDA_SHARED_DOWN_CUBLAS") != NULL ||

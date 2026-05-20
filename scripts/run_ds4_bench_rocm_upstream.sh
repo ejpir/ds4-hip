@@ -30,6 +30,8 @@ Environment:
   DS4_BENCH_CSV=FILE                     Default CSV output path
   DS4_CUDA_MOE_PROFILE=1                 Profile MoE stages in the upstream-shaped backend
   DS4_CUDA_INDEXED_HEADS32=1             Prototype 32-head indexed-attention block on gfx1151
+  DS4_CUDA_ATTN_Q_B_CUBLAS=1             Use f16 GEMM/cache for the large q_b projection
+  DS4_CUDA_ATTN_Q_B_PRELOAD=1            Preload q_b Q8_0 weights into the f16 cache
   DS4_CUDA_MOE_WMMA_MTILES=4|8|16        Hot MoE WMMA token tiles/block
   DS4_CUDA_MOE_WMMA_F16_MID=1            Hot MoE WMMA stores/reads routed mid as f16
   DS4_CUDA_MOE_WMMA_F16_MID_ALL=1        Store scalar/cold routed mid scratch as f16 too
@@ -105,6 +107,8 @@ if [[ "${DS4_SERVER_FAST_FULL:-0}" == "1" ]]; then
   # were part of the fastest ROCm CLI recipe.
   export DS4_CUDA_SHARED_GATE_UP_BATCH_FUSED="${DS4_CUDA_SHARED_GATE_UP_BATCH_FUSED:-1}"
   export DS4_CUDA_SHARED_DOWN_CUBLAS="${DS4_CUDA_SHARED_DOWN_CUBLAS:-1}"
+  export DS4_SERVER_ATTN_Q_B_CUBLAS="${DS4_SERVER_ATTN_Q_B_CUBLAS:-1}"
+  export DS4_SERVER_ATTN_Q_B_PRELOAD="${DS4_SERVER_ATTN_Q_B_PRELOAD:-1}"
   export DS4_CUDA_ATTENTION_OUTPUT_CUBLAS_ALL="${DS4_CUDA_ATTENTION_OUTPUT_CUBLAS_ALL:-1}"
   export DS4_CUDA_ATTENTION_OUTPUT_PACKED_B_CUBLAS="${DS4_CUDA_ATTENTION_OUTPUT_PACKED_B_CUBLAS:-1}"
   export DS4_CUDA_ATTENTION_OUTPUT_INTERLEAVED_B_CUBLAS="${DS4_CUDA_ATTENTION_OUTPUT_INTERLEAVED_B_CUBLAS:-1}"
@@ -129,6 +133,8 @@ export_pair_flag PREFILL_MIXED_FAST "${DS4_SERVER_PREFILL_MIXED_FAST:-0}"
 export_pair_value ATTENTION_INDEXED_FUSED_VALUE_GROUP "${DS4_SERVER_ATTENTION_INDEXED_FUSED_VALUE_GROUP:-}"
 export_pair_value ATTENTION_INDEXED_SPLIT_VALUE_GROUP "${DS4_SERVER_ATTENTION_INDEXED_SPLIT_VALUE_GROUP:-}"
 export_pair_flag INDEXED_HEADS32 "${DS4_SERVER_INDEXED_HEADS32:-0}"
+export_pair_flag ATTN_Q_B_CUBLAS "${DS4_SERVER_ATTN_Q_B_CUBLAS:-0}"
+export_pair_flag ATTN_Q_B_PRELOAD "${DS4_SERVER_ATTN_Q_B_PRELOAD:-0}"
 export_pair_flag Q8_BATCH_FAST "${DS4_SERVER_Q8_BATCH_FAST:-0}"
 export_pair_value Q8_BATCH_TILE "${DS4_SERVER_Q8_BATCH_TILE:-}"
 export_pair_value Q8_BATCH_RPB "${DS4_SERVER_Q8_BATCH_RPB:-}"

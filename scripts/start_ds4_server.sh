@@ -35,6 +35,8 @@ Environment:
   DS4_SERVER_PREFILL_MIXED_FAST=1  Experimental fast compressed/mixed prefill attention
   DS4_SERVER_ATTENTION_INDEXED_FUSED_VALUE_GROUP=4  Fused group4 indexed-attention score/value path; 0 disables
   DS4_SERVER_ATTENTION_INDEXED_SPLIT_VALUE_GROUP=4  Scratch-backed grouped indexed-attention value pass fallback; 0 disables
+  DS4_SERVER_ATTN_Q_B_CUBLAS=1 Use f16 GEMM/cache for the large q_b projection in upstream-shaped ROCm
+  DS4_SERVER_ATTN_Q_B_PRELOAD=1 Preload q_b Q8_0 weights into the f16 cache
   DS4_SERVER_Q8_BATCH_FAST=0|1   Batched Q8_0 prefill matmul is default-on in HIP; set 0 to disable
   DS4_SERVER_Q8_BATCH_TILE=32    Token tile for Q8 batch fast; passed through when set
   DS4_SERVER_Q8_BATCH_RPB=N      Rows/block for Q8 batch fast; default 32
@@ -107,6 +109,8 @@ if [[ "${DS4_SERVER_FAST_FULL:-0}" == "1" ]]; then
   export DS4_SERVER_PREFILL_RAW_FAST="${DS4_SERVER_PREFILL_RAW_FAST:-1}"
   export DS4_SERVER_PREFILL_MIXED_FAST="${DS4_SERVER_PREFILL_MIXED_FAST:-1}"
   export DS4_SERVER_ATTENTION_INDEXED_FUSED_VALUE_GROUP="${DS4_SERVER_ATTENTION_INDEXED_FUSED_VALUE_GROUP:-4}"
+  export DS4_SERVER_ATTN_Q_B_CUBLAS="${DS4_SERVER_ATTN_Q_B_CUBLAS:-1}"
+  export DS4_SERVER_ATTN_Q_B_PRELOAD="${DS4_SERVER_ATTN_Q_B_PRELOAD:-1}"
   export DS4_SERVER_Q8_BATCH_FAST="${DS4_SERVER_Q8_BATCH_FAST:-1}"
   export DS4_SERVER_Q8_BATCH_SHARED_X="${DS4_SERVER_Q8_BATCH_SHARED_X:-1}"
   export DS4_SERVER_Q8_BATCH_TILE="${DS4_SERVER_Q8_BATCH_TILE:-32}"
@@ -219,6 +223,14 @@ if [[ -n "${DS4_SERVER_ATTENTION_INDEXED_FUSED_VALUE_GROUP:-}" ]]; then
 fi
 if [[ -n "${DS4_SERVER_ATTENTION_INDEXED_SPLIT_VALUE_GROUP:-}" ]]; then
   export DS4_HIP_ATTENTION_INDEXED_SPLIT_VALUE_GROUP="$DS4_SERVER_ATTENTION_INDEXED_SPLIT_VALUE_GROUP"
+fi
+if [[ "${DS4_SERVER_ATTN_Q_B_CUBLAS:-0}" == "1" ]]; then
+  export DS4_CUDA_ATTN_Q_B_CUBLAS=1
+  export DS4_HIP_ATTN_Q_B_CUBLAS=1
+fi
+if [[ "${DS4_SERVER_ATTN_Q_B_PRELOAD:-0}" == "1" ]]; then
+  export DS4_CUDA_ATTN_Q_B_PRELOAD=1
+  export DS4_HIP_ATTN_Q_B_PRELOAD=1
 fi
 if [[ "${DS4_SERVER_Q8_BATCH_FAST:-0}" == "1" ]]; then
   export DS4_HIP_Q8_BATCH_FAST=1
