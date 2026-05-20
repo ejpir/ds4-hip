@@ -2153,24 +2153,33 @@ __device__ __forceinline__ static void q2_K_dequant_tile_half_rowwise(
         uint32_t k0,
         uint32_t out_dim,
         uint32_t tid) {
-    for (uint32_t j = tid; j < (uint32_t)(BN * BK); j += blockDim.x) {
-        const uint32_t nn = j / (uint32_t)BK;
-        const uint32_t kk = j - nn * (uint32_t)BK;
+    const uint32_t g = (k0 & 255u) >> 4u;
+    const uint32_t within = g & 7u;
+    const uint32_t qbase = (g >> 3u) * 32u + (within & 1u) * 16u;
+    const uint32_t shift = (within >> 1u) * 2u;
+    constexpr uint32_t KG = 2u;
+    for (uint32_t j = tid; j < (uint32_t)(BN * (BK / KG)); j += blockDim.x) {
+        const uint32_t nn = j / (uint32_t)(BK / KG);
+        const uint32_t kk0 = (j - nn * (uint32_t)(BK / KG)) * KG;
         const uint32_t row = n0 + nn;
         if (row < out_dim) {
-            const uint32_t g = (k0 & 255u) >> 4u;
-            const uint32_t within = g & 7u;
-            const uint32_t qbase = (g >> 3u) * 32u + (within & 1u) * 16u;
-            const uint32_t shift = (within >> 1u) * 2u;
             const unsigned char *blk = base + (uint64_t)row * row_bytes + (uint64_t)(k0 >> 8u) * 84u;
             const float d = dev_f16_to_f32((uint16_t)blk[80] | ((uint16_t)blk[81] << 8));
             const float dm = dev_f16_to_f32((uint16_t)blk[82] | ((uint16_t)blk[83] << 8));
             const float s = (float)(blk[g] & 0x0fu);
             const float m = (float)(blk[g] >> 4u);
-            const float q = (float)((blk[16u + qbase + kk] >> shift) & 3u);
-            shB[kk * (uint32_t)BN + nn] = __float2half(d * s * q - dm * m);
+#pragma unroll
+            for (uint32_t u = 0; u < KG; u++) {
+                const uint32_t kk = kk0 + u;
+                const float q = (float)((blk[16u + qbase + kk] >> shift) & 3u);
+                shB[kk * (uint32_t)BN + nn] = __float2half(d * s * q - dm * m);
+            }
         } else {
-            shB[kk * (uint32_t)BN + nn] = __float2half(0.0f);
+#pragma unroll
+            for (uint32_t u = 0; u < KG; u++) {
+                const uint32_t kk = kk0 + u;
+                shB[kk * (uint32_t)BN + nn] = __float2half(0.0f);
+            }
         }
     }
 }
@@ -2186,15 +2195,16 @@ __device__ __forceinline__ static void q2_K_dequant_dual_tile_half_rowwise(
         uint32_t k0,
         uint32_t out_dim,
         uint32_t tid) {
-    for (uint32_t j = tid; j < (uint32_t)(BN * BK); j += blockDim.x) {
-        const uint32_t nn = j / (uint32_t)BK;
-        const uint32_t kk = j - nn * (uint32_t)BK;
+    const uint32_t g = (k0 & 255u) >> 4u;
+    const uint32_t within = g & 7u;
+    const uint32_t qbase = (g >> 3u) * 32u + (within & 1u) * 16u;
+    const uint32_t shift = (within >> 1u) * 2u;
+    constexpr uint32_t KG = 2u;
+    for (uint32_t j = tid; j < (uint32_t)(BN * (BK / KG)); j += blockDim.x) {
+        const uint32_t nn = j / (uint32_t)(BK / KG);
+        const uint32_t kk0 = (j - nn * (uint32_t)(BK / KG)) * KG;
         const uint32_t row = n0 + nn;
         if (row < out_dim) {
-            const uint32_t g = (k0 & 255u) >> 4u;
-            const uint32_t within = g & 7u;
-            const uint32_t qbase = (g >> 3u) * 32u + (within & 1u) * 16u;
-            const uint32_t shift = (within >> 1u) * 2u;
             const unsigned char *blk0 = base0 + (uint64_t)row * row_bytes + (uint64_t)(k0 >> 8u) * 84u;
             const unsigned char *blk1 = base1 + (uint64_t)row * row_bytes + (uint64_t)(k0 >> 8u) * 84u;
             const float d0 = dev_f16_to_f32((uint16_t)blk0[80] | ((uint16_t)blk0[81] << 8));
@@ -2205,15 +2215,23 @@ __device__ __forceinline__ static void q2_K_dequant_dual_tile_half_rowwise(
             const float m0 = (float)(blk0[g] >> 4u);
             const float s1 = (float)(blk1[g] & 0x0fu);
             const float m1 = (float)(blk1[g] >> 4u);
-            const float q0 = (float)((blk0[16u + qbase + kk] >> shift) & 3u);
-            const float q1 = (float)((blk1[16u + qbase + kk] >> shift) & 3u);
-            const uint32_t sj = kk * (uint32_t)BN + nn;
-            shB0[sj] = __float2half(d0 * s0 * q0 - dm0 * m0);
-            shB1[sj] = __float2half(d1 * s1 * q1 - dm1 * m1);
+#pragma unroll
+            for (uint32_t u = 0; u < KG; u++) {
+                const uint32_t kk = kk0 + u;
+                const float q0 = (float)((blk0[16u + qbase + kk] >> shift) & 3u);
+                const float q1 = (float)((blk1[16u + qbase + kk] >> shift) & 3u);
+                const uint32_t sj = kk * (uint32_t)BN + nn;
+                shB0[sj] = __float2half(d0 * s0 * q0 - dm0 * m0);
+                shB1[sj] = __float2half(d1 * s1 * q1 - dm1 * m1);
+            }
         } else {
-            const uint32_t sj = kk * (uint32_t)BN + nn;
-            shB0[sj] = __float2half(0.0f);
-            shB1[sj] = __float2half(0.0f);
+#pragma unroll
+            for (uint32_t u = 0; u < KG; u++) {
+                const uint32_t kk = kk0 + u;
+                const uint32_t sj = kk * (uint32_t)BN + nn;
+                shB0[sj] = __float2half(0.0f);
+                shB1[sj] = __float2half(0.0f);
+            }
         }
     }
 }
