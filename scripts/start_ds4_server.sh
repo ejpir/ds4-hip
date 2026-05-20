@@ -64,6 +64,7 @@ Environment:
   DS4_SERVER_MOE_WMMA_HOT=1      Opt-in hot-bucket Q2_K WMMA MoE path. Enabled by DS4_SERVER_FAST_FULL=1.
   DS4_SERVER_MOE_WMMA_GATE_HOT=N Gate/up WMMA bucket threshold; FAST_FULL default 32
   DS4_SERVER_MOE_WMMA_DOWN_HOT=N Down WMMA bucket threshold; FAST_FULL default 32
+  DS4_SERVER_MOE_WMMA_MTILES=4|8|16 Hot MoE WMMA token tiles/block; FAST_FULL default 16
   DS4_SERVER_MOE_WMMA_F16_DOWN_ALL=1 Store routed MoE down scratch as f16 in upstream-shaped ROCm; FAST_FULL default 1
   DS4_SERVER_MOE_WMMA_LAYERS=LIST Restrict WMMA to layers/ranges, e.g. 14-42; diagnostic/experimental
   DS4_SERVER_COPY_MODEL=1        Copy GGUF tensor payload to HIP allocation using staged chunks
@@ -131,6 +132,7 @@ if [[ "${DS4_SERVER_FAST_FULL:-0}" == "1" ]]; then
   export DS4_SERVER_MOE_WMMA_HOT="${DS4_SERVER_MOE_WMMA_HOT:-1}"
   export DS4_SERVER_MOE_WMMA_GATE_HOT="${DS4_SERVER_MOE_WMMA_GATE_HOT:-32}"
   export DS4_SERVER_MOE_WMMA_DOWN_HOT="${DS4_SERVER_MOE_WMMA_DOWN_HOT:-32}"
+  export DS4_SERVER_MOE_WMMA_MTILES="${DS4_SERVER_MOE_WMMA_MTILES:-16}"
   export DS4_SERVER_MOE_WMMA_F16_DOWN_ALL="${DS4_SERVER_MOE_WMMA_F16_DOWN_ALL:-1}"
 fi
 
@@ -312,6 +314,10 @@ if [[ -n "${DS4_SERVER_MOE_WMMA_GATE_HOT:-}" ]]; then
 fi
 if [[ -n "${DS4_SERVER_MOE_WMMA_DOWN_HOT:-}" ]]; then
   export DS4_HIP_MOE_WMMA_DOWN_HOT="$DS4_SERVER_MOE_WMMA_DOWN_HOT"
+fi
+if [[ -n "${DS4_SERVER_MOE_WMMA_MTILES:-}" ]]; then
+  export DS4_CUDA_MOE_WMMA_MTILES="$DS4_SERVER_MOE_WMMA_MTILES"
+  export DS4_HIP_MOE_WMMA_MTILES="$DS4_SERVER_MOE_WMMA_MTILES"
 fi
 if [[ "${DS4_SERVER_MOE_WMMA_F16_DOWN_ALL:-0}" == "1" ]]; then
   export DS4_CUDA_MOE_WMMA_F16_DOWN_ALL=1
