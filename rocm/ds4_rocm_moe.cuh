@@ -1987,6 +1987,48 @@ __global__ static void moe_sum_kernel(float *out, const float *down, uint32_t ou
     out[gid] = acc;
 }
 
+__global__ static void moe_mark_hot_pairs_kernel(
+        uint8_t *hot_pair_mask,
+        const uint32_t *counts,
+        const uint32_t *offsets,
+        const uint32_t *pairs,
+        const uint32_t *hot_experts,
+        uint32_t hot_count) {
+    const uint32_t hot_idx = (uint32_t)blockIdx.y;
+    if (hot_idx >= hot_count) return;
+    const uint32_t expert = hot_experts[hot_idx];
+    if (expert >= 256u) return;
+    const uint32_t count = counts[expert];
+    const uint32_t first = offsets[expert];
+    for (uint32_t i = (uint32_t)blockIdx.x * blockDim.x + threadIdx.x;
+         i < count;
+         i += (uint32_t)gridDim.x * blockDim.x) {
+        hot_pair_mask[pairs[first + i]] = 1u;
+    }
+}
+
+__global__ static void moe_sum_f16_hot_kernel(
+        float *out,
+        const float *down,
+        const half *down_h,
+        const uint8_t *hot_pair_mask,
+        uint32_t out_dim,
+        uint32_t n_expert,
+        uint32_t n_tokens) {
+    uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t n = (uint64_t)n_tokens * out_dim;
+    if (gid >= n) return;
+    uint32_t tok = gid / out_dim;
+    uint32_t row = gid - (uint64_t)tok * out_dim;
+    float acc = 0.0f;
+    for (uint32_t slot = 0; slot < n_expert; slot++) {
+        const uint64_t pair = (uint64_t)tok * n_expert + slot;
+        if (hot_pair_mask[pair]) acc += __half2float(down_h[pair * out_dim + row]);
+        else acc += down[pair * out_dim + row];
+    }
+    out[gid] = acc;
+}
+
 __device__ __forceinline__ static void q2_K_scale_broadcast_w32(const unsigned char *blk, float *d, float *dmin) {
     float vd = 0.0f;
     float vm = 0.0f;
@@ -2580,9 +2622,10 @@ __global__ static void moe_gate_up_mid_q2K_hotlist_wmma_kernel(
     }
 }
 
-template <int MTILES=8, int BM=16, int BN=16, int BK=16>
+template <int MTILES=8, int BM=16, int BN=16, int BK=16, bool OUT_F16=false>
 __global__ static void moe_gate_up_mid_q2K_hotlist_wmma_n2_kernel(
         float *mid_out,
+        half *mid_out_h,
         const char *gate_base,
         const char *up_base,
         const float *x,
@@ -2701,7 +2744,9 @@ __global__ static void moe_gate_up_mid_q2K_hotlist_wmma_n2_kernel(
                     if (u > clamp) u = clamp;
                     if (u < -clamp) u = -clamp;
                 }
-                mid_out[(uint64_t)pair * expert_mid_dim + row0] = moe_silu_oldhip(g) * u * wt;
+                const float v = moe_silu_oldhip(g) * u * wt;
+                if (OUT_F16) mid_out_h[(uint64_t)pair * expert_mid_dim + row0] = __float2half(v);
+                else mid_out[(uint64_t)pair * expert_mid_dim + row0] = v;
             }
             if (row1 < expert_mid_dim) {
                 float g = shCg1[j];
@@ -2711,7 +2756,9 @@ __global__ static void moe_gate_up_mid_q2K_hotlist_wmma_n2_kernel(
                     if (u > clamp) u = clamp;
                     if (u < -clamp) u = -clamp;
                 }
-                mid_out[(uint64_t)pair * expert_mid_dim + row1] = moe_silu_oldhip(g) * u * wt;
+                const float v = moe_silu_oldhip(g) * u * wt;
+                if (OUT_F16) mid_out_h[(uint64_t)pair * expert_mid_dim + row1] = __float2half(v);
+                else mid_out[(uint64_t)pair * expert_mid_dim + row1] = v;
             }
         }
     }
@@ -2797,11 +2844,13 @@ __global__ static void moe_down_q2K_hotlist_wmma_kernel(
     }
 }
 
-template <int MTILES=8, int BM=16, int BN=16, int BK=16>
+template <int MTILES=8, int BM=16, int BN=16, int BK=16, bool MID_F16=false, bool OUT_F16=false>
 __global__ static void moe_down_q2K_hotlist_wmma_n2_kernel(
         float *down_out,
+        half *down_out_h,
         const char *down_base,
         const float *mid,
+        const half *mid_h,
         const uint32_t *counts,
         const uint32_t *offsets,
         const uint32_t *pairs,
@@ -2852,7 +2901,8 @@ __global__ static void moe_down_q2K_hotlist_wmma_n2_kernel(
             const uint32_t bucket_row = m_group0 + mt * BM + mm;
             if (bucket_row < count) {
                 const uint32_t pair = pairs[first + bucket_row];
-                shA[j] = __float2half(mid[(uint64_t)pair * expert_mid_dim + k0 + kk]);
+                if (MID_F16) shA[j] = mid_h[(uint64_t)pair * expert_mid_dim + k0 + kk];
+                else shA[j] = __float2half(mid[(uint64_t)pair * expert_mid_dim + k0 + kk]);
             } else {
                 shA[j] = __float2half(0.0f);
             }
@@ -2887,8 +2937,14 @@ __global__ static void moe_down_q2K_hotlist_wmma_n2_kernel(
             const uint32_t pair = pairs[first + bucket_row];
             const uint32_t row0 = n0 + nn;
             const uint32_t row1 = n0 + BN + nn;
-            if (row0 < out_dim) down_out[(uint64_t)pair * out_dim + row0] = shC0[j];
-            if (row1 < out_dim) down_out[(uint64_t)pair * out_dim + row1] = shC1[j];
+            if (row0 < out_dim) {
+                if (OUT_F16) down_out_h[(uint64_t)pair * out_dim + row0] = __float2half(shC0[j]);
+                else down_out[(uint64_t)pair * out_dim + row0] = shC0[j];
+            }
+            if (row1 < out_dim) {
+                if (OUT_F16) down_out_h[(uint64_t)pair * out_dim + row1] = __float2half(shC1[j]);
+                else down_out[(uint64_t)pair * out_dim + row1] = shC1[j];
+            }
         }
     }
 }

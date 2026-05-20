@@ -31,6 +31,8 @@ Environment:
   DS4_CUDA_MOE_PROFILE=1                 Profile MoE stages in the upstream-shaped backend
   DS4_CUDA_INDEXED_HEADS32=1             Prototype 32-head indexed-attention block on gfx1151
   DS4_CUDA_MOE_WMMA_MTILES=4|8|16        Hot MoE WMMA token tiles/block
+  DS4_CUDA_MOE_WMMA_F16_MID=1            Hot MoE WMMA stores/reads routed mid as f16
+  DS4_CUDA_MOE_WMMA_F16_DOWN=1           Hot MoE WMMA writes hot down as f16 and mixed-sums
   DS4_CUDA_MOE_DENSE_HOT=1               Prototype dense-hot hipBLASLt MoE path
   DS4_CUDA_MOE_DENSE_HOT_TOP=1|2|4       Number of hottest experts/layer to route through dense-hot
 
@@ -154,6 +156,8 @@ export_pair_value MOE_WMMA_LAYERS "${DS4_SERVER_MOE_WMMA_LAYERS:-}"
 export_pair_value MOE_WMMA_MTILES "${DS4_SERVER_MOE_WMMA_MTILES:-}"
 export_pair_flag MOE_WMMA_SPLIT_HOT "${DS4_SERVER_MOE_WMMA_SPLIT_HOT:-0}"
 export_pair_flag MOE_WMMA_TILE_HOT "${DS4_SERVER_MOE_WMMA_TILE_HOT:-0}"
+export_pair_flag MOE_WMMA_F16_MID "${DS4_SERVER_MOE_WMMA_F16_MID:-0}"
+export_pair_flag MOE_WMMA_F16_DOWN "${DS4_SERVER_MOE_WMMA_F16_DOWN:-0}"
 export_pair_flag MOE_DENSE_HOT "${DS4_SERVER_MOE_DENSE_HOT:-0}"
 export_pair_value MOE_DENSE_HOT_TOP "${DS4_SERVER_MOE_DENSE_HOT_TOP:-}"
 export_pair_value MOE_DENSE_HOT_MIN "${DS4_SERVER_MOE_DENSE_HOT_MIN:-}"
