@@ -8826,7 +8826,16 @@ static int routed_moe_launch(
         if (moe_wmma_direct_sum) {
             ok = 1;
         } else if (moe_wmma_f16_down_all) {
-            if (moe_slot_partial) {
+            if ((out_dim & 1u) == 0u) {
+                const uint64_t n2 = n >> 1u;
+                if (moe_slot_partial) {
+                    moe_sum_slot_f16x2_kernel<<<(n2 + 255u) / 256u, 256>>>(
+                            (float *)out->ptr, wmma_down_h, out_dim, n_expert, n_tokens);
+                } else {
+                    moe_sum_f16x2_kernel<<<(n2 + 255u) / 256u, 256>>>(
+                            (float *)out->ptr, wmma_down_h, out_dim, n_expert, n_tokens);
+                }
+            } else if (moe_slot_partial) {
                 moe_sum_slot_f16_kernel<<<(n + 255u) / 256u, 256>>>(
                         (float *)out->ptr, wmma_down_h, out_dim, n_expert, n_tokens);
             } else {

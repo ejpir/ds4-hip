@@ -2011,6 +2011,46 @@ __global__ static void moe_sum_slot_f16_kernel(float *out, const half *down_h, u
     out[gid] = acc;
 }
 
+__global__ static void moe_sum_f16x2_kernel(float *out, const half *down_h, uint32_t out_dim, uint32_t n_expert, uint32_t n_tokens) {
+    const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t out_dim2 = out_dim >> 1u;
+    const uint64_t n2 = (uint64_t)n_tokens * out_dim2;
+    if (gid >= n2) return;
+    const uint32_t tok = gid / out_dim2;
+    const uint32_t row = (uint32_t)(gid - (uint64_t)tok * out_dim2) << 1u;
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    for (uint32_t e = 0; e < n_expert; e++) {
+        const uint64_t off = ((uint64_t)tok * n_expert + e) * out_dim + row;
+        const float2 v = __half22float2(*reinterpret_cast<const __half2 *>(down_h + off));
+        acc0 += v.x;
+        acc1 += v.y;
+    }
+    const uint64_t out_off = (uint64_t)tok * out_dim + row;
+    out[out_off] = acc0;
+    out[out_off + 1u] = acc1;
+}
+
+__global__ static void moe_sum_slot_f16x2_kernel(float *out, const half *down_h, uint32_t out_dim, uint32_t n_expert, uint32_t n_tokens) {
+    const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t out_dim2 = out_dim >> 1u;
+    const uint64_t n2 = (uint64_t)n_tokens * out_dim2;
+    if (gid >= n2) return;
+    const uint32_t tok = gid / out_dim2;
+    const uint32_t row = (uint32_t)(gid - (uint64_t)tok * out_dim2) << 1u;
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    for (uint32_t slot = 0; slot < n_expert; slot++) {
+        const uint64_t off = ((uint64_t)slot * n_tokens + tok) * out_dim + row;
+        const float2 v = __half22float2(*reinterpret_cast<const __half2 *>(down_h + off));
+        acc0 += v.x;
+        acc1 += v.y;
+    }
+    const uint64_t out_off = (uint64_t)tok * out_dim + row;
+    out[out_off] = acc0;
+    out[out_off + 1u] = acc1;
+}
+
 __global__ static void moe_mark_hot_pairs_kernel(
         uint8_t *hot_pair_mask,
         const uint32_t *counts,
