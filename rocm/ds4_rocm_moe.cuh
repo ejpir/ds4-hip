@@ -3104,6 +3104,233 @@ __global__ static void moe_gate_up_mid_q2K_hottile_wmma_kernel(
 }
 
 template <int MTILES=8, int BM=16, int BN=16, int BK=16>
+__global__ static void moe_gate_up_mid_q2K_hottile_wmma_n2_kernel(
+        float *mid_out,
+        const char *gate_base,
+        const char *up_base,
+        const float *x,
+        const float *weights,
+        const uint32_t *counts,
+        const uint32_t *offsets,
+        const uint32_t *pairs,
+        const uint32_t *tile_experts,
+        const uint32_t *tile_starts,
+        uint32_t tile_count,
+        uint32_t expert_in_dim,
+        uint32_t expert_mid_dim,
+        uint64_t gate_expert_bytes,
+        uint64_t gate_row_bytes,
+        float clamp) {
+    extern __shared__ unsigned char raw_sh[];
+    half *shA = reinterpret_cast<half *>(raw_sh);
+    half *shBg0 = shA + MTILES * BM * BK;
+    half *shBu0 = shBg0 + BK * BN;
+    half *shBg1 = shBu0 + BK * BN;
+    half *shBu1 = shBg1 + BK * BN;
+    float *shCg0 = reinterpret_cast<float *>(shBu1 + BK * BN);
+    float *shCu0 = shCg0 + MTILES * BM * BN;
+    float *shCg1 = shCu0 + MTILES * BM * BN;
+    float *shCu1 = shCg1 + MTILES * BM * BN;
+    const uint32_t tile_idx = (uint32_t)blockIdx.y;
+    if (tile_idx >= tile_count) return;
+    const uint32_t expert = tile_experts[tile_idx];
+    if (expert >= 256u) return;
+    const uint32_t count = counts[expert];
+    const uint32_t m_group0 = tile_starts[tile_idx];
+    if (m_group0 >= count) return;
+    const uint32_t n0 = (uint32_t)blockIdx.x * (2u * BN);
+    const uint32_t tid = threadIdx.x;
+    const uint32_t wave = tid >> 5u;
+    const uint32_t first = offsets[expert];
+
+    using frag_a = rocwmma::fragment<rocwmma::matrix_a, BM, BN, BK, half, rocwmma::row_major>;
+    using frag_b = rocwmma::fragment<rocwmma::matrix_b, BM, BN, BK, half, rocwmma::row_major>;
+    using frag_c = rocwmma::fragment<rocwmma::accumulator, BM, BN, BK, float>;
+    frag_a a;
+    frag_b bg0, bu0, bg1, bu1;
+    frag_c accg0, accu0, accg1, accu1;
+    if (wave < MTILES) {
+        rocwmma::fill_fragment(accg0, 0.0f);
+        rocwmma::fill_fragment(accu0, 0.0f);
+        rocwmma::fill_fragment(accg1, 0.0f);
+        rocwmma::fill_fragment(accu1, 0.0f);
+    }
+
+    const unsigned char *gew = (const unsigned char *)gate_base + (uint64_t)expert * gate_expert_bytes;
+    const unsigned char *uew = (const unsigned char *)up_base + (uint64_t)expert * gate_expert_bytes;
+    for (uint32_t k0 = 0; k0 < expert_in_dim; k0 += BK) {
+        for (uint32_t j = tid; j < MTILES * BM * BK; j += blockDim.x) {
+            const uint32_t mt = j / (BM * BK);
+            const uint32_t rem = j - mt * BM * BK;
+            const uint32_t mm = rem / BK;
+            const uint32_t kk = rem - mm * BK;
+            const uint32_t bucket_row = m_group0 + mt * BM + mm;
+            if (bucket_row < count) {
+                const uint32_t pair = pairs[first + bucket_row];
+                const uint32_t token = pair / 6u;
+                shA[j] = __float2half(x[(uint64_t)token * expert_in_dim + k0 + kk]);
+            } else {
+                shA[j] = __float2half(0.0f);
+            }
+        }
+        q2_K_dequant_dual_tile_half_rowwise<BN, BK>(
+                shBg0, shBu0, gew, uew, gate_row_bytes, n0, k0, expert_mid_dim, tid);
+        q2_K_dequant_dual_tile_half_rowwise<BN, BK>(
+                shBg1, shBu1, gew, uew, gate_row_bytes, n0 + BN, k0, expert_mid_dim, tid);
+        __syncthreads();
+        if (wave < MTILES) {
+            rocwmma::load_matrix_sync(a, shA + wave * BM * BK, BK);
+            rocwmma::load_matrix_sync(bg0, shBg0, BN);
+            rocwmma::load_matrix_sync(bu0, shBu0, BN);
+            rocwmma::load_matrix_sync(bg1, shBg1, BN);
+            rocwmma::load_matrix_sync(bu1, shBu1, BN);
+            rocwmma::mma_sync(accg0, a, bg0, accg0);
+            rocwmma::mma_sync(accu0, a, bu0, accu0);
+            rocwmma::mma_sync(accg1, a, bg1, accg1);
+            rocwmma::mma_sync(accu1, a, bu1, accu1);
+        }
+        __syncthreads();
+    }
+
+    if (wave < MTILES) {
+        rocwmma::store_matrix_sync(shCg0 + wave * BM * BN, accg0, BN, rocwmma::mem_row_major);
+        rocwmma::store_matrix_sync(shCu0 + wave * BM * BN, accu0, BN, rocwmma::mem_row_major);
+        rocwmma::store_matrix_sync(shCg1 + wave * BM * BN, accg1, BN, rocwmma::mem_row_major);
+        rocwmma::store_matrix_sync(shCu1 + wave * BM * BN, accu1, BN, rocwmma::mem_row_major);
+    }
+    __syncthreads();
+
+    for (uint32_t j = tid; j < MTILES * BM * BN; j += blockDim.x) {
+        const uint32_t mt = j / (BM * BN);
+        const uint32_t rem = j - mt * BM * BN;
+        const uint32_t mm = rem / BN;
+        const uint32_t nn = rem - mm * BN;
+        const uint32_t bucket_row = m_group0 + mt * BM + mm;
+        if (bucket_row < count) {
+            const uint32_t pair = pairs[first + bucket_row];
+            const uint32_t row0 = n0 + nn;
+            const uint32_t row1 = n0 + BN + nn;
+            const float wt = weights[pair];
+            if (row0 < expert_mid_dim) {
+                float g = shCg0[j];
+                float u = shCu0[j];
+                if (clamp > 1.0e-6f) {
+                    if (g > clamp) g = clamp;
+                    if (u > clamp) u = clamp;
+                    if (u < -clamp) u = -clamp;
+                }
+                mid_out[(uint64_t)pair * expert_mid_dim + row0] = moe_silu_oldhip(g) * u * wt;
+            }
+            if (row1 < expert_mid_dim) {
+                float g = shCg1[j];
+                float u = shCu1[j];
+                if (clamp > 1.0e-6f) {
+                    if (g > clamp) g = clamp;
+                    if (u > clamp) u = clamp;
+                    if (u < -clamp) u = -clamp;
+                }
+                mid_out[(uint64_t)pair * expert_mid_dim + row1] = moe_silu_oldhip(g) * u * wt;
+            }
+        }
+    }
+}
+
+template <int MTILES=8, int BM=16, int BN=16, int BK=16>
+__global__ static void moe_down_q2K_hottile_wmma_n2_kernel(
+        float *down_out,
+        const char *down_base,
+        const float *mid,
+        const uint32_t *counts,
+        const uint32_t *offsets,
+        const uint32_t *pairs,
+        const uint32_t *tile_experts,
+        const uint32_t *tile_starts,
+        uint32_t tile_count,
+        uint32_t expert_mid_dim,
+        uint32_t out_dim,
+        uint64_t down_expert_bytes,
+        uint64_t down_row_bytes) {
+    extern __shared__ unsigned char raw_sh[];
+    half *shA = reinterpret_cast<half *>(raw_sh);
+    half *shB0 = shA + MTILES * BM * BK;
+    half *shB1 = shB0 + BK * BN;
+    float *shC0 = reinterpret_cast<float *>(shB1 + BK * BN);
+    float *shC1 = shC0 + MTILES * BM * BN;
+    const uint32_t tile_idx = (uint32_t)blockIdx.y;
+    if (tile_idx >= tile_count) return;
+    const uint32_t expert = tile_experts[tile_idx];
+    if (expert >= 256u) return;
+    const uint32_t count = counts[expert];
+    const uint32_t m_group0 = tile_starts[tile_idx];
+    if (m_group0 >= count) return;
+    const uint32_t n0 = (uint32_t)blockIdx.x * (2u * BN);
+    const uint32_t tid = threadIdx.x;
+    const uint32_t wave = tid >> 5u;
+    const uint32_t first = offsets[expert];
+
+    using frag_a = rocwmma::fragment<rocwmma::matrix_a, BM, BN, BK, half, rocwmma::row_major>;
+    using frag_b = rocwmma::fragment<rocwmma::matrix_b, BM, BN, BK, half, rocwmma::row_major>;
+    using frag_c = rocwmma::fragment<rocwmma::accumulator, BM, BN, BK, float>;
+    frag_a a;
+    frag_b b0, b1;
+    frag_c acc0, acc1;
+    if (wave < MTILES) {
+        rocwmma::fill_fragment(acc0, 0.0f);
+        rocwmma::fill_fragment(acc1, 0.0f);
+    }
+
+    const unsigned char *dew = (const unsigned char *)down_base + (uint64_t)expert * down_expert_bytes;
+    for (uint32_t k0 = 0; k0 < expert_mid_dim; k0 += BK) {
+        for (uint32_t j = tid; j < MTILES * BM * BK; j += blockDim.x) {
+            const uint32_t mt = j / (BM * BK);
+            const uint32_t rem = j - mt * BM * BK;
+            const uint32_t mm = rem / BK;
+            const uint32_t kk = rem - mm * BK;
+            const uint32_t bucket_row = m_group0 + mt * BM + mm;
+            if (bucket_row < count) {
+                const uint32_t pair = pairs[first + bucket_row];
+                shA[j] = __float2half(mid[(uint64_t)pair * expert_mid_dim + k0 + kk]);
+            } else {
+                shA[j] = __float2half(0.0f);
+            }
+        }
+        q2_K_dequant_tile_half_rowwise<BN, BK>(
+                shB0, dew, down_row_bytes, n0, k0, out_dim, tid);
+        q2_K_dequant_tile_half_rowwise<BN, BK>(
+                shB1, dew, down_row_bytes, n0 + BN, k0, out_dim, tid);
+        __syncthreads();
+        if (wave < MTILES) {
+            rocwmma::load_matrix_sync(a, shA + wave * BM * BK, BK);
+            rocwmma::load_matrix_sync(b0, shB0, BN);
+            rocwmma::load_matrix_sync(b1, shB1, BN);
+            rocwmma::mma_sync(acc0, a, b0, acc0);
+            rocwmma::mma_sync(acc1, a, b1, acc1);
+        }
+        __syncthreads();
+    }
+
+    if (wave < MTILES) {
+        rocwmma::store_matrix_sync(shC0 + wave * BM * BN, acc0, BN, rocwmma::mem_row_major);
+        rocwmma::store_matrix_sync(shC1 + wave * BM * BN, acc1, BN, rocwmma::mem_row_major);
+    }
+    __syncthreads();
+    for (uint32_t j = tid; j < MTILES * BM * BN; j += blockDim.x) {
+        const uint32_t mt = j / (BM * BN);
+        const uint32_t rem = j - mt * BM * BN;
+        const uint32_t mm = rem / BN;
+        const uint32_t nn = rem - mm * BN;
+        const uint32_t bucket_row = m_group0 + mt * BM + mm;
+        if (bucket_row < count) {
+            const uint32_t pair = pairs[first + bucket_row];
+            const uint32_t row0 = n0 + nn;
+            const uint32_t row1 = n0 + BN + nn;
+            if (row0 < out_dim) down_out[(uint64_t)pair * out_dim + row0] = shC0[j];
+            if (row1 < out_dim) down_out[(uint64_t)pair * out_dim + row1] = shC1[j];
+        }
+    }
+}
+
+template <int MTILES=8, int BM=16, int BN=16, int BK=16>
 __global__ static void moe_down_q2K_hottile_wmma_kernel(
         float *down_out,
         const char *down_base,
