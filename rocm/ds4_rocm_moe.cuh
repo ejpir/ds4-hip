@@ -1987,6 +1987,17 @@ __global__ static void moe_sum_kernel(float *out, const float *down, uint32_t ou
     out[gid] = acc;
 }
 
+__global__ static void moe_sum_f16_kernel(float *out, const half *down_h, uint32_t out_dim, uint32_t n_expert, uint32_t n_tokens) {
+    uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t n = (uint64_t)n_tokens * out_dim;
+    if (gid >= n) return;
+    uint32_t tok = gid / out_dim;
+    uint32_t row = gid - (uint64_t)tok * out_dim;
+    float acc = 0.0f;
+    for (uint32_t e = 0; e < n_expert; e++) acc += __half2float(down_h[((uint64_t)tok * n_expert + e) * out_dim + row]);
+    out[gid] = acc;
+}
+
 __global__ static void moe_mark_hot_pairs_kernel(
         uint8_t *hot_pair_mask,
         const uint32_t *counts,
@@ -2447,9 +2458,10 @@ __global__ static void moe_gate_up_mid_q2K_expert_batch_sharedx_kernel(
     }
 }
 
-template <uint32_t PAIR_TILE>
+template <uint32_t PAIR_TILE, bool OUT_F16=false>
 __global__ static void moe_down_q2K_expert_batch_sharedmid_kernel(
         float *down_out,
+        half *down_out_h,
         const char *down_base,
         const float *mid,
         const uint32_t *counts,
@@ -2510,7 +2522,10 @@ __global__ static void moe_down_q2K_expert_batch_sharedmid_kernel(
         if (lane == 0u && row_valid) {
 #pragma unroll
             for (uint32_t u = 0; u < PAIR_TILE; u++) {
-                if (pair[u] != UINT32_MAX) down_out[(uint64_t)pair[u] * out_dim + row] = acc[u];
+                if (pair[u] != UINT32_MAX) {
+                    if (OUT_F16) down_out_h[(uint64_t)pair[u] * out_dim + row] = __float2half(acc[u]);
+                    else down_out[(uint64_t)pair[u] * out_dim + row] = acc[u];
+                }
             }
         }
     }
