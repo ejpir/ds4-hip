@@ -819,6 +819,158 @@ static float *cuda_q8_f32_ptr(
     return dev;
 }
 
+static uint32_t cuda_prefill_warmup_tokens(void) {
+    uint32_t n_tok = cuda_parse_u32_env_alias("DS4_CUDA_PREFILL_WARMUP_TOKENS",
+                                             "DS4_HIP_PREFILL_WARMUP_TOKENS",
+                                             2048u, 1u, 4096u);
+    const char *chunk_env = getenv("DS4_METAL_PREFILL_CHUNK");
+    if (chunk_env && chunk_env[0] && !getenv("DS4_CUDA_PREFILL_WARMUP_TOKENS")) {
+        int have = 0;
+        uint64_t v = cuda_parse_u64_env("DS4_METAL_PREFILL_CHUNK", &have);
+        if (have && v > 0 && v <= 4096u) n_tok = (uint32_t)v;
+    }
+    return n_tok;
+}
+
+static void cuda_q8_f16_warmup_attn_q_b_gemm(const __half *w_f16, uint64_t in_dim, uint64_t out_dim) {
+    static int warmed = 0;
+    if (warmed || !g_cublas_ready || !w_f16 || in_dim == 0 || out_dim == 0) return;
+    if (getenv("DS4_CUDA_NO_ATTN_Q_B_WARMUP") != NULL ||
+        getenv("DS4_HIP_NO_ATTN_Q_B_WARMUP") != NULL) return;
+    if (!cuda_env_flag_any3("DS4_CUDA_ATTN_Q_B_CUBLAS", "DS4_HIP_ATTN_Q_B_CUBLAS", NULL) &&
+        !cuda_env_flag_any3("DS4_CUDA_Q_PATH_CUBLAS", "DS4_HIP_Q_PATH_CUBLAS", NULL)) return;
+    warmed = 1;
+    const uint32_t n_tok = cuda_prefill_warmup_tokens();
+    if (n_tok == 0 || in_dim > UINT64_MAX / n_tok || out_dim > UINT64_MAX / n_tok) return;
+    const uint64_t xh_count = (uint64_t)n_tok * in_dim;
+    const uint64_t out_count = (uint64_t)n_tok * out_dim;
+    const uint64_t xh_bytes = xh_count * sizeof(__half);
+    const uint64_t out_off = (xh_bytes + 255ull) & ~255ull;
+    if (out_count > (UINT64_MAX - out_off) / sizeof(float)) return;
+    void *tmp = cuda_tmp_alloc(out_off + out_count * sizeof(float), "attn_q_b f16 gemm warmup");
+    if (!tmp) return;
+    __half *xh = (__half *)tmp;
+    float *out = (float *)((char *)tmp + out_off);
+    if (cudaMemset(xh, 0, (size_t)xh_bytes) != cudaSuccess) return;
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    cublasStatus_t st = cublasGemmEx(g_cublas,
+                                     CUBLAS_OP_T,
+                                     CUBLAS_OP_N,
+                                     (int)out_dim,
+                                     (int)n_tok,
+                                     (int)in_dim,
+                                     &alpha,
+                                     w_f16,
+                                     CUDA_R_16F,
+                                     (int)in_dim,
+                                     xh,
+                                     CUDA_R_16F,
+                                     (int)in_dim,
+                                     &beta,
+                                     out,
+                                     CUDA_R_32F,
+                                     (int)out_dim,
+                                     CUBLAS_COMPUTE_32F,
+                                     CUBLAS_GEMM_DEFAULT);
+    if (st == CUBLAS_STATUS_SUCCESS) (void)cudaDeviceSynchronize();
+}
+
+static void cuda_q8_f16_warmup_attention_output_a_gemm(const __half *out_a_f16,
+                                                       uint64_t group_dim,
+                                                       uint64_t rank,
+                                                       uint32_t n_groups) {
+    static int warmed = 0;
+    if (warmed || !g_cublas_ready || !out_a_f16 || group_dim == 0 || rank == 0 || n_groups == 0) return;
+    if (getenv("DS4_CUDA_NO_ATTENTION_OUTPUT_WARMUP") != NULL ||
+        getenv("DS4_HIP_NO_ATTENTION_OUTPUT_WARMUP") != NULL) return;
+    if (!cuda_env_flag_any3("DS4_CUDA_ATTENTION_OUTPUT_CUBLAS_ALL", "DS4_HIP_ATTENTION_OUTPUT_CUBLAS_ALL", NULL) &&
+        !cuda_env_flag_any3("DS4_CUDA_ATTENTION_OUTPUT_CUBLAS", "DS4_HIP_ATTENTION_OUTPUT_CUBLAS", NULL)) return;
+    warmed = 1;
+    const uint32_t n_tok = cuda_prefill_warmup_tokens();
+    const uint64_t heads_h_count = (uint64_t)n_groups * n_tok * group_dim;
+    const uint64_t low_h_count = (uint64_t)n_groups * n_tok * rank;
+    const uint64_t heads_h_bytes = heads_h_count * sizeof(__half);
+    const uint64_t low_h_off = (heads_h_bytes + 255ull) & ~255ull;
+    if (low_h_count > (UINT64_MAX - low_h_off) / sizeof(__half)) return;
+    void *tmp = cuda_tmp_alloc(low_h_off + low_h_count * sizeof(__half), "attention output a warmup");
+    if (!tmp) return;
+    __half *heads_h = (__half *)tmp;
+    __half *low_h = (__half *)((char *)tmp + low_h_off);
+    if (cudaMemset(heads_h, 0, (size_t)heads_h_bytes) != cudaSuccess) return;
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    cublasStatus_t st = cublasGemmStridedBatchedEx(g_cublas,
+                                                   CUBLAS_OP_T,
+                                                   CUBLAS_OP_N,
+                                                   (int)rank,
+                                                   (int)n_tok,
+                                                   (int)group_dim,
+                                                   &alpha,
+                                                   out_a_f16,
+                                                   CUDA_R_16F,
+                                                   (int)group_dim,
+                                                   (long long)rank * (long long)group_dim,
+                                                   heads_h,
+                                                   CUDA_R_16F,
+                                                   (int)group_dim,
+                                                   (long long)n_tok * (long long)group_dim,
+                                                   &beta,
+                                                   low_h,
+                                                   CUDA_R_16F,
+                                                   (int)(n_groups * rank),
+                                                   (long long)rank,
+                                                   (int)n_groups,
+                                                   CUBLAS_COMPUTE_32F,
+                                                   CUBLAS_GEMM_DEFAULT);
+    if (st == CUBLAS_STATUS_SUCCESS) (void)cudaDeviceSynchronize();
+}
+
+static void cuda_q8_f16_warmup_attention_output_b_gemm(const __half *out_b_f16_t,
+                                                       uint64_t low_dim,
+                                                       uint64_t out_dim) {
+    static int warmed = 0;
+    if (warmed || !g_cublas_ready || !out_b_f16_t || low_dim == 0 || out_dim == 0) return;
+    if (getenv("DS4_CUDA_NO_ATTENTION_OUTPUT_WARMUP") != NULL ||
+        getenv("DS4_HIP_NO_ATTENTION_OUTPUT_WARMUP") != NULL) return;
+    if (!cuda_env_flag_any3("DS4_CUDA_ATTENTION_OUTPUT_CUBLAS_ALL", "DS4_HIP_ATTENTION_OUTPUT_CUBLAS_ALL", NULL) &&
+        !cuda_env_flag_any3("DS4_CUDA_ATTENTION_OUTPUT_B_CUBLAS", "DS4_HIP_ATTENTION_OUTPUT_B_CUBLAS", NULL)) return;
+    warmed = 1;
+    const uint32_t n_tok = cuda_prefill_warmup_tokens();
+    const uint64_t low_h_count = (uint64_t)n_tok * low_dim;
+    const uint64_t out_count = (uint64_t)n_tok * out_dim;
+    const uint64_t low_h_bytes = low_h_count * sizeof(__half);
+    const uint64_t out_off = (low_h_bytes + 255ull) & ~255ull;
+    if (out_count > (UINT64_MAX - out_off) / sizeof(float)) return;
+    void *tmp = cuda_tmp_alloc(out_off + out_count * sizeof(float), "attention output b warmup");
+    if (!tmp) return;
+    __half *low_h = (__half *)tmp;
+    float *out = (float *)((char *)tmp + out_off);
+    if (cudaMemset(low_h, 0, (size_t)low_h_bytes) != cudaSuccess) return;
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    cublasStatus_t st = cublasGemmEx(g_cublas,
+                                     CUBLAS_OP_N,
+                                     CUBLAS_OP_N,
+                                     (int)out_dim,
+                                     (int)n_tok,
+                                     (int)low_dim,
+                                     &alpha,
+                                     out_b_f16_t,
+                                     CUDA_R_16F,
+                                     (int)out_dim,
+                                     low_h,
+                                     CUDA_R_16F,
+                                     (int)low_dim,
+                                     &beta,
+                                     out,
+                                     CUDA_R_32F,
+                                     (int)out_dim,
+                                     CUBLAS_COMPUTE_32F,
+                                     CUBLAS_GEMM_DEFAULT);
+    if (st == CUBLAS_STATUS_SUCCESS) (void)cudaDeviceSynchronize();
+}
+
 static int cuda_ok(cudaError_t err, const char *what) {
     if (err == cudaSuccess) return 1;
     fprintf(stderr, "ds4: CUDA %s failed: %s\n", what, cudaGetErrorString(err));
@@ -1927,9 +2079,23 @@ extern "C" int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_
         getenv("DS4_HIP_ATTENTION_OUTPUT_NO_TRANSPOSED_B_CUBLAS") == NULL &&
         strstr(cache_label, "attn_output_b") != NULL;
     if (preload_transposed_b) {
-        if (cuda_q8_f16_transpose_ptr(model_map, offset, bytes, in_dim, out_dim, cache_label)) return 1;
-    } else if (cuda_q8_f16_ptr(model_map, offset, bytes, in_dim, out_dim, cache_label)) {
-        return 1;
+        const __half *f16_t = cuda_q8_f16_transpose_ptr(model_map, offset, bytes, in_dim, out_dim, cache_label);
+        if (f16_t) {
+            if (strstr(cache_label, "attn_output_b") != NULL && in_dim == 8192u && out_dim == 4096u) {
+                cuda_q8_f16_warmup_attention_output_b_gemm(f16_t, in_dim, out_dim);
+            }
+            return 1;
+        }
+    } else {
+        const __half *f16 = cuda_q8_f16_ptr(model_map, offset, bytes, in_dim, out_dim, cache_label);
+        if (f16) {
+            if (strstr(cache_label, "attn_q_b") != NULL && in_dim == 1024u && out_dim == 32768u) {
+                cuda_q8_f16_warmup_attn_q_b_gemm(f16, in_dim, out_dim);
+            } else if (strstr(cache_label, "attn_output_a") != NULL && in_dim == 4096u && out_dim == 8192u) {
+                cuda_q8_f16_warmup_attention_output_a_gemm(f16, in_dim, 1024u, 8u);
+            }
+            return 1;
+        }
     }
     optional_q8_preload_disabled = 1;
     return 1;
