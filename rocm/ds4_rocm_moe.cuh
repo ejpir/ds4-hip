@@ -2757,6 +2757,12 @@ __global__ static void moe_gate_up_mid_q2K_hotlist_wmma_n2_kernel(
     const uint32_t tid = threadIdx.x;
     const uint32_t wave = tid >> 5u;
     const uint32_t first = offsets[expert];
+    __shared__ uint32_t shPair[MTILES * BM];
+    for (uint32_t j = tid; j < MTILES * BM; j += blockDim.x) {
+        const uint32_t bucket_row = m_group0 + j;
+        shPair[j] = (bucket_row < count) ? pairs[first + bucket_row] : UINT32_MAX;
+    }
+    __syncthreads();
 
     using frag_a = rocwmma::fragment<rocwmma::matrix_a, BM, BN, BK, half, rocwmma::row_major>;
     using frag_b = rocwmma::fragment<rocwmma::matrix_b, BM, BN, BK, half, rocwmma::row_major>;
@@ -2785,9 +2791,8 @@ __global__ static void moe_gate_up_mid_q2K_hotlist_wmma_n2_kernel(
             const uint32_t rem = j - mt * BM * BK;
             const uint32_t mm = rem / BK;
             const uint32_t kk = rem - mm * BK;
-            const uint32_t bucket_row = m_group0 + mt * BM + mm;
-            if (bucket_row < count) {
-                const uint32_t pair = pairs[first + bucket_row];
+            const uint32_t pair = shPair[mt * BM + mm];
+            if (pair != UINT32_MAX) {
                 const uint32_t token = pair / 6u;
                 shA[j] = __float2half(x[(uint64_t)token * expert_in_dim + k0 + kk]);
             } else {
@@ -2826,9 +2831,8 @@ __global__ static void moe_gate_up_mid_q2K_hotlist_wmma_n2_kernel(
         const uint32_t rem = j - mt * BM * BN;
         const uint32_t mm = rem / BN;
         const uint32_t nn = rem - mm * BN;
-        const uint32_t bucket_row = m_group0 + mt * BM + mm;
-        if (bucket_row < count) {
-            const uint32_t pair = pairs[first + bucket_row];
+        const uint32_t pair = shPair[mt * BM + mm];
+        if (pair != UINT32_MAX) {
             const uint32_t row0 = n0 + nn;
             const uint32_t row1 = n0 + BN + nn;
             const float wt = weights[pair];
@@ -2974,6 +2978,12 @@ __global__ static void moe_down_q2K_hotlist_wmma_n2_kernel(
     const uint32_t tid = threadIdx.x;
     const uint32_t wave = tid >> 5u;
     const uint32_t first = offsets[expert];
+    __shared__ uint32_t shPair[MTILES * BM];
+    for (uint32_t j = tid; j < MTILES * BM; j += blockDim.x) {
+        const uint32_t bucket_row = m_group0 + j;
+        shPair[j] = (bucket_row < count) ? pairs[first + bucket_row] : UINT32_MAX;
+    }
+    __syncthreads();
 
     using frag_a = rocwmma::fragment<rocwmma::matrix_a, BM, BN, BK, half, rocwmma::row_major>;
     using frag_b = rocwmma::fragment<rocwmma::matrix_b, BM, BN, BK, half, rocwmma::row_major>;
@@ -2995,9 +3005,8 @@ __global__ static void moe_down_q2K_hotlist_wmma_n2_kernel(
             const uint32_t rem = j - mt * BM * BK;
             const uint32_t mm = rem / BK;
             const uint32_t kk = rem - mm * BK;
-            const uint32_t bucket_row = m_group0 + mt * BM + mm;
-            if (bucket_row < count) {
-                const uint32_t pair = pairs[first + bucket_row];
+            const uint32_t pair = shPair[mt * BM + mm];
+            if (pair != UINT32_MAX) {
                 if (MID_F16) shA[j] = mid_h[(uint64_t)pair * expert_mid_dim + k0 + kk];
                 else shA[j] = __float2half(mid[(uint64_t)pair * expert_mid_dim + k0 + kk]);
             } else {
@@ -3029,9 +3038,8 @@ __global__ static void moe_down_q2K_hotlist_wmma_n2_kernel(
         const uint32_t rem = j - mt * BM * BN;
         const uint32_t mm = rem / BN;
         const uint32_t nn = rem - mm * BN;
-        const uint32_t bucket_row = m_group0 + mt * BM + mm;
-        if (bucket_row < count) {
-            const uint32_t pair = pairs[first + bucket_row];
+        const uint32_t pair = shPair[mt * BM + mm];
+        if (pair != UINT32_MAX) {
             const uint32_t row0 = n0 + nn;
             const uint32_t row1 = n0 + BN + nn;
             const uint32_t tok = pair / 6u;
