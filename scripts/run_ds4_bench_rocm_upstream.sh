@@ -32,6 +32,7 @@ Environment:
   DS4_CUDA_INDEXED_HEADS32=1             Prototype 32-head indexed-attention block on gfx1151
   DS4_CUDA_MOE_WMMA_MTILES=4|8|16        Hot MoE WMMA token tiles/block
   DS4_CUDA_MOE_WMMA_F16_MID=1            Hot MoE WMMA stores/reads routed mid as f16
+  DS4_CUDA_MOE_WMMA_F16_MID_ALL=1        Store scalar/cold routed mid scratch as f16 too
   DS4_CUDA_MOE_WMMA_F16_DOWN=1           Hot MoE WMMA writes hot down as f16 and mixed-sums
   DS4_CUDA_MOE_WMMA_F16_DOWN_ALL=1       Store all routed MoE down scratch as f16
   DS4_CUDA_MOE_WMMA_DIRECT_SUM=1         Atomic-add routed MoE down directly to output
@@ -159,6 +160,7 @@ export_pair_value MOE_WMMA_MTILES "${DS4_SERVER_MOE_WMMA_MTILES:-}"
 export_pair_flag MOE_WMMA_SPLIT_HOT "${DS4_SERVER_MOE_WMMA_SPLIT_HOT:-0}"
 export_pair_flag MOE_WMMA_TILE_HOT "${DS4_SERVER_MOE_WMMA_TILE_HOT:-0}"
 export_pair_flag MOE_WMMA_F16_MID "${DS4_SERVER_MOE_WMMA_F16_MID:-0}"
+export_pair_flag MOE_WMMA_F16_MID_ALL "${DS4_SERVER_MOE_WMMA_F16_MID_ALL:-0}"
 export_pair_flag MOE_WMMA_F16_DOWN "${DS4_SERVER_MOE_WMMA_F16_DOWN:-0}"
 export_pair_flag MOE_WMMA_F16_DOWN_ALL "${DS4_SERVER_MOE_WMMA_F16_DOWN_ALL:-0}"
 export_pair_flag MOE_WMMA_DIRECT_SUM "${DS4_SERVER_MOE_WMMA_DIRECT_SUM:-0}"

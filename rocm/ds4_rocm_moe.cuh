@@ -2359,9 +2359,10 @@ __global__ static void moe_down_q2K_sum_rows_w32_kernel(
     if (lane == 0u) out[(uint64_t)tok * out_dim + row] = acc;
 }
 
-template <uint32_t PAIR_TILE>
+template <uint32_t PAIR_TILE, bool OUT_F16=false>
 __global__ static void moe_gate_up_mid_q2K_expert_batch_sharedx_kernel(
         float *mid_out,
+        half *mid_out_h,
         const char *gate_base,
         const char *up_base,
         const float *x,
@@ -2451,19 +2452,22 @@ __global__ static void moe_gate_up_mid_q2K_expert_batch_sharedx_kernel(
                         if (upv > clamp) upv = clamp;
                         if (upv < -clamp) upv = -clamp;
                     }
-                    mid_out[(uint64_t)pair[u] * expert_mid_dim + row] = moe_silu_oldhip(g) * upv * weights[pair[u]];
+                    const float v = moe_silu_oldhip(g) * upv * weights[pair[u]];
+                    if (OUT_F16) mid_out_h[(uint64_t)pair[u] * expert_mid_dim + row] = __float2half(v);
+                    else mid_out[(uint64_t)pair[u] * expert_mid_dim + row] = v;
                 }
             }
         }
     }
 }
 
-template <uint32_t PAIR_TILE, bool OUT_F16=false, bool DIRECT_OUT=false>
+template <uint32_t PAIR_TILE, bool MID_F16=false, bool OUT_F16=false, bool DIRECT_OUT=false>
 __global__ static void moe_down_q2K_expert_batch_sharedmid_kernel(
         float *down_out,
         half *down_out_h,
         const char *down_base,
         const float *mid,
+        const half *mid_h,
         const uint32_t *counts,
         const uint32_t *offsets,
         const uint32_t *pairs,
@@ -2500,7 +2504,12 @@ __global__ static void moe_down_q2K_expert_batch_sharedmid_kernel(
             for (uint32_t j = tid; j < PAIR_TILE * 256u; j += blockDim.x) {
                 const uint32_t u = j >> 8u;
                 const uint32_t k = j & 255u;
-                shmid[j] = (pair[u] != UINT32_MAX) ? mid[(uint64_t)pair[u] * expert_mid_dim + mbase + k] : 0.0f;
+                if (pair[u] != UINT32_MAX) {
+                    const uint64_t moff = (uint64_t)pair[u] * expert_mid_dim + mbase + k;
+                    shmid[j] = MID_F16 ? __half2float(mid_h[moff]) : mid[moff];
+                } else {
+                    shmid[j] = 0.0f;
+                }
             }
             __syncthreads();
             if (row_valid) {

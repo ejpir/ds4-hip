@@ -7640,16 +7640,20 @@ static int routed_moe_launch(
             cuda_env_flag_any3("DS4_CUDA_MOE_WMMA_F16_DOWN_ALL", "DS4_HIP_MOE_WMMA_F16_DOWN_ALL", NULL);
         const int moe_wmma_direct_sum_req =
             cuda_env_flag_any3("DS4_CUDA_MOE_WMMA_DIRECT_SUM", "DS4_HIP_MOE_WMMA_DIRECT_SUM", NULL);
+        const int moe_wmma_f16_mid_all_req =
+            cuda_env_flag_any3("DS4_CUDA_MOE_WMMA_F16_MID_ALL", "DS4_HIP_MOE_WMMA_F16_MID_ALL", NULL);
         const int moe_wmma_f16_mid = moe_wmma_hot && !moe_dense_hot &&
             (cuda_env_flag_any3("DS4_CUDA_MOE_WMMA_F16_MID", "DS4_HIP_MOE_WMMA_F16_MID", NULL) ||
-             moe_wmma_f16_down_req || moe_wmma_f16_down_all_req || moe_wmma_direct_sum_req) &&
+             moe_wmma_f16_mid_all_req || moe_wmma_f16_down_req || moe_wmma_f16_down_all_req || moe_wmma_direct_sum_req) &&
             n_expert == 6u && expert_in_dim % 16u == 0u && expert_mid_dim % 16u == 0u && out_dim % 16u == 0u;
+        const int moe_wmma_f16_mid_all = moe_wmma_f16_mid && moe_wmma_f16_mid_all_req;
         const int moe_wmma_direct_sum = moe_wmma_f16_mid && moe_wmma_direct_sum_req;
         const int moe_wmma_f16_down = moe_wmma_f16_mid && !moe_wmma_direct_sum && moe_wmma_f16_down_req;
         const int moe_wmma_f16_down_all = moe_wmma_f16_mid && !moe_wmma_direct_sum && moe_wmma_f16_down_all_req;
 #else
         const int moe_dense_hot = 0;
         const int moe_wmma_f16_mid = 0;
+        const int moe_wmma_f16_mid_all = 0;
         const int moe_wmma_direct_sum = 0;
         const int moe_wmma_f16_down = 0;
         const int moe_wmma_f16_down_all = 0;
@@ -7889,20 +7893,41 @@ static int routed_moe_launch(
         const uint32_t down_scalar_max = ((moe_wmma_hot && (wmma_down_hot_count != 0u || wmma_f16_hot_count != 0u)) || dense_hot_n != 0u) ? wmma_down_hot_threshold : 0u;
         dim3 gate_grid((expert_mid_dim + gate_rpb - 1u) / gate_rpb, 256u, 1);
         if (gate_tile == 4u) {
-            moe_gate_up_mid_q2K_expert_batch_sharedx_kernel<4><<<gate_grid, gate_threads, gate_shmem>>>(
-                    (float *)mid->ptr, gate_w, up_w, (const float *)x->ptr, (const float *)weights->ptr,
-                    counts, offsets, sorted_pairs, 1u, gate_scalar_max, expert_in_dim, expert_mid_dim,
-                    gate_expert_bytes, gate_row_bytes, clamp);
+            if (moe_wmma_f16_mid_all) {
+                moe_gate_up_mid_q2K_expert_batch_sharedx_kernel<4,true><<<gate_grid, gate_threads, gate_shmem>>>(
+                        NULL, wmma_mid_h, gate_w, up_w, (const float *)x->ptr, (const float *)weights->ptr,
+                        counts, offsets, sorted_pairs, 1u, gate_scalar_max, expert_in_dim, expert_mid_dim,
+                        gate_expert_bytes, gate_row_bytes, clamp);
+            } else {
+                moe_gate_up_mid_q2K_expert_batch_sharedx_kernel<4><<<gate_grid, gate_threads, gate_shmem>>>(
+                        (float *)mid->ptr, NULL, gate_w, up_w, (const float *)x->ptr, (const float *)weights->ptr,
+                        counts, offsets, sorted_pairs, 1u, gate_scalar_max, expert_in_dim, expert_mid_dim,
+                        gate_expert_bytes, gate_row_bytes, clamp);
+            }
         } else if (gate_tile == 8u) {
-            moe_gate_up_mid_q2K_expert_batch_sharedx_kernel<8><<<gate_grid, gate_threads, gate_shmem>>>(
-                    (float *)mid->ptr, gate_w, up_w, (const float *)x->ptr, (const float *)weights->ptr,
-                    counts, offsets, sorted_pairs, 1u, gate_scalar_max, expert_in_dim, expert_mid_dim,
-                    gate_expert_bytes, gate_row_bytes, clamp);
+            if (moe_wmma_f16_mid_all) {
+                moe_gate_up_mid_q2K_expert_batch_sharedx_kernel<8,true><<<gate_grid, gate_threads, gate_shmem>>>(
+                        NULL, wmma_mid_h, gate_w, up_w, (const float *)x->ptr, (const float *)weights->ptr,
+                        counts, offsets, sorted_pairs, 1u, gate_scalar_max, expert_in_dim, expert_mid_dim,
+                        gate_expert_bytes, gate_row_bytes, clamp);
+            } else {
+                moe_gate_up_mid_q2K_expert_batch_sharedx_kernel<8><<<gate_grid, gate_threads, gate_shmem>>>(
+                        (float *)mid->ptr, NULL, gate_w, up_w, (const float *)x->ptr, (const float *)weights->ptr,
+                        counts, offsets, sorted_pairs, 1u, gate_scalar_max, expert_in_dim, expert_mid_dim,
+                        gate_expert_bytes, gate_row_bytes, clamp);
+            }
         } else {
-            moe_gate_up_mid_q2K_expert_batch_sharedx_kernel<16><<<gate_grid, gate_threads, gate_shmem>>>(
-                    (float *)mid->ptr, gate_w, up_w, (const float *)x->ptr, (const float *)weights->ptr,
-                    counts, offsets, sorted_pairs, 1u, gate_scalar_max, expert_in_dim, expert_mid_dim,
-                    gate_expert_bytes, gate_row_bytes, clamp);
+            if (moe_wmma_f16_mid_all) {
+                moe_gate_up_mid_q2K_expert_batch_sharedx_kernel<16,true><<<gate_grid, gate_threads, gate_shmem>>>(
+                        NULL, wmma_mid_h, gate_w, up_w, (const float *)x->ptr, (const float *)weights->ptr,
+                        counts, offsets, sorted_pairs, 1u, gate_scalar_max, expert_in_dim, expert_mid_dim,
+                        gate_expert_bytes, gate_row_bytes, clamp);
+            } else {
+                moe_gate_up_mid_q2K_expert_batch_sharedx_kernel<16><<<gate_grid, gate_threads, gate_shmem>>>(
+                        (float *)mid->ptr, NULL, gate_w, up_w, (const float *)x->ptr, (const float *)weights->ptr,
+                        counts, offsets, sorted_pairs, 1u, gate_scalar_max, expert_in_dim, expert_mid_dim,
+                        gate_expert_bytes, gate_row_bytes, clamp);
+            }
         }
         if (!cuda_ok(cudaGetLastError(), "routed_moe q2 expert gate/up launch")) return 0;
 #ifdef __HIP_PLATFORM_AMD__
@@ -8066,54 +8091,117 @@ static int routed_moe_launch(
         dim3 down_grid((out_dim + down_rpb - 1u) / down_rpb, 256u, 1);
         if (down_tile == 4u) {
             if (moe_wmma_direct_sum) {
-                moe_down_q2K_expert_batch_sharedmid_kernel<4,false,true><<<down_grid, down_threads, down_shmem>>>(
-                        (float *)out->ptr, NULL, down_w, (const float *)mid->ptr,
-                        counts, offsets, sorted_pairs, 1u, down_scalar_max, expert_mid_dim, out_dim,
-                        down_expert_bytes, down_row_bytes);
+                if (moe_wmma_f16_mid_all) {
+                    moe_down_q2K_expert_batch_sharedmid_kernel<4,true,false,true><<<down_grid, down_threads, down_shmem>>>(
+                            (float *)out->ptr, NULL, down_w, NULL, wmma_mid_h,
+                            counts, offsets, sorted_pairs, 1u, down_scalar_max, expert_mid_dim, out_dim,
+                            down_expert_bytes, down_row_bytes);
+                } else {
+                    moe_down_q2K_expert_batch_sharedmid_kernel<4,false,false,true><<<down_grid, down_threads, down_shmem>>>(
+                            (float *)out->ptr, NULL, down_w, (const float *)mid->ptr, NULL,
+                            counts, offsets, sorted_pairs, 1u, down_scalar_max, expert_mid_dim, out_dim,
+                            down_expert_bytes, down_row_bytes);
+                }
             } else if (moe_wmma_f16_down_all) {
-                moe_down_q2K_expert_batch_sharedmid_kernel<4,true><<<down_grid, down_threads, down_shmem>>>(
-                        NULL, wmma_down_h, down_w, (const float *)mid->ptr,
-                        counts, offsets, sorted_pairs, 1u, down_scalar_max, expert_mid_dim, out_dim,
-                        down_expert_bytes, down_row_bytes);
+                if (moe_wmma_f16_mid_all) {
+                    moe_down_q2K_expert_batch_sharedmid_kernel<4,true,true><<<down_grid, down_threads, down_shmem>>>(
+                            NULL, wmma_down_h, down_w, NULL, wmma_mid_h,
+                            counts, offsets, sorted_pairs, 1u, down_scalar_max, expert_mid_dim, out_dim,
+                            down_expert_bytes, down_row_bytes);
+                } else {
+                    moe_down_q2K_expert_batch_sharedmid_kernel<4,false,true><<<down_grid, down_threads, down_shmem>>>(
+                            NULL, wmma_down_h, down_w, (const float *)mid->ptr, NULL,
+                            counts, offsets, sorted_pairs, 1u, down_scalar_max, expert_mid_dim, out_dim,
+                            down_expert_bytes, down_row_bytes);
+                }
             } else {
-                moe_down_q2K_expert_batch_sharedmid_kernel<4><<<down_grid, down_threads, down_shmem>>>(
-                        (float *)down->ptr, NULL, down_w, (const float *)mid->ptr,
-                        counts, offsets, sorted_pairs, 1u, down_scalar_max, expert_mid_dim, out_dim,
-                        down_expert_bytes, down_row_bytes);
+                if (moe_wmma_f16_mid_all) {
+                    moe_down_q2K_expert_batch_sharedmid_kernel<4,true><<<down_grid, down_threads, down_shmem>>>(
+                            (float *)down->ptr, NULL, down_w, NULL, wmma_mid_h,
+                            counts, offsets, sorted_pairs, 1u, down_scalar_max, expert_mid_dim, out_dim,
+                            down_expert_bytes, down_row_bytes);
+                } else {
+                    moe_down_q2K_expert_batch_sharedmid_kernel<4><<<down_grid, down_threads, down_shmem>>>(
+                            (float *)down->ptr, NULL, down_w, (const float *)mid->ptr, NULL,
+                            counts, offsets, sorted_pairs, 1u, down_scalar_max, expert_mid_dim, out_dim,
+                            down_expert_bytes, down_row_bytes);
+                }
             }
         } else if (down_tile == 8u) {
             if (moe_wmma_direct_sum) {
-                moe_down_q2K_expert_batch_sharedmid_kernel<8,false,true><<<down_grid, down_threads, down_shmem>>>(
-                        (float *)out->ptr, NULL, down_w, (const float *)mid->ptr,
-                        counts, offsets, sorted_pairs, 1u, down_scalar_max, expert_mid_dim, out_dim,
-                        down_expert_bytes, down_row_bytes);
+                if (moe_wmma_f16_mid_all) {
+                    moe_down_q2K_expert_batch_sharedmid_kernel<8,true,false,true><<<down_grid, down_threads, down_shmem>>>(
+                            (float *)out->ptr, NULL, down_w, NULL, wmma_mid_h,
+                            counts, offsets, sorted_pairs, 1u, down_scalar_max, expert_mid_dim, out_dim,
+                            down_expert_bytes, down_row_bytes);
+                } else {
+                    moe_down_q2K_expert_batch_sharedmid_kernel<8,false,false,true><<<down_grid, down_threads, down_shmem>>>(
+                            (float *)out->ptr, NULL, down_w, (const float *)mid->ptr, NULL,
+                            counts, offsets, sorted_pairs, 1u, down_scalar_max, expert_mid_dim, out_dim,
+                            down_expert_bytes, down_row_bytes);
+                }
             } else if (moe_wmma_f16_down_all) {
-                moe_down_q2K_expert_batch_sharedmid_kernel<8,true><<<down_grid, down_threads, down_shmem>>>(
-                        NULL, wmma_down_h, down_w, (const float *)mid->ptr,
-                        counts, offsets, sorted_pairs, 1u, down_scalar_max, expert_mid_dim, out_dim,
-                        down_expert_bytes, down_row_bytes);
+                if (moe_wmma_f16_mid_all) {
+                    moe_down_q2K_expert_batch_sharedmid_kernel<8,true,true><<<down_grid, down_threads, down_shmem>>>(
+                            NULL, wmma_down_h, down_w, NULL, wmma_mid_h,
+                            counts, offsets, sorted_pairs, 1u, down_scalar_max, expert_mid_dim, out_dim,
+                            down_expert_bytes, down_row_bytes);
+                } else {
+                    moe_down_q2K_expert_batch_sharedmid_kernel<8,false,true><<<down_grid, down_threads, down_shmem>>>(
+                            NULL, wmma_down_h, down_w, (const float *)mid->ptr, NULL,
+                            counts, offsets, sorted_pairs, 1u, down_scalar_max, expert_mid_dim, out_dim,
+                            down_expert_bytes, down_row_bytes);
+                }
             } else {
-                moe_down_q2K_expert_batch_sharedmid_kernel<8><<<down_grid, down_threads, down_shmem>>>(
-                        (float *)down->ptr, NULL, down_w, (const float *)mid->ptr,
-                        counts, offsets, sorted_pairs, 1u, down_scalar_max, expert_mid_dim, out_dim,
-                        down_expert_bytes, down_row_bytes);
+                if (moe_wmma_f16_mid_all) {
+                    moe_down_q2K_expert_batch_sharedmid_kernel<8,true><<<down_grid, down_threads, down_shmem>>>(
+                            (float *)down->ptr, NULL, down_w, NULL, wmma_mid_h,
+                            counts, offsets, sorted_pairs, 1u, down_scalar_max, expert_mid_dim, out_dim,
+                            down_expert_bytes, down_row_bytes);
+                } else {
+                    moe_down_q2K_expert_batch_sharedmid_kernel<8><<<down_grid, down_threads, down_shmem>>>(
+                            (float *)down->ptr, NULL, down_w, (const float *)mid->ptr, NULL,
+                            counts, offsets, sorted_pairs, 1u, down_scalar_max, expert_mid_dim, out_dim,
+                            down_expert_bytes, down_row_bytes);
+                }
             }
         } else {
             if (moe_wmma_direct_sum) {
-                moe_down_q2K_expert_batch_sharedmid_kernel<16,false,true><<<down_grid, down_threads, down_shmem>>>(
-                        (float *)out->ptr, NULL, down_w, (const float *)mid->ptr,
-                        counts, offsets, sorted_pairs, 1u, down_scalar_max, expert_mid_dim, out_dim,
-                        down_expert_bytes, down_row_bytes);
+                if (moe_wmma_f16_mid_all) {
+                    moe_down_q2K_expert_batch_sharedmid_kernel<16,true,false,true><<<down_grid, down_threads, down_shmem>>>(
+                            (float *)out->ptr, NULL, down_w, NULL, wmma_mid_h,
+                            counts, offsets, sorted_pairs, 1u, down_scalar_max, expert_mid_dim, out_dim,
+                            down_expert_bytes, down_row_bytes);
+                } else {
+                    moe_down_q2K_expert_batch_sharedmid_kernel<16,false,false,true><<<down_grid, down_threads, down_shmem>>>(
+                            (float *)out->ptr, NULL, down_w, (const float *)mid->ptr, NULL,
+                            counts, offsets, sorted_pairs, 1u, down_scalar_max, expert_mid_dim, out_dim,
+                            down_expert_bytes, down_row_bytes);
+                }
             } else if (moe_wmma_f16_down_all) {
-                moe_down_q2K_expert_batch_sharedmid_kernel<16,true><<<down_grid, down_threads, down_shmem>>>(
-                        NULL, wmma_down_h, down_w, (const float *)mid->ptr,
-                        counts, offsets, sorted_pairs, 1u, down_scalar_max, expert_mid_dim, out_dim,
-                        down_expert_bytes, down_row_bytes);
+                if (moe_wmma_f16_mid_all) {
+                    moe_down_q2K_expert_batch_sharedmid_kernel<16,true,true><<<down_grid, down_threads, down_shmem>>>(
+                            NULL, wmma_down_h, down_w, NULL, wmma_mid_h,
+                            counts, offsets, sorted_pairs, 1u, down_scalar_max, expert_mid_dim, out_dim,
+                            down_expert_bytes, down_row_bytes);
+                } else {
+                    moe_down_q2K_expert_batch_sharedmid_kernel<16,false,true><<<down_grid, down_threads, down_shmem>>>(
+                            NULL, wmma_down_h, down_w, (const float *)mid->ptr, NULL,
+                            counts, offsets, sorted_pairs, 1u, down_scalar_max, expert_mid_dim, out_dim,
+                            down_expert_bytes, down_row_bytes);
+                }
             } else {
-                moe_down_q2K_expert_batch_sharedmid_kernel<16><<<down_grid, down_threads, down_shmem>>>(
-                        (float *)down->ptr, NULL, down_w, (const float *)mid->ptr,
-                        counts, offsets, sorted_pairs, 1u, down_scalar_max, expert_mid_dim, out_dim,
-                        down_expert_bytes, down_row_bytes);
+                if (moe_wmma_f16_mid_all) {
+                    moe_down_q2K_expert_batch_sharedmid_kernel<16,true><<<down_grid, down_threads, down_shmem>>>(
+                            (float *)down->ptr, NULL, down_w, NULL, wmma_mid_h,
+                            counts, offsets, sorted_pairs, 1u, down_scalar_max, expert_mid_dim, out_dim,
+                            down_expert_bytes, down_row_bytes);
+                } else {
+                    moe_down_q2K_expert_batch_sharedmid_kernel<16><<<down_grid, down_threads, down_shmem>>>(
+                            (float *)down->ptr, NULL, down_w, (const float *)mid->ptr, NULL,
+                            counts, offsets, sorted_pairs, 1u, down_scalar_max, expert_mid_dim, out_dim,
+                            down_expert_bytes, down_row_bytes);
+                }
             }
         }
         if (!cuda_ok(cudaGetLastError(), "routed_moe q2 expert down launch")) return 0;
@@ -8297,12 +8385,13 @@ static int routed_moe_launch(
                 (void)cudaEventElapsedTime(&ms_sum, q2_prof[5], q2_prof[6]);
                 (void)cudaEventElapsedTime(&ms_total, q2_prof[0], q2_prof[6]);
                 fprintf(stderr,
-                        "ds4: CUDA MoE q2 expert profile tokens=%u pairs=%u hot_gate=%u/%u tiles=%u hot_down=%u/%u tiles=%u f16_hot=%u/%u direct=%u f16_all=%u bucket=%.3f gate_scalar=%.3f gate_wmma=%.3f down_scalar=%.3f down_wmma=%.3f sum=%.3f total=%.3f ms\n",
+                        "ds4: CUDA MoE q2 expert profile tokens=%u pairs=%u hot_gate=%u/%u tiles=%u hot_down=%u/%u tiles=%u f16_hot=%u/%u direct=%u f16_mid_all=%u f16_all=%u bucket=%.3f gate_scalar=%.3f gate_wmma=%.3f down_scalar=%.3f down_wmma=%.3f sum=%.3f total=%.3f ms\n",
                         n_tokens, pair_count, wmma_gate_hot_count, wmma_gate_hot_max, wmma_gate_tile_count,
                         wmma_down_hot_count, wmma_down_hot_max, wmma_down_tile_count,
                         wmma_f16_hot_count, wmma_f16_hot_max,
-                        (uint32_t)moe_wmma_direct_sum, (uint32_t)moe_wmma_f16_down_all,
-                        ms_bucket, ms_gate_scalar, ms_gate_wmma, ms_down_scalar, ms_down_wmma, ms_sum, ms_total);
+                        (uint32_t)moe_wmma_direct_sum, (uint32_t)moe_wmma_f16_mid_all,
+                        (uint32_t)moe_wmma_f16_down_all, ms_bucket, ms_gate_scalar, ms_gate_wmma,
+                        ms_down_scalar, ms_down_wmma, ms_sum, ms_total);
             }
             for (uint32_t i = 0; i < 7u; i++) (void)cudaEventDestroy(q2_prof[i]);
         }
