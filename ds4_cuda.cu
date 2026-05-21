@@ -6179,6 +6179,10 @@ static int attention_decode_batch_launch(
     const float *sinks = (const float *)cuda_model_range_ptr(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
     if (!sinks) return 0;
+    const int fast_window_attention =
+        cuda_env_flag_any3("DS4_CUDA_WINDOW_ATTENTION", "DS4_HIP_WINDOW_ATTENTION", NULL) ||
+        cuda_env_flag_any3("DS4_CUDA_PREFILL_RAW_FAST", "DS4_HIP_PREFILL_RAW_FAST", NULL) ||
+        cuda_env_flag_any3("DS4_CUDA_PREFILL_MIXED_FAST", "DS4_HIP_PREFILL_MIXED_FAST", NULL);
     if (!cuda_attention_score_buffer_fits(n_comp)) {
         if (!use_comp_mask && head_dim == 512u &&
             getenv("DS4_CUDA_NO_WINDOW_ATTENTION") == NULL) {
@@ -6205,7 +6209,7 @@ static int attention_decode_batch_launch(
     }
     if (!use_comp_mask && n_tokens > 1 && head_dim == 512 &&
         getenv("DS4_CUDA_NO_WINDOW_ATTENTION") == NULL &&
-        getenv("DS4_CUDA_WINDOW_ATTENTION") != NULL) {
+        fast_window_attention) {
         dim3 grid(n_tokens, (n_head + 7u) / 8u, 1);
         attention_decode_mixed_heads8_online_kernel<<<grid, 256>>>((float *)heads->ptr,
                                                                    sinks,
