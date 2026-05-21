@@ -14450,8 +14450,9 @@ static uint32_t metal_graph_prefill_cap_for_prompt(int prompt_len) {
 }
 
 /* When a server request shares a large prefix with the live checkpoint, extend
- * the KV cache with batched prefill instead of single-token decode.  The env
- * knob is useful while tuning the crossover point for different Macs. */
+ * the KV cache with batched prefill instead of single-token decode.  On an M3
+ * Max, prefill is faster from 2-token suffixes upward; keep the default at 4
+ * as a conservative crossover.  The env knob remains useful for retuning. */
 static uint32_t metal_graph_resume_prefill_min_tokens(void) {
     const char *env = getenv("DS4_METAL_RESUME_PREFILL_MIN");
     if (env && env[0]) {
@@ -14462,7 +14463,7 @@ static uint32_t metal_graph_resume_prefill_min_tokens(void) {
             return (uint32_t)v;
         }
     }
-    return 32u;
+    return 4u;
 }
 
 ds4_context_memory ds4_context_memory_estimate(ds4_backend backend, int ctx_size) {
@@ -16796,6 +16797,23 @@ void ds4_engine_dump_tokens(ds4_engine *e, const ds4_tokens *tokens) {
     dump_tokens(&e->vocab, tokens);
 }
 
+int ds4_engine_collect_imatrix(
+        ds4_engine *e,
+        const char *dataset_path,
+        const char *output_path,
+        int ctx_size,
+        int max_prompts,
+        int max_tokens) {
+    (void)e;
+    (void)dataset_path;
+    (void)output_path;
+    (void)ctx_size;
+    (void)max_prompts;
+    (void)max_tokens;
+    fprintf(stderr, "ds4: imatrix collection is not available in this HIP/ROCm merge build\n");
+    return 1;
+}
+
 int ds4_dump_text_tokenization(const char *model_path, const char *text, FILE *fp) {
     ds4_model model;
     ds4_vocab vocab;
@@ -17566,6 +17584,28 @@ int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k) {
         out[i].logprob = isfinite(out[i].logit) ? (float)((double)out[i].logit - logsum) : DS4_NEG_INF;
     }
     return k;
+}
+
+int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out) {
+    if (!s || !out || token < 0 || token >= (int)DS4_N_VOCAB) return 0;
+
+    float max_logit = DS4_NEG_INF;
+    for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
+        const float v = s->logits[i];
+        if (isfinite(v) && v > max_logit) max_logit = v;
+    }
+    if (!isfinite(max_logit)) return 0;
+
+    double sum = 0.0;
+    for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
+        const float v = s->logits[i];
+        if (isfinite(v)) sum += exp((double)v - (double)max_logit);
+    }
+    const double logsum = (double)max_logit + log(sum);
+    out->id = token;
+    out->logit = s->logits[token];
+    out->logprob = isfinite(out->logit) ? (float)((double)out->logit - logsum) : DS4_NEG_INF;
+    return 1;
 }
 
 static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,

@@ -2,6 +2,7 @@
 /ds4-server
 /ds4-bench
 /ds4-eval
+/ds4-agent
 /ds4-rocm-upstream
 /ds4-server-rocm-upstream
 /ds4-bench-rocm-upstream

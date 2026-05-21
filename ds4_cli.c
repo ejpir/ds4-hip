@@ -36,6 +36,11 @@ typedef struct {
     const char *dump_logprobs_path;
     const char *force_tokens_path;
     int dump_logprobs_top_k;
+    const char *perplexity_file_path;
+    const char *imatrix_dataset_path;
+    const char *imatrix_output_path;
+    int imatrix_max_prompts;
+    int imatrix_max_tokens;
     ds4_think_mode think_mode;
     bool head_test;
     bool first_token_test;
@@ -101,6 +106,12 @@ static void usage(FILE *fp) {
         "      CPU helper threads for host-side or reference work.\n"
         "  --quality\n"
         "      Prefer exact kernels where faster approximate paths exist; MTP uses strict verification.\n"
+        "  --dir-steering-file FILE\n"
+        "      Load one f32 direction vector per layer for directional steering.\n"
+        "  --dir-steering-ffn F\n"
+        "      Apply steering after FFN outputs: y -= F*v*dot(v,y). Default with file: 1\n"
+        "  --dir-steering-attn F\n"
+        "      Apply steering after attention outputs. Default: 0\n"
         "  --warm-weights\n"
         "      Touch mapped tensor pages before generation. Slower startup, fewer first-use stalls.\n"
         "\n"
@@ -153,6 +164,16 @@ static void usage(FILE *fp) {
         "      Number of local alternatives stored by --dump-logprobs. Default: 20\n"
         "  --force-tokens FILE\n"
         "      With --dump-logprobs, feed token ids from FILE/JSON instead of local argmax.\n"
+        "  --perplexity-file FILE\n"
+        "      Score raw text with teacher-forced next-token negative log likelihood.\n"
+        "  --imatrix-dataset FILE\n"
+        "      Rendered DS4 prompt dataset produced by misc/imatrix_dataset.\n"
+        "  --imatrix-out FILE\n"
+        "      Collect a routed-MoE activation imatrix and write llama-compatible .dat.\n"
+        "  --imatrix-max-prompts N\n"
+        "      Stop imatrix collection after N prompts. Default: no prompt limit\n"
+        "  --imatrix-max-tokens N\n"
+        "      Stop imatrix collection after N prompt tokens. Default: no token limit\n"
         "  --head-test\n"
         "      Run the output HC/logits head after the native slice.\n"
         "  --first-token-test\n"
@@ -784,6 +805,84 @@ static int run_logprob_dump(ds4_engine *engine, const cli_config *cfg, const ds4
     return 0;
 }
 
+static int run_perplexity_file(ds4_engine *engine, const cli_config *cfg) {
+    char *text = read_prompt_file(cfg->gen.perplexity_file_path, true);
+    ds4_tokens tokens = {0};
+    ds4_tokenize_text(engine, text, &tokens);
+    free(text);
+
+    /* Seed the graph with enough real context to stay on the normal Metal
+     * prefill path; scoring starts immediately after this fixed prefix. */
+    const int prefix_len = 32;
+    if (tokens.len <= prefix_len) {
+        fprintf(stderr, "ds4: --perplexity-file needs more than %d tokens\n", prefix_len);
+        ds4_tokens_free(&tokens);
+        return 1;
+    }
+
+    int scored = tokens.len - prefix_len;
+    if (cfg->gen.n_predict > 0 && scored > cfg->gen.n_predict) scored = cfg->gen.n_predict;
+    if (scored > cfg->gen.ctx_size - prefix_len) scored = cfg->gen.ctx_size - prefix_len;
+    if (scored <= 0) {
+        fprintf(stderr, "ds4: context too small for perplexity scoring\n");
+        ds4_tokens_free(&tokens);
+        return 1;
+    }
+
+    ds4_session *session = NULL;
+    if (ds4_session_create(&session, engine, cfg->gen.ctx_size) != 0) {
+        fprintf(stderr, "ds4: --perplexity-file requires a graph session backend\n");
+        ds4_tokens_free(&tokens);
+        return 1;
+    }
+
+    ds4_tokens prefix = {0};
+    for (int i = 0; i < prefix_len; i++) ds4_tokens_push(&prefix, tokens.v[i]);
+    char err[160];
+    if (ds4_session_sync(session, &prefix, err, sizeof(err)) != 0) {
+        fprintf(stderr, "ds4: perplexity initial token failed: %s\n", err);
+        ds4_tokens_free(&prefix);
+        ds4_session_free(session);
+        ds4_tokens_free(&tokens);
+        return 1;
+    }
+    ds4_tokens_free(&prefix);
+
+    double nll = 0.0;
+    for (int j = 0; j < scored; j++) {
+        const int i = prefix_len + j;
+        ds4_token_score score;
+        if (!ds4_session_token_logprob(session, tokens.v[i], &score)) {
+            fprintf(stderr, "ds4: failed to score token %d\n", i);
+            ds4_session_free(session);
+            ds4_tokens_free(&tokens);
+            return 1;
+        }
+        nll -= (double)score.logprob;
+
+        if (((j + 1) % 256) == 0 || j + 1 == scored) {
+            fprintf(stderr, "ds4: perplexity scored %d/%d\r", j + 1, scored);
+            fflush(stderr);
+        }
+
+        if (j + 1 < scored && ds4_session_eval(session, tokens.v[i], err, sizeof(err)) != 0) {
+            fprintf(stderr, "\nds4: perplexity decode failed at token %d: %s\n", i, err);
+            ds4_session_free(session);
+            ds4_tokens_free(&tokens);
+            return 1;
+        }
+    }
+    fputc('\n', stderr);
+
+    const double avg_nll = nll / (double)scored;
+    printf("tokens=%d scored=%d nll=%.9f avg_nll=%.9f ppl=%.9f\n",
+           tokens.len, scored, nll, avg_nll, exp(avg_nll));
+
+    ds4_session_free(session);
+    ds4_tokens_free(&tokens);
+    return 0;
+}
+
 static int run_generation(ds4_engine *engine, const cli_config *cfg) {
     ds4_tokens prompt = {0};
     build_prompt(engine, &cfg->gen, &prompt);
@@ -1278,6 +1377,7 @@ static cli_config parse_options(int argc, char **argv) {
         },
     };
 
+    bool directional_steering_scale_set = false;
     for (int i = 1; i < argc; i++) {
         const char *arg = argv[i];
         if (!strcmp(arg, "-h") || !strcmp(arg, "--help")) {
@@ -1320,6 +1420,14 @@ static cli_config parse_options(int argc, char **argv) {
             c.gen.seed = parse_u64(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--quality")) {
             c.engine.quality = true;
+        } else if (!strcmp(arg, "--dir-steering-file")) {
+            c.engine.directional_steering_file = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--dir-steering-ffn")) {
+            c.engine.directional_steering_ffn = parse_float_range(need_arg(&i, argc, argv, arg), arg, -100.0f, 100.0f);
+            directional_steering_scale_set = true;
+        } else if (!strcmp(arg, "--dir-steering-attn")) {
+            c.engine.directional_steering_attn = parse_float_range(need_arg(&i, argc, argv, arg), arg, -100.0f, 100.0f);
+            directional_steering_scale_set = true;
         } else if (!strcmp(arg, "-t") || !strcmp(arg, "--threads")) {
             c.engine.n_threads = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--backend")) {
@@ -1337,6 +1445,17 @@ static cli_config parse_options(int argc, char **argv) {
             c.gen.dump_logprobs_top_k = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--force-tokens")) {
             c.gen.force_tokens_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--perplexity-file")) {
+            c.gen.perplexity_file_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--imatrix-dataset")) {
+            c.gen.imatrix_dataset_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--imatrix-out")) {
+            c.gen.imatrix_output_path = need_arg(&i, argc, argv, arg);
+            c.engine.backend = DS4_BACKEND_METAL;
+        } else if (!strcmp(arg, "--imatrix-max-prompts")) {
+            c.gen.imatrix_max_prompts = parse_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--imatrix-max-tokens")) {
+            c.gen.imatrix_max_tokens = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--think")) {
             c.gen.think_mode = DS4_THINK_HIGH;
         } else if (!strcmp(arg, "--think-max")) {
@@ -1373,6 +1492,22 @@ static cli_config parse_options(int argc, char **argv) {
         }
     }
 
+    if (c.engine.directional_steering_file && !directional_steering_scale_set) {
+        c.engine.directional_steering_ffn = 1.0f;
+    }
+    if (c.gen.imatrix_output_path && !c.gen.imatrix_dataset_path) {
+        fprintf(stderr, "ds4: --imatrix-out requires --imatrix-dataset\n");
+        exit(2);
+    }
+    if (c.gen.imatrix_dataset_path && !c.gen.imatrix_output_path) {
+        fprintf(stderr, "ds4: --imatrix-dataset requires --imatrix-out\n");
+        exit(2);
+    }
+    if (c.gen.perplexity_file_path && c.gen.prompt) {
+        fprintf(stderr, "ds4: --perplexity-file does not use -p/--prompt-file\n");
+        exit(2);
+    }
+
     return c;
 }
 
@@ -1402,6 +1537,15 @@ int main(int argc, char **argv) {
     int rc = 0;
     if (cfg.inspect) {
         ds4_engine_summary(engine);
+    } else if (cfg.gen.imatrix_output_path) {
+        rc = ds4_engine_collect_imatrix(engine,
+                                        cfg.gen.imatrix_dataset_path,
+                                        cfg.gen.imatrix_output_path,
+                                        cfg.gen.ctx_size,
+                                        cfg.gen.imatrix_max_prompts,
+                                        cfg.gen.imatrix_max_tokens);
+    } else if (cfg.gen.perplexity_file_path) {
+        rc = run_perplexity_file(engine, &cfg);
     } else if (cfg.gen.prompt == NULL) {
         rc = run_repl(engine, &cfg);
     } else {
