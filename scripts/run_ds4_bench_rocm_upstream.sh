@@ -33,6 +33,7 @@ Environment:
   DS4_CUDA_ATTN_Q_B_CUBLAS=1             Use f16 GEMM/cache for the large q_b projection
   DS4_CUDA_ATTN_Q_B_PRELOAD=1            Preload q_b Q8_0 weights into the f16 cache
   DS4_CUDA_ATTN_Q_B_F16_OUT=1            Write q_b GEMM to f16 and fuse head norm/rope to float
+  DS4_SERVER_Q8_PREQUANT_DECODE=0        Disable default FAST_FULL prequantized Q8 decode matvecs
   DS4_SERVER_ATTENTION_OUTPUT_F16_OUT=0  Disable default FAST_FULL attention-output f16 projection
   DS4_SERVER_ATTENTION_OUTPUT_F16_OUT_MIN_TOKENS=N Optional attention f16-output minimum; default 0
   DS4_SERVER_SHARED_DOWN_F16_OUT=0       Disable default FAST_FULL shared-down f16 projection
@@ -108,6 +109,7 @@ if [[ "${DS4_SERVER_FAST_FULL:-0}" == "1" ]]; then
   export DS4_SERVER_Q8_REPACK="${DS4_SERVER_Q8_REPACK:-0}"
   export DS4_SERVER_Q8_REPACK_SPLIT16="${DS4_SERVER_Q8_REPACK_SPLIT16:-0}"
   export DS4_SERVER_Q8_WMMA_FAST="${DS4_SERVER_Q8_WMMA_FAST:-1}"
+  export DS4_SERVER_Q8_PREQUANT_DECODE="${DS4_SERVER_Q8_PREQUANT_DECODE:-1}"
   export DS4_SERVER_MOE_WMMA_HOT="${DS4_SERVER_MOE_WMMA_HOT:-1}"
   export DS4_SERVER_MOE_WMMA_GATE_HOT="${DS4_SERVER_MOE_WMMA_GATE_HOT:-8}"
   export DS4_SERVER_MOE_WMMA_DOWN_HOT="${DS4_SERVER_MOE_WMMA_DOWN_HOT:-8}"
@@ -166,6 +168,11 @@ export_pair_value Q8_GROUPED_BATCH_TILE "${DS4_SERVER_Q8_GROUPED_BATCH_TILE:-}"
 export_pair_flag Q8_REPACK "${DS4_SERVER_Q8_REPACK:-0}"
 export_pair_flag Q8_REPACK_SPLIT16 "${DS4_SERVER_Q8_REPACK_SPLIT16:-0}"
 export_pair_flag Q8_WMMA_FAST "${DS4_SERVER_Q8_WMMA_FAST:-0}"
+if [[ "${DS4_SERVER_Q8_PREQUANT_DECODE:-0}" == "1" ]]; then
+  export DS4_CUDA_Q8_PREQUANT_DECODE=1
+elif [[ -n "${DS4_SERVER_Q8_PREQUANT_DECODE:-}" ]]; then
+  unset DS4_CUDA_Q8_PREQUANT_DECODE || true
+fi
 export_pair_flag Q8_HIPBLASLT "${DS4_SERVER_Q8_HIPBLASLT:-0}"
 export_pair_value Q8_HIPBLASLT_MAX_TOKENS "${DS4_SERVER_Q8_HIPBLASLT_MAX_TOKENS:-}"
 export_pair_flag MOE_EXPERT_BATCH "${DS4_SERVER_MOE_EXPERT_BATCH:-0}"
