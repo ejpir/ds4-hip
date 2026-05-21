@@ -18,7 +18,7 @@ Environment:
   DS4_MODEL=FILE                  GGUF model path
   DS4_SERVER_HOST=127.0.0.1       Bind host
   DS4_SERVER_PORT=8000            Bind port
-  DS4_SERVER_CTX=4096             Context size, conservative default
+  DS4_SERVER_CTX=32768            Context size, standard default
   DS4_SERVER_TOKENS=1024          Default max output tokens
   DS4_SERVER_KV_DIR=/tmp/ds4-kv   Disk KV directory
   DS4_SERVER_KV_MB=2048           Disk KV budget MB
@@ -89,7 +89,7 @@ Safety/perf toggles:
 
 Examples:
   scripts/start_ds4_server.sh
-  DS4_SERVER_CTX=32768 scripts/start_ds4_server.sh
+  DS4_SERVER_CTX=65536 scripts/start_ds4_server.sh
   DS4_SERVER_PERFLEVEL=high DS4_SERVER_DEVICE_TENSORS=1 scripts/start_ds4_server.sh
   scripts/start_ds4_server.sh -- --quality
 EOF
@@ -100,7 +100,7 @@ MODEL_DEFAULT="/home/nick/.cache/huggingface/hub/models--cyberneurova--CyberNeur
 MODEL="${DS4_MODEL:-$MODEL_DEFAULT}"
 HOST="${DS4_SERVER_HOST:-127.0.0.1}"
 PORT="${DS4_SERVER_PORT:-8000}"
-CTX="${DS4_SERVER_CTX:-4096}"
+CTX="${DS4_SERVER_CTX:-32768}"
 TOKENS="${DS4_SERVER_TOKENS:-1024}"
 KV_DIR="${DS4_SERVER_KV_DIR:-/tmp/ds4-kv}"
 KV_MB="${DS4_SERVER_KV_MB:-2048}"
