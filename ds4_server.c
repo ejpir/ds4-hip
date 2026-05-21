@@ -40,6 +40,13 @@
 static volatile sig_atomic_t g_stop_requested = 0;
 static volatile sig_atomic_t g_listen_fd = -1;
 
+static bool server_spec_ngram_enabled(void) {
+    if (getenv("DS4_SPEC_DISABLE") != NULL) return false;
+    const char *v = getenv("DS4_SPEC_DRAFTER");
+    return (v && (!strcmp(v, "ngram") || !strcmp(v, "prompt") || !strcmp(v, "prompt-lookup"))) ||
+           getenv("DS4_SPEC_NGRAM") != NULL;
+}
+
 #define DS4_SERVER_IO_TIMEOUT_SEC 10
 #define DS4_SERVER_SEND_STALL_TIMEOUT_MS 2000
 
@@ -10117,7 +10124,20 @@ static void generate_job(server *s, job *j) {
 
         int toks[17];
         int ntok = 0;
-        if (temperature <= 0.0f &&
+        if (temperature <= 0.0f && server_spec_ngram_enabled()) {
+            ntok = ds4_session_eval_ngram_speculative_argmax(s->session,
+                                                             token,
+                                                             max_tokens - completion,
+                                                             ds4_token_eos(s->engine),
+                                                             toks,
+                                                             (int)(sizeof(toks) / sizeof(toks[0])),
+                                                             err,
+                                                             sizeof(err));
+            if (ntok < 0) {
+                finish = "error";
+                break;
+            }
+        } else if (temperature <= 0.0f &&
             ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL)
         {

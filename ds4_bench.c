@@ -271,6 +271,13 @@ static int next_frontier(const bench_config *c, int cur) {
     return next;
 }
 
+static bool bench_spec_ngram_enabled(void) {
+    if (getenv("DS4_SPEC_DISABLE") != NULL) return false;
+    const char *v = getenv("DS4_SPEC_DRAFTER");
+    return (v && (!strcmp(v, "ngram") || !strcmp(v, "prompt") || !strcmp(v, "prompt-lookup"))) ||
+           getenv("DS4_SPEC_NGRAM") != NULL;
+}
+
 static void log_context_memory(ds4_backend backend, int ctx_size) {
     ds4_context_memory m = ds4_context_memory_estimate(backend, ctx_size);
     fprintf(stderr,
@@ -419,8 +426,9 @@ int main(int argc, char **argv) {
             break;
         }
 
+        const bool use_ngram_spec = bench_spec_ngram_enabled();
         const double gen_t0 = bench_now_sec();
-        for (int i = 0; i < cfg.gen_tokens; i++) {
+        for (int i = 0; i < cfg.gen_tokens; ) {
             if (ds4_session_pos(session) + 1 >= ds4_session_ctx(session)) {
                 fprintf(stderr, "ds4-bench: generation would exceed allocated context at frontier %d\n", frontier);
                 rc = 1;
@@ -432,10 +440,30 @@ int main(int argc, char **argv) {
                 rc = 1;
                 break;
             }
-            if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
-                fprintf(stderr, "ds4-bench: decode at frontier %d failed: %s\n", frontier, err);
-                rc = 1;
-                break;
+            if (use_ngram_spec) {
+                int toks[17];
+                int ntok = ds4_session_eval_ngram_speculative_argmax(session,
+                                                                     token,
+                                                                     cfg.gen_tokens - i,
+                                                                     eos,
+                                                                     toks,
+                                                                     (int)(sizeof(toks) / sizeof(toks[0])),
+                                                                     err,
+                                                                     sizeof(err));
+                if (ntok < 0) {
+                    fprintf(stderr, "ds4-bench: ngram decode at frontier %d failed: %s\n", frontier, err);
+                    rc = 1;
+                    break;
+                }
+                if (ntok <= 0) ntok = 1;
+                i += ntok;
+            } else {
+                if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
+                    fprintf(stderr, "ds4-bench: decode at frontier %d failed: %s\n", frontier, err);
+                    rc = 1;
+                    break;
+                }
+                i++;
             }
         }
         const double gen_t1 = bench_now_sec();

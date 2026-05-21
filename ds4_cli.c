@@ -71,6 +71,13 @@ static void cli_interrupt_clear(void) {
     cli_interrupted = 0;
 }
 
+static bool cli_spec_ngram_enabled(void) {
+    if (getenv("DS4_SPEC_DISABLE") != NULL) return false;
+    const char *v = getenv("DS4_SPEC_DRAFTER");
+    return (v && (!strcmp(v, "ngram") || !strcmp(v, "prompt") || !strcmp(v, "prompt-lookup"))) ||
+           getenv("DS4_SPEC_NGRAM") != NULL;
+}
+
 static void usage(FILE *fp) {
     fprintf(fp,
         "Usage: ds4 [(-p PROMPT | --prompt-file FILE)] [options]\n"
@@ -513,7 +520,21 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
 
         int toks[17];
         int ntok = 0;
-        if (cfg->gen.temperature <= 0.0f && ds4_engine_mtp_draft_tokens(engine) > 1 &&
+        if (cfg->gen.temperature <= 0.0f && cli_spec_ngram_enabled()) {
+            ntok = ds4_session_eval_ngram_speculative_argmax(session,
+                                                             token,
+                                                             max_tokens - generated,
+                                                             ds4_token_eos(engine),
+                                                             toks,
+                                                             (int)(sizeof(toks) / sizeof(toks[0])),
+                                                             err,
+                                                             sizeof(err));
+            if (ntok < 0) {
+                fprintf(stderr, "ds4: decode failed: %s\n", err);
+                ds4_session_free(session);
+                return 1;
+            }
+        } else if (cfg->gen.temperature <= 0.0f && ds4_engine_mtp_draft_tokens(engine) > 1 &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
             ntok = ds4_session_eval_speculative_argmax(session,
                                                        token,
@@ -1140,7 +1161,20 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
 
         int toks[17];
         int ntok = 0;
-        if (cfg->gen.temperature <= 0.0f && ds4_engine_mtp_draft_tokens(engine) > 1 &&
+        if (cfg->gen.temperature <= 0.0f && cli_spec_ngram_enabled()) {
+            ntok = ds4_session_eval_ngram_speculative_argmax(chat->session,
+                                                             token,
+                                                             max_tokens - generated,
+                                                             ds4_token_eos(engine),
+                                                             toks,
+                                                             (int)(sizeof(toks) / sizeof(toks[0])),
+                                                             err,
+                                                             sizeof(err));
+            if (ntok < 0) {
+                fprintf(stderr, "ds4: decode failed: %s\n", err);
+                return 1;
+            }
+        } else if (cfg->gen.temperature <= 0.0f && ds4_engine_mtp_draft_tokens(engine) > 1 &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
             ntok = ds4_session_eval_speculative_argmax(chat->session,
                                                        token,
