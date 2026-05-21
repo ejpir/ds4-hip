@@ -2236,6 +2236,110 @@ __device__ __forceinline__ static void q2_K_dequant_dual_tile_half_rowwise(
     }
 }
 
+template <int BN, int BK>
+__device__ __forceinline__ static void q2_K_dequant_pair_tile_half_rowwise(
+        half *shB0,
+        half *shB1,
+        const unsigned char *base,
+        uint64_t row_bytes,
+        uint32_t n0,
+        uint32_t k0,
+        uint32_t out_dim,
+        uint32_t tid) {
+    const uint32_t g = (k0 & 255u) >> 4u;
+    const uint32_t within = g & 7u;
+    const uint32_t qbase = (g >> 3u) * 32u + (within & 1u) * 16u;
+    const uint32_t shift = (within >> 1u) * 2u;
+    constexpr uint32_t KG = 2u;
+    constexpr uint32_t UNITS_PER_TILE = (uint32_t)(BN * (BK / KG));
+    for (uint32_t j = tid; j < 2u * UNITS_PER_TILE; j += blockDim.x) {
+        const uint32_t tile = j / UNITS_PER_TILE;
+        const uint32_t rem = j - tile * UNITS_PER_TILE;
+        const uint32_t nn = rem / (uint32_t)(BK / KG);
+        const uint32_t kk0 = (rem - nn * (uint32_t)(BK / KG)) * KG;
+        const uint32_t row = n0 + tile * (uint32_t)BN + nn;
+        half *shB = tile == 0u ? shB0 : shB1;
+        if (row < out_dim) {
+            const unsigned char *blk = base + (uint64_t)row * row_bytes + (uint64_t)(k0 >> 8u) * 84u;
+            const float d = dev_f16_to_f32((uint16_t)blk[80] | ((uint16_t)blk[81] << 8));
+            const float dm = dev_f16_to_f32((uint16_t)blk[82] | ((uint16_t)blk[83] << 8));
+            const float s = (float)(blk[g] & 0x0fu);
+            const float m = (float)(blk[g] >> 4u);
+#pragma unroll
+            for (uint32_t u = 0; u < KG; u++) {
+                const uint32_t kk = kk0 + u;
+                const float q = (float)((blk[16u + qbase + kk] >> shift) & 3u);
+                shB[nn * (uint32_t)BK + kk] = __float2half(d * s * q - dm * m);
+            }
+        } else {
+#pragma unroll
+            for (uint32_t u = 0; u < KG; u++) {
+                const uint32_t kk = kk0 + u;
+                shB[nn * (uint32_t)BK + kk] = __float2half(0.0f);
+            }
+        }
+    }
+}
+
+template <int BN, int BK>
+__device__ __forceinline__ static void q2_K_dequant_dual_pair_tile_half_rowwise(
+        half *shB0g,
+        half *shB0u,
+        half *shB1g,
+        half *shB1u,
+        const unsigned char *gate_base,
+        const unsigned char *up_base,
+        uint64_t row_bytes,
+        uint32_t n0,
+        uint32_t k0,
+        uint32_t out_dim,
+        uint32_t tid) {
+    const uint32_t g = (k0 & 255u) >> 4u;
+    const uint32_t within = g & 7u;
+    const uint32_t qbase = (g >> 3u) * 32u + (within & 1u) * 16u;
+    const uint32_t shift = (within >> 1u) * 2u;
+    constexpr uint32_t KG = 2u;
+    constexpr uint32_t UNITS_PER_TILE = (uint32_t)(BN * (BK / KG));
+    for (uint32_t j = tid; j < 2u * UNITS_PER_TILE; j += blockDim.x) {
+        const uint32_t tile = j / UNITS_PER_TILE;
+        const uint32_t rem = j - tile * UNITS_PER_TILE;
+        const uint32_t nn = rem / (uint32_t)(BK / KG);
+        const uint32_t kk0 = (rem - nn * (uint32_t)(BK / KG)) * KG;
+        const uint32_t row = n0 + tile * (uint32_t)BN + nn;
+        half *shBg = tile == 0u ? shB0g : shB1g;
+        half *shBu = tile == 0u ? shB0u : shB1u;
+        if (row < out_dim) {
+            const unsigned char *gb = gate_base + (uint64_t)row * row_bytes + (uint64_t)(k0 >> 8u) * 84u;
+            const unsigned char *ub = up_base + (uint64_t)row * row_bytes + (uint64_t)(k0 >> 8u) * 84u;
+            const float gd = dev_f16_to_f32((uint16_t)gb[80] | ((uint16_t)gb[81] << 8));
+            const float gm = dev_f16_to_f32((uint16_t)gb[82] | ((uint16_t)gb[83] << 8));
+            const float ud = dev_f16_to_f32((uint16_t)ub[80] | ((uint16_t)ub[81] << 8));
+            const float um = dev_f16_to_f32((uint16_t)ub[82] | ((uint16_t)ub[83] << 8));
+            const float gs = (float)(gb[g] & 0x0fu);
+            const float gmn = (float)(gb[g] >> 4u);
+            const float us = (float)(ub[g] & 0x0fu);
+            const float umn = (float)(ub[g] >> 4u);
+#pragma unroll
+            for (uint32_t u = 0; u < KG; u++) {
+                const uint32_t kk = kk0 + u;
+                const float gq = (float)((gb[16u + qbase + kk] >> shift) & 3u);
+                const float uq = (float)((ub[16u + qbase + kk] >> shift) & 3u);
+                const uint32_t sj = nn * (uint32_t)BK + kk;
+                shBg[sj] = __float2half(gd * gs * gq - gm * gmn);
+                shBu[sj] = __float2half(ud * us * uq - um * umn);
+            }
+        } else {
+#pragma unroll
+            for (uint32_t u = 0; u < KG; u++) {
+                const uint32_t kk = kk0 + u;
+                const uint32_t sj = nn * (uint32_t)BK + kk;
+                shBg[sj] = __float2half(0.0f);
+                shBu[sj] = __float2half(0.0f);
+            }
+        }
+    }
+}
+
 __device__ __forceinline__ static float moe_silu_oldhip(float x) {
     return x * (1.0f / (1.0f + expf(-x)));
 }
@@ -2784,7 +2888,7 @@ __global__ static void moe_gate_up_mid_q2K_hotlist_wmma_n2_kernel(
     __syncthreads();
 
     using frag_a = rocwmma::fragment<rocwmma::matrix_a, BM, BN, BK, half, rocwmma::row_major>;
-    using frag_b = rocwmma::fragment<rocwmma::matrix_b, BM, BN, BK, half, rocwmma::row_major>;
+    using frag_b = rocwmma::fragment<rocwmma::matrix_b, BM, BN, BK, half, rocwmma::col_major>;
     using frag_c = rocwmma::fragment<rocwmma::accumulator, BM, BN, BK, float>;
     frag_a a;
     frag_b bg0;
@@ -2833,10 +2937,8 @@ __global__ static void moe_gate_up_mid_q2K_hotlist_wmma_n2_kernel(
                 }
             }
         }
-        q2_K_dequant_dual_tile_half_rowwise<BN, BK>(
-                shBg0, shBu0, gew, uew, gate_row_bytes, n0, k0, expert_mid_dim, tid);
-        q2_K_dequant_dual_tile_half_rowwise<BN, BK>(
-                shBg1, shBu1, gew, uew, gate_row_bytes, n0 + BN, k0, expert_mid_dim, tid);
+        q2_K_dequant_dual_pair_tile_half_rowwise<BN, BK>(
+                shBg0, shBu0, shBg1, shBu1, gew, uew, gate_row_bytes, n0, k0, expert_mid_dim, tid);
         __syncthreads();
         if (wave < MTILES) {
             rocwmma::load_matrix_sync(a, shA + wave * BM * BK, BK);
@@ -3020,7 +3122,7 @@ __global__ static void moe_down_q2K_hotlist_wmma_n2_kernel(
     __syncthreads();
 
     using frag_a = rocwmma::fragment<rocwmma::matrix_a, BM, BN, BK, half, rocwmma::row_major>;
-    using frag_b = rocwmma::fragment<rocwmma::matrix_b, BM, BN, BK, half, rocwmma::row_major>;
+    using frag_b = rocwmma::fragment<rocwmma::matrix_b, BM, BN, BK, half, rocwmma::col_major>;
     using frag_c = rocwmma::fragment<rocwmma::accumulator, BM, BN, BK, float>;
     frag_a a;
     frag_b b0;
@@ -3060,10 +3162,8 @@ __global__ static void moe_down_q2K_hotlist_wmma_n2_kernel(
                 }
             }
         }
-        q2_K_dequant_tile_half_rowwise<BN, BK>(
-                shB0, dew, down_row_bytes, n0, k0, out_dim, tid);
-        q2_K_dequant_tile_half_rowwise<BN, BK>(
-                shB1, dew, down_row_bytes, n0 + BN, k0, out_dim, tid);
+        q2_K_dequant_pair_tile_half_rowwise<BN, BK>(
+                shB0, shB1, dew, down_row_bytes, n0, k0, out_dim, tid);
         __syncthreads();
         if (wave < MTILES) {
             rocwmma::load_matrix_sync(a, shA + wave * BM * BK, BK);
@@ -3280,7 +3380,7 @@ __global__ static void moe_gate_up_mid_q2K_hottile_wmma_n2_kernel(
     const uint32_t first = offsets[expert];
 
     using frag_a = rocwmma::fragment<rocwmma::matrix_a, BM, BN, BK, half, rocwmma::row_major>;
-    using frag_b = rocwmma::fragment<rocwmma::matrix_b, BM, BN, BK, half, rocwmma::row_major>;
+    using frag_b = rocwmma::fragment<rocwmma::matrix_b, BM, BN, BK, half, rocwmma::col_major>;
     using frag_c = rocwmma::fragment<rocwmma::accumulator, BM, BN, BK, float>;
     frag_a a;
     frag_b bg0, bu0, bg1, bu1;
@@ -3309,10 +3409,8 @@ __global__ static void moe_gate_up_mid_q2K_hottile_wmma_n2_kernel(
                 shA[j] = __float2half(0.0f);
             }
         }
-        q2_K_dequant_dual_tile_half_rowwise<BN, BK>(
-                shBg0, shBu0, gew, uew, gate_row_bytes, n0, k0, expert_mid_dim, tid);
-        q2_K_dequant_dual_tile_half_rowwise<BN, BK>(
-                shBg1, shBu1, gew, uew, gate_row_bytes, n0 + BN, k0, expert_mid_dim, tid);
+        q2_K_dequant_dual_pair_tile_half_rowwise<BN, BK>(
+                shBg0, shBu0, shBg1, shBu1, gew, uew, gate_row_bytes, n0, k0, expert_mid_dim, tid);
         __syncthreads();
         if (wave < MTILES) {
             rocwmma::load_matrix_sync(a, shA + wave * BM * BK, BK);
@@ -3405,7 +3503,7 @@ __global__ static void moe_down_q2K_hottile_wmma_n2_kernel(
     const uint32_t first = offsets[expert];
 
     using frag_a = rocwmma::fragment<rocwmma::matrix_a, BM, BN, BK, half, rocwmma::row_major>;
-    using frag_b = rocwmma::fragment<rocwmma::matrix_b, BM, BN, BK, half, rocwmma::row_major>;
+    using frag_b = rocwmma::fragment<rocwmma::matrix_b, BM, BN, BK, half, rocwmma::col_major>;
     using frag_c = rocwmma::fragment<rocwmma::accumulator, BM, BN, BK, float>;
     frag_a a;
     frag_b b0, b1;
@@ -3430,10 +3528,8 @@ __global__ static void moe_down_q2K_hottile_wmma_n2_kernel(
                 shA[j] = __float2half(0.0f);
             }
         }
-        q2_K_dequant_tile_half_rowwise<BN, BK>(
-                shB0, dew, down_row_bytes, n0, k0, out_dim, tid);
-        q2_K_dequant_tile_half_rowwise<BN, BK>(
-                shB1, dew, down_row_bytes, n0 + BN, k0, out_dim, tid);
+        q2_K_dequant_pair_tile_half_rowwise<BN, BK>(
+                shB0, shB1, dew, down_row_bytes, n0, k0, out_dim, tid);
         __syncthreads();
         if (wave < MTILES) {
             rocwmma::load_matrix_sync(a, shA + wave * BM * BK, BK);
