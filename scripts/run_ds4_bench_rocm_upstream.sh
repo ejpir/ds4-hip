@@ -33,10 +33,10 @@ Environment:
   DS4_CUDA_ATTN_Q_B_CUBLAS=1             Use f16 GEMM/cache for the large q_b projection
   DS4_CUDA_ATTN_Q_B_PRELOAD=1            Preload q_b Q8_0 weights into the f16 cache
   DS4_CUDA_ATTN_Q_B_F16_OUT=1            Write q_b GEMM to f16 and fuse head norm/rope to float
-  DS4_CUDA_ATTENTION_OUTPUT_F16_OUT=1    Opt-in f16 projection output for large prefill; default min tokens 128
-  DS4_CUDA_ATTENTION_OUTPUT_F16_OUT_MIN_TOKENS=N Override attention f16-output minimum
-  DS4_CUDA_SHARED_DOWN_F16_OUT=1         Opt-in f16 shared-down output for large prefill; default min tokens 128
-  DS4_CUDA_SHARED_DOWN_F16_OUT_MIN_TOKENS=N Override shared-down f16-output minimum
+  DS4_SERVER_ATTENTION_OUTPUT_F16_OUT=0  Disable default FAST_FULL attention-output f16 projection
+  DS4_SERVER_ATTENTION_OUTPUT_F16_OUT_MIN_TOKENS=N Optional attention f16-output minimum; default 0
+  DS4_SERVER_SHARED_DOWN_F16_OUT=0       Disable default FAST_FULL shared-down f16 projection
+  DS4_SERVER_SHARED_DOWN_F16_OUT_MIN_TOKENS=N Optional shared-down f16-output minimum; default 0
   DS4_CUDA_MOE_WMMA_MTILES=4|8|16        Hot MoE WMMA token tiles/block
   DS4_CUDA_MOE_WMMA_F16_MID=1            Hot MoE WMMA stores/reads routed mid as f16
   DS4_CUDA_MOE_WMMA_F16_MID_ALL=1        Store scalar/cold routed mid scratch as f16 too
@@ -121,11 +121,11 @@ if [[ "${DS4_SERVER_FAST_FULL:-0}" == "1" ]]; then
   # were part of the fastest ROCm CLI recipe.
   export DS4_CUDA_SHARED_GATE_UP_BATCH_FUSED="${DS4_CUDA_SHARED_GATE_UP_BATCH_FUSED:-1}"
   export DS4_CUDA_SHARED_DOWN_CUBLAS="${DS4_CUDA_SHARED_DOWN_CUBLAS:-1}"
-  export DS4_SERVER_SHARED_DOWN_F16_OUT="${DS4_SERVER_SHARED_DOWN_F16_OUT:-0}"
+  export DS4_SERVER_SHARED_DOWN_F16_OUT="${DS4_SERVER_SHARED_DOWN_F16_OUT:-1}"
   export DS4_SERVER_ATTN_Q_B_CUBLAS="${DS4_SERVER_ATTN_Q_B_CUBLAS:-1}"
   export DS4_SERVER_ATTN_Q_B_PRELOAD="${DS4_SERVER_ATTN_Q_B_PRELOAD:-1}"
   export DS4_SERVER_ATTN_Q_B_F16_OUT="${DS4_SERVER_ATTN_Q_B_F16_OUT:-1}"
-  export DS4_SERVER_ATTENTION_OUTPUT_F16_OUT="${DS4_SERVER_ATTENTION_OUTPUT_F16_OUT:-0}"
+  export DS4_SERVER_ATTENTION_OUTPUT_F16_OUT="${DS4_SERVER_ATTENTION_OUTPUT_F16_OUT:-1}"
   export DS4_CUDA_ATTENTION_OUTPUT_CUBLAS_ALL="${DS4_CUDA_ATTENTION_OUTPUT_CUBLAS_ALL:-1}"
   export DS4_CUDA_ATTENTION_OUTPUT_PACKED_B_CUBLAS="${DS4_CUDA_ATTENTION_OUTPUT_PACKED_B_CUBLAS:-1}"
   export DS4_CUDA_ATTENTION_OUTPUT_INTERLEAVED_B_CUBLAS="${DS4_CUDA_ATTENTION_OUTPUT_INTERLEAVED_B_CUBLAS:-1}"

@@ -38,10 +38,10 @@ Environment:
   DS4_SERVER_ATTN_Q_B_CUBLAS=1 Use f16 GEMM/cache for the large q_b projection in upstream-shaped ROCm
   DS4_SERVER_ATTN_Q_B_PRELOAD=1 Preload q_b Q8_0 weights into the f16 cache
   DS4_SERVER_ATTN_Q_B_F16_OUT=1 Write q_b GEMM to f16 and fuse head norm/rope to float; FAST_FULL default 1
-  DS4_SERVER_ATTENTION_OUTPUT_F16_OUT=1 Opt-in attention output f16 projection for large prefill; default min tokens 128
-  DS4_SERVER_ATTENTION_OUTPUT_F16_OUT_MIN_TOKENS=N Override attention f16-output minimum
-  DS4_SERVER_SHARED_DOWN_F16_OUT=1 Opt-in shared-down f16 projection for large prefill; default min tokens 128
-  DS4_SERVER_SHARED_DOWN_F16_OUT_MIN_TOKENS=N Override shared-down f16-output minimum
+  DS4_SERVER_ATTENTION_OUTPUT_F16_OUT=0 Disable FAST_FULL default attention output f16 projection
+  DS4_SERVER_ATTENTION_OUTPUT_F16_OUT_MIN_TOKENS=N Optional attention f16-output minimum; default 0
+  DS4_SERVER_SHARED_DOWN_F16_OUT=0 Disable FAST_FULL default shared-down f16 projection
+  DS4_SERVER_SHARED_DOWN_F16_OUT_MIN_TOKENS=N Optional shared-down f16-output minimum; default 0
   DS4_SERVER_Q8_BATCH_FAST=0|1   Batched Q8_0 prefill matmul is default-on in HIP; set 0 to disable
   DS4_SERVER_Q8_BATCH_TILE=32    Token tile for Q8 batch fast; passed through when set
   DS4_SERVER_Q8_BATCH_RPB=N      Rows/block for Q8 batch fast; default 32
@@ -123,11 +123,10 @@ if [[ "${DS4_SERVER_FAST_FULL:-0}" == "1" ]]; then
   export DS4_SERVER_ATTN_Q_B_CUBLAS="${DS4_SERVER_ATTN_Q_B_CUBLAS:-1}"
   export DS4_SERVER_ATTN_Q_B_PRELOAD="${DS4_SERVER_ATTN_Q_B_PRELOAD:-1}"
   export DS4_SERVER_ATTN_Q_B_F16_OUT="${DS4_SERVER_ATTN_Q_B_F16_OUT:-1}"
-  # Keep f16-output projection shortcuts opt-in for serving/chat quality. The
-  # backend also gates them to larger prefill chunks by *_MIN_TOKENS (default
-  # 128) because short chat prompts were overly sensitive to half output.
-  export DS4_SERVER_ATTENTION_OUTPUT_F16_OUT="${DS4_SERVER_ATTENTION_OUTPUT_F16_OUT:-0}"
-  export DS4_SERVER_SHARED_DOWN_F16_OUT="${DS4_SERVER_SHARED_DOWN_F16_OUT:-0}"
+  # The HC split-stride fix makes the f16-output projection shortcuts safe for
+  # the fast preset in short natural probes; keep explicit kill switches.
+  export DS4_SERVER_ATTENTION_OUTPUT_F16_OUT="${DS4_SERVER_ATTENTION_OUTPUT_F16_OUT:-1}"
+  export DS4_SERVER_SHARED_DOWN_F16_OUT="${DS4_SERVER_SHARED_DOWN_F16_OUT:-1}"
   export DS4_SERVER_Q8_BATCH_FAST="${DS4_SERVER_Q8_BATCH_FAST:-1}"
   export DS4_SERVER_Q8_BATCH_SHARED_X="${DS4_SERVER_Q8_BATCH_SHARED_X:-1}"
   export DS4_SERVER_Q8_BATCH_TILE="${DS4_SERVER_Q8_BATCH_TILE:-32}"

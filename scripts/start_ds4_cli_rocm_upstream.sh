@@ -39,10 +39,10 @@ Useful environment overrides:
   DS4_CLI_TOKENS=N
   DS4_CLI_STOP_SERVER=1
   DS4_CLI_ALLOW_WITH_SERVER=1
-  DS4_SERVER_ATTENTION_OUTPUT_F16_OUT=1  Opt in for large prefill only; default min tokens 128
-  DS4_SERVER_ATTENTION_OUTPUT_F16_OUT_MIN_TOKENS=N  Override attention f16-output minimum
-  DS4_SERVER_SHARED_DOWN_F16_OUT=1       Opt in for large prefill only; default min tokens 128
-  DS4_SERVER_SHARED_DOWN_F16_OUT_MIN_TOKENS=N       Override shared-down f16-output minimum
+  DS4_SERVER_ATTENTION_OUTPUT_F16_OUT=0  Disable default FAST_FULL attention-output f16 projection
+  DS4_SERVER_ATTENTION_OUTPUT_F16_OUT_MIN_TOKENS=N  Optional attention f16-output minimum; default 0
+  DS4_SERVER_SHARED_DOWN_F16_OUT=0       Disable default FAST_FULL shared-down f16 projection
+  DS4_SERVER_SHARED_DOWN_F16_OUT_MIN_TOKENS=N       Optional shared-down f16-output minimum; default 0
   DS4_SERVER_FAST_FULL=0       Disable the preset and use your explicit env
   DS4_SERVER_PERFLEVEL=auto    Or empty/off/skip to bypass rocm-smi perflevel changes
 EOF
@@ -126,11 +126,10 @@ if [[ "${DS4_SERVER_FAST_FULL:-0}" == "1" ]]; then
   export DS4_SERVER_ATTN_Q_B_CUBLAS="${DS4_SERVER_ATTN_Q_B_CUBLAS:-1}"
   export DS4_SERVER_ATTN_Q_B_PRELOAD="${DS4_SERVER_ATTN_Q_B_PRELOAD:-1}"
   export DS4_SERVER_ATTN_Q_B_F16_OUT="${DS4_SERVER_ATTN_Q_B_F16_OUT:-1}"
-  # Keep the f16-output projection shortcuts opt-in for interactive chat. The
-  # backend also gates them to larger prefill chunks by *_MIN_TOKENS (default
-  # 128) because short chat prompts were overly sensitive to half output.
-  export DS4_SERVER_ATTENTION_OUTPUT_F16_OUT="${DS4_SERVER_ATTENTION_OUTPUT_F16_OUT:-0}"
-  export DS4_SERVER_SHARED_DOWN_F16_OUT="${DS4_SERVER_SHARED_DOWN_F16_OUT:-0}"
+  # The HC split-stride fix makes the f16-output projection shortcuts safe for
+  # the fast ROCm preset in short natural probes; keep explicit kill switches.
+  export DS4_SERVER_ATTENTION_OUTPUT_F16_OUT="${DS4_SERVER_ATTENTION_OUTPUT_F16_OUT:-1}"
+  export DS4_SERVER_SHARED_DOWN_F16_OUT="${DS4_SERVER_SHARED_DOWN_F16_OUT:-1}"
   export DS4_CUDA_ATTENTION_OUTPUT_CUBLAS_ALL="${DS4_CUDA_ATTENTION_OUTPUT_CUBLAS_ALL:-1}"
   export DS4_CUDA_ATTENTION_OUTPUT_PACKED_B_CUBLAS="${DS4_CUDA_ATTENTION_OUTPUT_PACKED_B_CUBLAS:-1}"
   export DS4_CUDA_ATTENTION_OUTPUT_INTERLEAVED_B_CUBLAS="${DS4_CUDA_ATTENTION_OUTPUT_INTERLEAVED_B_CUBLAS:-1}"
