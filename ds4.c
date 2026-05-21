@@ -16167,6 +16167,7 @@ struct ds4_session {
     ds4_session_progress_fn progress;
     void *progress_ud;
     uint32_t prefill_cap;
+    uint32_t ngram_spec_cooldown;
     int ctx_size;
     bool checkpoint_valid;
     bool mtp_draft_valid;
@@ -17386,6 +17387,7 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
     return 1;
 #else
     ds4_engine *e = s->engine;
+    s->ngram_spec_cooldown = 0;
     if (prompt->len <= 0 || prompt->len >= s->ctx_size) {
         snprintf(err, errlen, "prompt exceeds context");
         return 1;
@@ -17794,6 +17796,10 @@ int ds4_session_eval_ngram_speculative_argmax(ds4_session *s, int first_token,
      * (rejects restore the target frontier), but batch reductions can still
      * perturb near-tie greedy decisions, so keep it opt-in and non-quality. */
     if (e->quality || getenv("DS4_SPEC_NGRAM_STRICT") != NULL) return n_accept;
+    if (s->ngram_spec_cooldown > 0) {
+        s->ngram_spec_cooldown--;
+        return n_accept;
+    }
     bool have_spec_scratch = s->graph.spec_logits != NULL;
     for (uint32_t il = 0; have_spec_scratch && il < DS4_N_LAYER; il++) {
         const uint32_t ratio = ds4_layer_compress_ratio(il);
@@ -17813,6 +17819,7 @@ int ds4_session_eval_ngram_speculative_argmax(ds4_session *s, int first_token,
     min_draft = ds4_env_int_clamped("DS4_SPEC_NGRAM_MIN_DRAFT", min_draft, 1, 16);
     int min_match = ds4_env_int_clamped("DS4_SPEC_NGRAM_MIN_MATCH", 4, 1, 128);
     int max_match = ds4_env_int_clamped("DS4_SPEC_NGRAM_MAX_MATCH", 64, min_match, 512);
+    const int reject_cooldown = ds4_env_int_clamped("DS4_SPEC_NGRAM_REJECT_COOLDOWN", 128, 0, 4096);
 
     if (max_draft > max_tokens - n_accept) max_draft = max_tokens - n_accept;
     if (max_draft > accepted_cap - n_accept) max_draft = accepted_cap - n_accept;
@@ -17835,14 +17842,16 @@ int ds4_session_eval_ngram_speculative_argmax(ds4_session *s, int first_token,
 
     const bool log_ngram = getenv("DS4_SPEC_NGRAM_LOG") != NULL;
     if (sample_argmax(s->logits, DS4_N_VOCAB) != drafts[0]) {
+        if (reject_cooldown > 0) s->ngram_spec_cooldown = (uint32_t)reject_cooldown;
         if (log_ngram) {
             fprintf(stderr,
-                    "ds4: ngram spec reject-first match=%d source=%d drafted=%d draft0=%d target=%d\n",
+                    "ds4: ngram spec reject-first match=%d source=%d drafted=%d draft0=%d target=%d cooldown=%d\n",
                     match_len,
                     source_pos,
                     draft_n,
                     drafts[0],
-                    sample_argmax(s->logits, DS4_N_VOCAB));
+                    sample_argmax(s->logits, DS4_N_VOCAB),
+                    reject_cooldown);
         }
         return n_accept;
     }
@@ -17886,6 +17895,7 @@ int ds4_session_eval_ngram_speculative_argmax(ds4_session *s, int first_token,
             }
             s->checkpoint_valid = true;
             s->mtp_draft_valid = false;
+            s->ngram_spec_cooldown = 0;
             if (log_ngram) {
                 fprintf(stderr,
                         "ds4: ngram spec accept match=%d source=%d drafted=%d accepted=%d\n",
@@ -17903,14 +17913,16 @@ int ds4_session_eval_ngram_speculative_argmax(ds4_session *s, int first_token,
     (void)spec_frontier_restore(&frontier, s);
     s->checkpoint_valid = true;
     s->mtp_draft_valid = false;
+    if (reject_cooldown > 0) s->ngram_spec_cooldown = (uint32_t)reject_cooldown;
     if (log_ngram) {
         fprintf(stderr,
-                "ds4: ngram spec reject match=%d source=%d drafted=%d verified_prefix=%d ok=%d\n",
+                "ds4: ngram spec reject match=%d source=%d drafted=%d verified_prefix=%d ok=%d cooldown=%d\n",
                 match_len,
                 source_pos,
                 draft_n,
                 commit_drafts,
-                ok ? 1 : 0);
+                ok ? 1 : 0,
+                reject_cooldown);
     }
     spec_frontier_free(&frontier);
     return n_accept;
@@ -18515,6 +18527,7 @@ void ds4_session_invalidate(ds4_session *s) {
     s->checkpoint_valid = false;
     s->checkpoint.len = 0;
     s->mtp_draft_valid = false;
+    s->ngram_spec_cooldown = 0;
 }
 
 void ds4_session_rewind(ds4_session *s, int pos) {
@@ -18522,6 +18535,7 @@ void ds4_session_rewind(ds4_session *s, int pos) {
     if (pos > s->checkpoint.len) pos = s->checkpoint.len;
     s->checkpoint.len = pos;
     s->mtp_draft_valid = false;
+    s->ngram_spec_cooldown = 0;
 }
 
 int ds4_session_pos(ds4_session *s) {

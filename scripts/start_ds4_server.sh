@@ -87,6 +87,7 @@ Environment:
 Safety/perf toggles:
   DS4_SPEC_DRAFTER=ngram          Opt-in prompt-lookup/n-gram speculative drafter for greedy decode
   DS4_SPEC_MAX_DRAFT=16           Maximum n-gram draft length; verifier accepts full chunks only
+  DS4_SPEC_NGRAM_REJECT_COOLDOWN=128  Tokens to skip after a failed n-gram verification
   DS4_SERVER_PERFLEVEL=high|auto  Optional rocm-smi --setperflevel; set empty/off/skip to bypass
   DS4_SERVER_DEVICE_TENSORS=1     Use faster hipMalloc device tensors
   DS4_SERVER_TOP_ONLY=1           Greedy top-only decode
