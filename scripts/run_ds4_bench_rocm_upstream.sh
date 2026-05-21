@@ -33,8 +33,8 @@ Environment:
   DS4_CUDA_ATTN_Q_B_CUBLAS=1             Use f16 GEMM/cache for the large q_b projection
   DS4_CUDA_ATTN_Q_B_PRELOAD=1            Preload q_b Q8_0 weights into the f16 cache
   DS4_CUDA_ATTN_Q_B_F16_OUT=1            Write q_b GEMM to f16 and fuse head norm/rope to float
-  DS4_CUDA_ATTENTION_OUTPUT_F16_OUT=1    Unsafe opt-in: fastest Promessi prefill, can degrade chat output
-  DS4_CUDA_SHARED_DOWN_F16_OUT=1         Unsafe opt-in: fastest Promessi prefill, can degrade chat output
+  DS4_CUDA_ATTENTION_OUTPUT_F16_OUT=1    Opt-in f16 projection output for large prefill; default min tokens 128
+  DS4_CUDA_SHARED_DOWN_F16_OUT=1         Opt-in f16 shared-down output for large prefill; default min tokens 128
   DS4_CUDA_MOE_WMMA_MTILES=4|8|16        Hot MoE WMMA token tiles/block
   DS4_CUDA_MOE_WMMA_F16_MID=1            Hot MoE WMMA stores/reads routed mid as f16
   DS4_CUDA_MOE_WMMA_F16_MID_ALL=1        Store scalar/cold routed mid scratch as f16 too

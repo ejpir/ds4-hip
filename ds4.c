@@ -11612,6 +11612,17 @@ static bool ds4_profile_env_u32_matches(const char *name, uint32_t value) {
     return end != s && v == (unsigned long)value;
 }
 
+static uint32_t ds4_env_u32_default2(const char *name0, const char *name1, uint32_t def) {
+    const char *s = getenv(name0);
+    if ((!s || !s[0]) && name1) s = getenv(name1);
+    if (!s || !s[0]) return def;
+    char *end = NULL;
+    unsigned long v = strtoul(s, &end, 10);
+    if (end == s) return def;
+    if (v > UINT32_MAX) return UINT32_MAX;
+    return (uint32_t)v;
+}
+
 static bool metal_graph_layer_stage_profile_boundary(
         const char *part,
         const char *stage,
@@ -12966,7 +12977,11 @@ static bool metal_graph_encode_layer_attention_batch(
     }
     DS4_METAL_PROFILE_ATTN_STAGE("inv_rope");
 #if defined(DS4_USE_GPU_API)
-    const bool attn_out_f16 = (getenv("DS4_CUDA_ATTENTION_OUTPUT_F16_OUT") != NULL ||
+    const uint32_t attn_out_f16_min = ds4_env_u32_default2("DS4_CUDA_ATTENTION_OUTPUT_F16_OUT_MIN_TOKENS",
+                                                           "DS4_HIP_ATTENTION_OUTPUT_F16_OUT_MIN_TOKENS",
+                                                           128u);
+    const bool attn_out_f16 = n_tokens >= attn_out_f16_min &&
+                              (getenv("DS4_CUDA_ATTENTION_OUTPUT_F16_OUT") != NULL ||
                                getenv("DS4_HIP_ATTENTION_OUTPUT_F16_OUT") != NULL) &&
                               getenv("DS4_METAL_GRAPH_DUMP_PREFIX") == NULL;
     if (attn_out_f16) {
@@ -13280,7 +13295,11 @@ static bool metal_graph_encode_layer_ffn_batch(
     const bool keep_ffn_out = metal_graph_needs_ffn_out(g, il, pos0);
     bool shared_down_f16 = false;
 #if defined(DS4_USE_GPU_API)
-    const bool shared_down_f16_enabled = (getenv("DS4_CUDA_SHARED_DOWN_F16_OUT") != NULL ||
+    const uint32_t shared_down_f16_min = ds4_env_u32_default2("DS4_CUDA_SHARED_DOWN_F16_OUT_MIN_TOKENS",
+                                                              "DS4_HIP_SHARED_DOWN_F16_OUT_MIN_TOKENS",
+                                                              128u);
+    const bool shared_down_f16_enabled = n_tokens >= shared_down_f16_min &&
+                                         (getenv("DS4_CUDA_SHARED_DOWN_F16_OUT") != NULL ||
                                           getenv("DS4_HIP_SHARED_DOWN_F16_OUT") != NULL) &&
                                          getenv("DS4_METAL_GRAPH_DUMP_PREFIX") == NULL &&
                                          !keep_ffn_out;
