@@ -11612,7 +11612,7 @@ static bool ds4_profile_env_u32_matches(const char *name, uint32_t value) {
     return end != s && v == (unsigned long)value;
 }
 
-static uint32_t ds4_env_u32_default2(const char *name0, const char *name1, uint32_t def) {
+static DS4_MAYBE_UNUSED uint32_t ds4_env_u32_default2(const char *name0, const char *name1, uint32_t def) {
     const char *s = getenv(name0);
     if ((!s || !s[0]) && name1) s = getenv(name1);
     if (!s || !s[0]) return def;
