@@ -17123,6 +17123,12 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     e->mtp_draft_tokens = opt->mtp_draft_tokens > 0 ? opt->mtp_draft_tokens : 1;
     if (e->mtp_draft_tokens > 16) e->mtp_draft_tokens = 16;
     e->mtp_margin = opt->mtp_margin >= 0.0f ? opt->mtp_margin : 3.0f;
+    if (opt->directional_steering_file && opt->directional_steering_file[0]) {
+        fprintf(stderr, "ds4: directional steering is not available in this HIP/ROCm merge build\n");
+        free(e);
+        *out = NULL;
+        return 1;
+    }
     if (opt->n_threads > 0) g_requested_threads = (uint32_t)opt->n_threads;
     ds4_acquire_instance_lock();
 
