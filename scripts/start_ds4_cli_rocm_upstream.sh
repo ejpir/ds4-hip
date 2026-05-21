@@ -40,7 +40,9 @@ Useful environment overrides:
   DS4_CLI_STOP_SERVER=1
   DS4_CLI_ALLOW_WITH_SERVER=1
   DS4_SERVER_ATTENTION_OUTPUT_F16_OUT=1  Opt in for large prefill only; default min tokens 128
+  DS4_SERVER_ATTENTION_OUTPUT_F16_OUT_MIN_TOKENS=N  Override attention f16-output minimum
   DS4_SERVER_SHARED_DOWN_F16_OUT=1       Opt in for large prefill only; default min tokens 128
+  DS4_SERVER_SHARED_DOWN_F16_OUT_MIN_TOKENS=N       Override shared-down f16-output minimum
   DS4_SERVER_FAST_FULL=0       Disable the preset and use your explicit env
   DS4_SERVER_PERFLEVEL=auto    Or empty to skip rocm-smi perflevel changes
 EOF
@@ -157,7 +159,9 @@ export_pair_flag ATTN_Q_B_CUBLAS "${DS4_SERVER_ATTN_Q_B_CUBLAS:-0}"
 export_pair_flag ATTN_Q_B_PRELOAD "${DS4_SERVER_ATTN_Q_B_PRELOAD:-0}"
 export_pair_flag ATTN_Q_B_F16_OUT "${DS4_SERVER_ATTN_Q_B_F16_OUT:-0}"
 export_pair_flag ATTENTION_OUTPUT_F16_OUT "${DS4_SERVER_ATTENTION_OUTPUT_F16_OUT:-0}"
+export_pair_value ATTENTION_OUTPUT_F16_OUT_MIN_TOKENS "${DS4_SERVER_ATTENTION_OUTPUT_F16_OUT_MIN_TOKENS:-}"
 export_pair_flag SHARED_DOWN_F16_OUT "${DS4_SERVER_SHARED_DOWN_F16_OUT:-0}"
+export_pair_value SHARED_DOWN_F16_OUT_MIN_TOKENS "${DS4_SERVER_SHARED_DOWN_F16_OUT_MIN_TOKENS:-}"
 export_pair_flag Q8_BATCH_FAST "${DS4_SERVER_Q8_BATCH_FAST:-0}"
 export_pair_value Q8_BATCH_TILE "${DS4_SERVER_Q8_BATCH_TILE:-}"
 export_pair_value Q8_BATCH_RPB "${DS4_SERVER_Q8_BATCH_RPB:-}"

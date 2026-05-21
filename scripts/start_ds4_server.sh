@@ -39,7 +39,9 @@ Environment:
   DS4_SERVER_ATTN_Q_B_PRELOAD=1 Preload q_b Q8_0 weights into the f16 cache
   DS4_SERVER_ATTN_Q_B_F16_OUT=1 Write q_b GEMM to f16 and fuse head norm/rope to float; FAST_FULL default 1
   DS4_SERVER_ATTENTION_OUTPUT_F16_OUT=1 Opt-in attention output f16 projection for large prefill; default min tokens 128
+  DS4_SERVER_ATTENTION_OUTPUT_F16_OUT_MIN_TOKENS=N Override attention f16-output minimum
   DS4_SERVER_SHARED_DOWN_F16_OUT=1 Opt-in shared-down f16 projection for large prefill; default min tokens 128
+  DS4_SERVER_SHARED_DOWN_F16_OUT_MIN_TOKENS=N Override shared-down f16-output minimum
   DS4_SERVER_Q8_BATCH_FAST=0|1   Batched Q8_0 prefill matmul is default-on in HIP; set 0 to disable
   DS4_SERVER_Q8_BATCH_TILE=32    Token tile for Q8 batch fast; passed through when set
   DS4_SERVER_Q8_BATCH_RPB=N      Rows/block for Q8 batch fast; default 32
@@ -260,9 +262,17 @@ if [[ "${DS4_SERVER_ATTENTION_OUTPUT_F16_OUT:-0}" == "1" ]]; then
   export DS4_CUDA_ATTENTION_OUTPUT_F16_OUT=1
   export DS4_HIP_ATTENTION_OUTPUT_F16_OUT=1
 fi
+if [[ -n "${DS4_SERVER_ATTENTION_OUTPUT_F16_OUT_MIN_TOKENS:-}" ]]; then
+  export DS4_CUDA_ATTENTION_OUTPUT_F16_OUT_MIN_TOKENS="$DS4_SERVER_ATTENTION_OUTPUT_F16_OUT_MIN_TOKENS"
+  export DS4_HIP_ATTENTION_OUTPUT_F16_OUT_MIN_TOKENS="$DS4_SERVER_ATTENTION_OUTPUT_F16_OUT_MIN_TOKENS"
+fi
 if [[ "${DS4_SERVER_SHARED_DOWN_F16_OUT:-0}" == "1" ]]; then
   export DS4_CUDA_SHARED_DOWN_F16_OUT=1
   export DS4_HIP_SHARED_DOWN_F16_OUT=1
+fi
+if [[ -n "${DS4_SERVER_SHARED_DOWN_F16_OUT_MIN_TOKENS:-}" ]]; then
+  export DS4_CUDA_SHARED_DOWN_F16_OUT_MIN_TOKENS="$DS4_SERVER_SHARED_DOWN_F16_OUT_MIN_TOKENS"
+  export DS4_HIP_SHARED_DOWN_F16_OUT_MIN_TOKENS="$DS4_SERVER_SHARED_DOWN_F16_OUT_MIN_TOKENS"
 fi
 if [[ "${DS4_SERVER_Q8_BATCH_FAST:-0}" == "1" ]]; then
   export DS4_HIP_Q8_BATCH_FAST=1
