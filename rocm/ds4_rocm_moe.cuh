@@ -11,6 +11,11 @@ __device__ static float dev_f16_to_f32(uint16_t v) {
     return __half2float(*reinterpret_cast<const __half *>(&v));
 }
 
+__device__ __forceinline__ static uint32_t dev_pack_half2_bits(float x, float y) {
+    const __half2 h = __floats2half2_rn(x, y);
+    return *reinterpret_cast<const uint32_t *>(&h);
+}
+
 __device__ __forceinline__ static uint32_t dev_unpack_iq2_signs(uint32_t v) {
     const uint32_t p = __popc(v) & 1u;
     const uint32_t s = v ^ (p << 7u);
@@ -2259,25 +2264,23 @@ __device__ __forceinline__ static void q2_K_dequant_pair_tile_half_rowwise(
         const uint32_t kk0 = (rem - nn * (uint32_t)(BK / KG)) * KG;
         const uint32_t row = n0 + tile * (uint32_t)BN + nn;
         half *shB = tile == 0u ? shB0 : shB1;
+        uint32_t v = 0u;
         if (row < out_dim) {
             const unsigned char *blk = base + (uint64_t)row * row_bytes + (uint64_t)(k0 >> 8u) * 84u;
             const float d = dev_f16_to_f32((uint16_t)blk[80] | ((uint16_t)blk[81] << 8));
             const float dm = dev_f16_to_f32((uint16_t)blk[82] | ((uint16_t)blk[83] << 8));
             const float s = (float)(blk[g] & 0x0fu);
             const float m = (float)(blk[g] >> 4u);
-#pragma unroll
-            for (uint32_t u = 0; u < KG; u++) {
-                const uint32_t kk = kk0 + u;
-                const float q = (float)((blk[16u + qbase + kk] >> shift) & 3u);
-                shB[nn * (uint32_t)BK + kk] = __float2half(d * s * q - dm * m);
-            }
-        } else {
-#pragma unroll
-            for (uint32_t u = 0; u < KG; u++) {
-                const uint32_t kk = kk0 + u;
-                shB[nn * (uint32_t)BK + kk] = __float2half(0.0f);
-            }
+            const uint32_t qbits = (uint32_t)blk[16u + qbase + kk0] |
+                                   ((uint32_t)blk[16u + qbase + kk0 + 1u] << 8u);
+            const uint32_t q0 = (qbits >> shift) & 3u;
+            const uint32_t q1 = (qbits >> (8u + shift)) & 3u;
+            const float ds = d * s;
+            const float dmm = dm * m;
+            v = dev_pack_half2_bits(ds * (float)q0 - dmm,
+                                    ds * (float)q1 - dmm);
         }
+        *reinterpret_cast<uint32_t *>(shB + nn * (uint32_t)BK + kk0) = v;
     }
 }
 
@@ -2308,6 +2311,8 @@ __device__ __forceinline__ static void q2_K_dequant_dual_pair_tile_half_rowwise(
         const uint32_t row = n0 + tile * (uint32_t)BN + nn;
         half *shBg = tile == 0u ? shB0g : shB1g;
         half *shBu = tile == 0u ? shB0u : shB1u;
+        uint32_t gv = 0u;
+        uint32_t uv = 0u;
         if (row < out_dim) {
             const unsigned char *gb = gate_base + (uint64_t)row * row_bytes + (uint64_t)(k0 >> 8u) * 84u;
             const unsigned char *ub = up_base + (uint64_t)row * row_bytes + (uint64_t)(k0 >> 8u) * 84u;
@@ -2319,24 +2324,26 @@ __device__ __forceinline__ static void q2_K_dequant_dual_pair_tile_half_rowwise(
             const float gmn = (float)(gb[g] >> 4u);
             const float us = (float)(ub[g] & 0x0fu);
             const float umn = (float)(ub[g] >> 4u);
-#pragma unroll
-            for (uint32_t u = 0; u < KG; u++) {
-                const uint32_t kk = kk0 + u;
-                const float gq = (float)((gb[16u + qbase + kk] >> shift) & 3u);
-                const float uq = (float)((ub[16u + qbase + kk] >> shift) & 3u);
-                const uint32_t sj = nn * (uint32_t)BK + kk;
-                shBg[sj] = __float2half(gd * gs * gq - gm * gmn);
-                shBu[sj] = __float2half(ud * us * uq - um * umn);
-            }
-        } else {
-#pragma unroll
-            for (uint32_t u = 0; u < KG; u++) {
-                const uint32_t kk = kk0 + u;
-                const uint32_t sj = nn * (uint32_t)BK + kk;
-                shBg[sj] = __float2half(0.0f);
-                shBu[sj] = __float2half(0.0f);
-            }
+            const uint32_t gqbits = (uint32_t)gb[16u + qbase + kk0] |
+                                    ((uint32_t)gb[16u + qbase + kk0 + 1u] << 8u);
+            const uint32_t uqbits = (uint32_t)ub[16u + qbase + kk0] |
+                                    ((uint32_t)ub[16u + qbase + kk0 + 1u] << 8u);
+            const uint32_t gq0 = (gqbits >> shift) & 3u;
+            const uint32_t gq1 = (gqbits >> (8u + shift)) & 3u;
+            const uint32_t uq0 = (uqbits >> shift) & 3u;
+            const uint32_t uq1 = (uqbits >> (8u + shift)) & 3u;
+            const float gds = gd * gs;
+            const float gmm = gm * gmn;
+            const float uds = ud * us;
+            const float umm = um * umn;
+            gv = dev_pack_half2_bits(gds * (float)gq0 - gmm,
+                                     gds * (float)gq1 - gmm);
+            uv = dev_pack_half2_bits(uds * (float)uq0 - umm,
+                                     uds * (float)uq1 - umm);
         }
+        const uint32_t sj = nn * (uint32_t)BK + kk0;
+        *reinterpret_cast<uint32_t *>(shBg + sj) = gv;
+        *reinterpret_cast<uint32_t *>(shBu + sj) = uv;
     }
 }
 
