@@ -116,6 +116,9 @@ cuda-regression:
 rocm rocm-upstream: ds4-rocm-upstream ds4-server-rocm-upstream ds4-bench-rocm-upstream
 	@echo "ROCm upstream-shaped binaries built with ROCM_ARCH=$(ROCM_ARCH)"
 
+ds4-mtp-oracle-bench-rocm-upstream: tools/mtp_oracle_microbench_gpuapi.o ds4_gpuapi.o ds4_cuda.o
+	$(ROCM_HIPCC) -o $@ $^ $(ROCM_LDLIBS)
+
 ds4-rocm-upstream: ds4_cli_gpuapi.o linenoise.o ds4_gpuapi.o ds4_cuda.o
 	$(ROCM_HIPCC) -o $@ $^ $(ROCM_LDLIBS)
 
@@ -199,6 +202,9 @@ ds4_server_gpuapi.o: ds4_server.c ds4.h ds4_kvstore.h rax.h
 
 ds4_bench_gpuapi.o: ds4_bench.c ds4.h
 	$(CC) $(CFLAGS) -DDS4_USE_GPU_API -DDS4_USE_HIP -c -o $@ ds4_bench.c
+
+tools/mtp_oracle_microbench_gpuapi.o: tools/mtp_oracle_microbench.c ds4.h
+	$(CC) $(CFLAGS) -DDS4_USE_GPU_API -DDS4_USE_HIP -I. -c -o $@ tools/mtp_oracle_microbench.c
 
 ds4_cuda.o: ds4_cuda.cu ds4_gpu.h ds4_iq2_tables_cuda.inc ds4_rocm.h rocm/ds4_rocm_common.cuh rocm/ds4_rocm_q8.cuh rocm/ds4_rocm_fp8_kv.cuh rocm/ds4_rocm_attention.cuh rocm/ds4_rocm_hc.cuh rocm/ds4_rocm_output.cuh rocm/ds4_rocm_moe.cuh
 	$(ROCM_HIPCC) $(ROCM_CFLAGS) -c -o $@ ds4_cuda.cu

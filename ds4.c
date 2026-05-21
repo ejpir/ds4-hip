@@ -9164,6 +9164,11 @@ static bool metal_graph_alloc_raw_cap(
         bool                    enable_mtp) {
     memset(g, 0, sizeof(*g));
     g->mtp_enabled = enable_mtp;
+    const bool enable_all_row_prefill_head =
+        getenv("DS4_METAL_PREFILL_ALL_ROW_HEAD") != NULL ||
+        getenv("DS4_HIP_PREFILL_ALL_ROW_HEAD") != NULL ||
+        getenv("DS4_CUDA_PREFILL_ALL_ROW_HEAD") != NULL;
+    const bool enable_spec_logits = enable_mtp || enable_all_row_prefill_head;
     if (raw_cap == 0) raw_cap = 1;
     if (ctx_size == 0) ctx_size = raw_cap;
     if (prefill_cap == 0) prefill_cap = 1;
@@ -9317,8 +9322,11 @@ static bool metal_graph_alloc_raw_cap(
         g->mtp_state_hc = ds4_metal_tensor_alloc(hc_dim * sizeof(float));
         g->mtp_next_hc = ds4_metal_tensor_alloc(hc_dim * sizeof(float));
         g->mtp_raw_cache = ds4_metal_tensor_alloc((uint64_t)raw_cap * DS4_N_HEAD_DIM * sizeof(float));
-        g->spec_logits = ds4_metal_tensor_alloc((uint64_t)16 * DS4_N_VOCAB * sizeof(float));
         g->mtp_n_raw = 0;
+    }
+    if (enable_spec_logits) {
+        const uint64_t spec_rows = enable_all_row_prefill_head ? pc : 16u;
+        g->spec_logits = ds4_metal_tensor_alloc(spec_rows * DS4_N_VOCAB * sizeof(float));
     }
 
     g->prefill_tokens = ds4_metal_tensor_alloc(pc * sizeof(int32_t));
@@ -9405,6 +9413,7 @@ static bool metal_graph_alloc_raw_cap(
                     g->after_ffn_hc &&
                     g->output_pre && g->output_weights && g->output_embd &&
                     g->output_norm && g->logits &&
+                    (!enable_spec_logits || g->spec_logits) &&
                     (!enable_mtp ||
                      (g->mtp_embed && g->mtp_enorm && g->mtp_eproj &&
                       g->mtp_eproj_hc && g->mtp_hnorm_hc && g->mtp_hproj_hc &&
@@ -14083,29 +14092,60 @@ static bool metal_graph_prefill_chunked_range(
     if (show_progress) fputc('\n', stderr);
     if (last_chunk_tokens == 0) return false;
 
-    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
-    ds4_metal_tensor *last_hc = metal_graph_tensor_row_view(g->batch_cur_hc,
-                                                            last_chunk_tokens - 1u,
-                                                            hc_dim);
-    if (!last_hc) return false;
+    const bool all_row_head = getenv("DS4_METAL_PREFILL_ALL_ROW_HEAD") != NULL ||
+                              getenv("DS4_HIP_PREFILL_ALL_ROW_HEAD") != NULL ||
+                              getenv("DS4_CUDA_PREFILL_ALL_ROW_HEAD") != NULL;
+    const bool all_row_topk = all_row_head &&
+                              (getenv("DS4_METAL_PREFILL_ALL_ROW_TOPK") != NULL ||
+                               getenv("DS4_HIP_PREFILL_ALL_ROW_TOPK") != NULL ||
+                               getenv("DS4_CUDA_PREFILL_ALL_ROW_TOPK") != NULL);
     ds4_metal_tensor *saved_cur = g->cur_hc;
-    g->cur_hc = last_hc;
 
     if (progress && !progress(progress_ud, "prefill_head_begin", (int)end, prompt->len)) return false;
     const double t_head0 = profile ? now_sec() : 0.0;
     bool ok = ds4_metal_begin_commands() != 0;
-    if (ok) ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
+    if (all_row_head) {
+        if (ok) ok = metal_graph_encode_output_head_batch(g, model, weights,
+                                                          last_chunk_tokens,
+                                                          weights->output->dim[1]);
+        if (ok && all_row_topk && last_chunk_tokens > 1u) {
+            ok = ds4_metal_indexer_topk_tensor(g->comp_selected,
+                                               g->spec_logits,
+                                               DS4_N_VOCAB,
+                                               1,
+                                               last_chunk_tokens - 1u) != 0;
+        }
+    } else {
+        const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+        ds4_metal_tensor *last_hc = metal_graph_tensor_row_view(g->batch_cur_hc,
+                                                                last_chunk_tokens - 1u,
+                                                                hc_dim);
+        if (!last_hc) ok = false;
+        if (ok) {
+            g->cur_hc = last_hc;
+            ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
+            g->cur_hc = saved_cur;
+        }
+        ds4_metal_tensor_free(last_hc);
+    }
     const double t_head_encoded = profile ? now_sec() : 0.0;
     if (ok) ok = ds4_metal_end_commands() != 0;
     const double t_head_done = profile ? now_sec() : 0.0;
     g->cur_hc = saved_cur;
-    ds4_metal_tensor_free(last_hc);
     if (!ok) return false;
     if (progress && !progress(progress_ud, "prefill_head_done", (int)end, prompt->len)) return false;
 
     const double t_before_read = profile ? now_sec() : 0.0;
     if (logits) {
-        ok = ds4_metal_tensor_read(g->logits, 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
+        if (all_row_head) {
+            const uint64_t row_bytes = (uint64_t)DS4_N_VOCAB * sizeof(float);
+            ok = ds4_metal_tensor_read(g->spec_logits,
+                                       (uint64_t)(last_chunk_tokens - 1u) * row_bytes,
+                                       logits,
+                                       row_bytes) != 0;
+        } else {
+            ok = ds4_metal_tensor_read(g->logits, 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
+        }
     }
     if (profile) {
         const double t_read = now_sec();
