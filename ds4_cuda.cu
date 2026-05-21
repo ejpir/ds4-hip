@@ -6559,6 +6559,117 @@ extern "C" int ds4_gpu_attention_prefill_masked_mixed_heads_tensor(
                                        q, raw_kv, comp_kv, comp_mask, 1, n_tokens,
                                        n_comp, window, ratio, n_head, head_dim);
 }
+extern "C" int ds4_gpu_attention_output_q8_batch_f16_tensor(
+        ds4_gpu_tensor       *out_h,
+        ds4_gpu_tensor       *low,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                out_a_offset,
+        uint64_t                out_b_offset,
+        uint64_t                group_dim,
+        uint64_t                rank,
+        uint32_t                n_groups,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *heads,
+        uint32_t                n_tokens) {
+    (void)low;
+    if (!out_h || !heads || !model_map || !g_cublas_ready || g_quality_mode ||
+        group_dim == 0 || rank == 0 || n_groups == 0 || out_dim == 0 || n_tokens == 0) {
+        return 0;
+    }
+    const uint64_t low_dim = (uint64_t)n_groups * rank;
+    const uint64_t blocks_a = (group_dim + 31) / 32;
+    const uint64_t blocks_b = (low_dim + 31) / 32;
+    const uint64_t out_a_bytes = (uint64_t)n_groups * rank * blocks_a * 34;
+    const uint64_t out_b_bytes = out_dim * blocks_b * 34;
+    if (out_a_offset > model_size || out_b_offset > model_size ||
+        out_a_bytes > model_size - out_a_offset ||
+        out_b_bytes > model_size - out_b_offset ||
+        heads->bytes < (uint64_t)n_tokens * n_groups * group_dim * sizeof(float) ||
+        out_h->bytes < (uint64_t)n_tokens * out_dim * sizeof(__half)) {
+        return 0;
+    }
+    const __half *out_a_f16 = cuda_q8_f16_ptr(model_map, out_a_offset, out_a_bytes,
+                                              group_dim, low_dim, "attn_output_a");
+    if (!out_a_f16) return 0;
+    const int transposed_b = getenv("DS4_CUDA_ATTENTION_OUTPUT_NO_TRANSPOSED_B_CUBLAS") == NULL &&
+                             getenv("DS4_HIP_ATTENTION_OUTPUT_NO_TRANSPOSED_B_CUBLAS") == NULL;
+    const __half *out_b_f16_t = transposed_b
+        ? cuda_q8_f16_transpose_ptr(model_map, out_b_offset, out_b_bytes,
+                                    low_dim, out_dim, "attn_output_b")
+        : NULL;
+    const __half *out_b_f16 = out_b_f16_t
+        ? NULL
+        : cuda_q8_f16_ptr(model_map, out_b_offset, out_b_bytes,
+                          low_dim, out_dim, "attn_output_b");
+    if (!out_b_f16 && !out_b_f16_t) return 0;
+
+    const uint64_t heads_h_count = (uint64_t)n_groups * n_tokens * group_dim;
+    const uint64_t low_h_count = (uint64_t)n_groups * n_tokens * rank;
+    const uint64_t heads_h_bytes = heads_h_count * sizeof(__half);
+    const uint64_t low_h_offset = (heads_h_bytes + 255u) & ~255ull;
+    const uint64_t tmp_bytes = low_h_offset + low_h_count * sizeof(__half);
+    void *tmp = cuda_tmp_alloc(tmp_bytes, "attention output f16 out cublas");
+    if (!tmp) return 0;
+    __half *heads_h = (__half *)tmp;
+    __half *low_h = (__half *)((char *)tmp + low_h_offset);
+    attention_pack_group_heads_f16_kernel<<<(heads_h_count + 255u) / 256u, 256>>>(
+            heads_h,
+            (const float *)heads->ptr,
+            n_tokens,
+            n_groups,
+            group_dim);
+    if (!cuda_ok(cudaGetLastError(), "attention_output_f16 heads pack launch")) return 0;
+    const float alpha = 1.0f;
+    const float beta0 = 0.0f;
+    cublasStatus_t st = cublasGemmStridedBatchedEx(g_cublas,
+                                                   CUBLAS_OP_T,
+                                                   CUBLAS_OP_N,
+                                                   (int)rank,
+                                                   (int)n_tokens,
+                                                   (int)group_dim,
+                                                   &alpha,
+                                                   out_a_f16,
+                                                   CUDA_R_16F,
+                                                   (int)group_dim,
+                                                   (long long)rank * group_dim,
+                                                   heads_h,
+                                                   CUDA_R_16F,
+                                                   (int)group_dim,
+                                                   (long long)n_tokens * group_dim,
+                                                   &beta0,
+                                                   low_h,
+                                                   CUDA_R_16F,
+                                                   (int)low_dim,
+                                                   (long long)rank,
+                                                   (int)n_groups,
+                                                   CUBLAS_COMPUTE_32F,
+                                                   CUBLAS_GEMM_DEFAULT);
+    if (st != CUBLAS_STATUS_SUCCESS) return 0;
+    const __half *b_ptr = out_b_f16_t ? out_b_f16_t : out_b_f16;
+    const auto b_op = out_b_f16_t ? CUBLAS_OP_N : CUBLAS_OP_T;
+    const int b_lda = out_b_f16_t ? (int)out_dim : (int)low_dim;
+    st = cublasGemmEx(g_cublas,
+                      b_op,
+                      CUBLAS_OP_N,
+                      (int)out_dim,
+                      (int)n_tokens,
+                      (int)low_dim,
+                      &alpha,
+                      b_ptr,
+                      CUDA_R_16F,
+                      b_lda,
+                      low_h,
+                      CUDA_R_16F,
+                      (int)low_dim,
+                      &beta0,
+                      out_h->ptr,
+                      CUDA_R_16F,
+                      (int)out_dim,
+                      CUBLAS_COMPUTE_32F,
+                      CUBLAS_GEMM_DEFAULT);
+    return st == CUBLAS_STATUS_SUCCESS;
+}
 extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *low,
@@ -9392,6 +9503,22 @@ extern "C" int ds4_gpu_hc_expand_split_tensor(ds4_gpu_tensor *out_hc, const ds4_
                                                     n_embd, n_hc, n_tokens,
                                                     mix_hc, mix_hc, 0);
     return cuda_ok(cudaGetLastError(), "hc_expand_split launch");
+}
+extern "C" int ds4_gpu_hc_expand_split_half_tensor(ds4_gpu_tensor *out_hc, const ds4_gpu_tensor *block_out_h, const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *split, uint32_t n_embd, uint32_t n_hc) {
+    if (!out_hc || !block_out_h || !residual_hc || !split || n_embd == 0 || n_hc == 0) return 0;
+    uint32_t n_tokens = (uint32_t)(out_hc->bytes / ((uint64_t)n_hc * n_embd * sizeof(float)));
+    if (block_out_h->bytes < (uint64_t)n_tokens * n_embd * sizeof(__half)) return 0;
+    uint32_t mix_hc = 2u * n_hc + n_hc * n_hc;
+    uint64_t n_elem = (uint64_t)n_tokens * n_hc * n_embd;
+    const float *base = (const float *)split->ptr;
+    hc_expand_half_kernel<<<(n_elem + 255) / 256, 256>>>((float *)out_hc->ptr,
+                                                         (const __half *)block_out_h->ptr,
+                                                         (const float *)residual_hc->ptr,
+                                                         base + n_hc,
+                                                         base + 2u * n_hc,
+                                                         n_embd, n_hc, n_tokens,
+                                                         mix_hc, mix_hc);
+    return cuda_ok(cudaGetLastError(), "hc_expand_split_half launch");
 }
 extern "C" int ds4_gpu_hc_expand_add_split_tensor(ds4_gpu_tensor *out_hc, const ds4_gpu_tensor *block_out, const ds4_gpu_tensor *block_add, const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *split, uint32_t n_embd, uint32_t n_hc) {
     if (!out_hc || !block_out || !block_add || !residual_hc || !split || n_embd == 0 || n_hc == 0) return 0;

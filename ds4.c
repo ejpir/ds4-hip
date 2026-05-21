@@ -12965,20 +12965,41 @@ static bool metal_graph_encode_layer_attention_batch(
                                       (uint64_t)n_tokens * q_dim, il, pos0);
     }
     DS4_METAL_PROFILE_ATTN_STAGE("inv_rope");
-    if (ok) ok = ds4_metal_attention_output_q8_batch_tensor(g->batch_attn_out,
-                                                            g->batch_attn_low,
-                                                            g->batch_group_tmp,
-                                                            g->batch_low_tmp,
-                                                            model->map,
-                                                            model->size,
-                                                            layer->attn_output_a->abs_offset,
-                                                            layer->attn_output_b->abs_offset,
-                                                            group_dim,
-                                                            rank,
-                                                            n_groups,
-                                                            DS4_N_EMBD,
-                                                            g->batch_heads,
-                                                            n_tokens) != 0;
+#if defined(DS4_USE_GPU_API)
+    const bool attn_out_f16 = (getenv("DS4_CUDA_ATTENTION_OUTPUT_F16_OUT") != NULL ||
+                               getenv("DS4_HIP_ATTENTION_OUTPUT_F16_OUT") != NULL) &&
+                              getenv("DS4_METAL_GRAPH_DUMP_PREFIX") == NULL;
+    if (attn_out_f16) {
+        if (ok) ok = ds4_metal_attention_output_q8_batch_f16_tensor(g->batch_q_half,
+                                                                    g->batch_attn_low,
+                                                                    model->map,
+                                                                    model->size,
+                                                                    layer->attn_output_a->abs_offset,
+                                                                    layer->attn_output_b->abs_offset,
+                                                                    group_dim,
+                                                                    rank,
+                                                                    n_groups,
+                                                                    DS4_N_EMBD,
+                                                                    g->batch_heads,
+                                                                    n_tokens) != 0;
+    } else
+#endif
+    {
+        if (ok) ok = ds4_metal_attention_output_q8_batch_tensor(g->batch_attn_out,
+                                                                g->batch_attn_low,
+                                                                g->batch_group_tmp,
+                                                                g->batch_low_tmp,
+                                                                model->map,
+                                                                model->size,
+                                                                layer->attn_output_a->abs_offset,
+                                                                layer->attn_output_b->abs_offset,
+                                                                group_dim,
+                                                                rank,
+                                                                n_groups,
+                                                                DS4_N_EMBD,
+                                                                g->batch_heads,
+                                                                n_tokens) != 0;
+    }
     if (ok) {
         metal_graph_debug_dump_tensor("attn_low", g->batch_attn_low,
                                       (uint64_t)n_tokens * n_groups * rank,
@@ -12990,12 +13011,24 @@ static bool metal_graph_encode_layer_attention_batch(
                                       (uint64_t)n_tokens * DS4_N_EMBD, il, pos0);
     }
     DS4_METAL_PROFILE_ATTN_STAGE("output_proj");
-    if (ok) ok = ds4_metal_hc_expand_split_tensor(after_attn_hc_view,
-                                                  g->batch_attn_out,
-                                                  g->batch_cur_hc,
-                                                  hc_split_view,
-                                                  DS4_N_EMBD,
-                                                  DS4_N_HC) != 0;
+#if defined(DS4_USE_GPU_API)
+    if (attn_out_f16) {
+        if (ok) ok = ds4_metal_hc_expand_split_half_tensor(after_attn_hc_view,
+                                                           g->batch_q_half,
+                                                           g->batch_cur_hc,
+                                                           hc_split_view,
+                                                           DS4_N_EMBD,
+                                                           DS4_N_HC) != 0;
+    } else
+#endif
+    {
+        if (ok) ok = ds4_metal_hc_expand_split_tensor(after_attn_hc_view,
+                                                      g->batch_attn_out,
+                                                      g->batch_cur_hc,
+                                                      hc_split_view,
+                                                      DS4_N_EMBD,
+                                                      DS4_N_HC) != 0;
+    }
     if (ok) {
         metal_graph_debug_dump_tensor("hc_attn_post", g->batch_after_attn_hc,
                                       (uint64_t)n_tokens * hc_dim, il, pos0);

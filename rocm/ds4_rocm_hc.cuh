@@ -103,6 +103,35 @@ __global__ static void hc_expand_kernel(
     out_hc[(uint64_t)t * n_hc * n_embd + (uint64_t)dst_hc * n_embd + d] = acc;
 }
 
+__global__ static void hc_expand_half_kernel(
+        float *out_hc,
+        const __half *block_out,
+        const float *residual_hc,
+        const float *post,
+        const float *comb,
+        uint32_t n_embd,
+        uint32_t n_hc,
+        uint32_t n_tokens,
+        uint32_t post_stride,
+        uint32_t comb_stride) {
+    uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t n_elem = (uint64_t)n_tokens * n_hc * n_embd;
+    if (gid >= n_elem) return;
+    uint32_t d = gid % n_embd;
+    uint64_t tmp = gid / n_embd;
+    uint32_t dst_hc = tmp % n_hc;
+    uint32_t t = tmp / n_hc;
+
+    const float block_v = __half2float(block_out[(uint64_t)t * n_embd + d]);
+    float acc = block_v * post[(uint64_t)t * post_stride + dst_hc];
+    for (uint32_t src_hc = 0; src_hc < n_hc; src_hc++) {
+        float comb_v = comb[(uint64_t)t * comb_stride + dst_hc + (uint64_t)src_hc * n_hc];
+        float res_v = residual_hc[(uint64_t)t * n_hc * n_embd + (uint64_t)src_hc * n_embd + d];
+        acc += comb_v * res_v;
+    }
+    out_hc[(uint64_t)t * n_hc * n_embd + (uint64_t)dst_hc * n_embd + d] = acc;
+}
+
 __global__ static void hc_split_weighted_sum_fused_kernel(
         float *out,
         float *split,

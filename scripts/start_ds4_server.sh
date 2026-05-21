@@ -38,11 +38,12 @@ Environment:
   DS4_SERVER_ATTN_Q_B_CUBLAS=1 Use f16 GEMM/cache for the large q_b projection in upstream-shaped ROCm
   DS4_SERVER_ATTN_Q_B_PRELOAD=1 Preload q_b Q8_0 weights into the f16 cache
   DS4_SERVER_ATTN_Q_B_F16_OUT=1 Write q_b GEMM to f16 and fuse head norm/rope to float; FAST_FULL default 1
+  DS4_SERVER_ATTENTION_OUTPUT_F16_OUT=1 Write attention output projection to f16 and fuse HC expand; FAST_FULL default 1
   DS4_SERVER_Q8_BATCH_FAST=0|1   Batched Q8_0 prefill matmul is default-on in HIP; set 0 to disable
   DS4_SERVER_Q8_BATCH_TILE=32    Token tile for Q8 batch fast; passed through when set
   DS4_SERVER_Q8_BATCH_RPB=N      Rows/block for Q8 batch fast; default 32
   DS4_SERVER_Q8_BATCH_SHARED_X=0|1  LDS shared-X batched Q8 prefill is default-on; set 0 to disable
-  DS4_SERVER_Q8_BATCH_SHARED_X_BLOCKS=16  K-block chunk for Q8 shared-X batch, 8|16|32
+  DS4_SERVER_Q8_BATCH_SHARED_X_BLOCKS=32  K-block chunk for Q8 shared-X batch, 8|16|32
   DS4_SERVER_Q8_GROUPED_BATCH_TILE=32 Token tile for grouped attn_output_a Q8 batch, 2|4|8|16|32
   DS4_SERVER_Q8_REPACK=1         Opt-in eager q_b Q8_0 repack for decode; uses ~1.43 GiB VRAM
   DS4_SERVER_Q8_REPACK_SPLIT16=1 Opt-in split-major Q8_0 repack for attn_output/shared-down; uses ~3.2 GiB VRAM
@@ -119,11 +120,12 @@ if [[ "${DS4_SERVER_FAST_FULL:-0}" == "1" ]]; then
   export DS4_SERVER_ATTN_Q_B_CUBLAS="${DS4_SERVER_ATTN_Q_B_CUBLAS:-1}"
   export DS4_SERVER_ATTN_Q_B_PRELOAD="${DS4_SERVER_ATTN_Q_B_PRELOAD:-1}"
   export DS4_SERVER_ATTN_Q_B_F16_OUT="${DS4_SERVER_ATTN_Q_B_F16_OUT:-1}"
+  export DS4_SERVER_ATTENTION_OUTPUT_F16_OUT="${DS4_SERVER_ATTENTION_OUTPUT_F16_OUT:-1}"
   export DS4_SERVER_Q8_BATCH_FAST="${DS4_SERVER_Q8_BATCH_FAST:-1}"
   export DS4_SERVER_Q8_BATCH_SHARED_X="${DS4_SERVER_Q8_BATCH_SHARED_X:-1}"
   export DS4_SERVER_Q8_BATCH_TILE="${DS4_SERVER_Q8_BATCH_TILE:-32}"
   export DS4_SERVER_Q8_BATCH_RPB="${DS4_SERVER_Q8_BATCH_RPB:-32}"
-  export DS4_SERVER_Q8_BATCH_SHARED_X_BLOCKS="${DS4_SERVER_Q8_BATCH_SHARED_X_BLOCKS:-16}"
+  export DS4_SERVER_Q8_BATCH_SHARED_X_BLOCKS="${DS4_SERVER_Q8_BATCH_SHARED_X_BLOCKS:-32}"
   export DS4_SERVER_Q8_GROUPED_BATCH_TILE="${DS4_SERVER_Q8_GROUPED_BATCH_TILE:-32}"
   export DS4_SERVER_MOE_EXPERT_BATCH="${DS4_SERVER_MOE_EXPERT_BATCH:-1}"
   export DS4_SERVER_MOE_GATE_TILE="${DS4_SERVER_MOE_GATE_TILE:-4}"
@@ -248,6 +250,10 @@ fi
 if [[ "${DS4_SERVER_ATTN_Q_B_F16_OUT:-0}" == "1" ]]; then
   export DS4_CUDA_ATTN_Q_B_F16_OUT=1
   export DS4_HIP_ATTN_Q_B_F16_OUT=1
+fi
+if [[ "${DS4_SERVER_ATTENTION_OUTPUT_F16_OUT:-0}" == "1" ]]; then
+  export DS4_CUDA_ATTENTION_OUTPUT_F16_OUT=1
+  export DS4_HIP_ATTENTION_OUTPUT_F16_OUT=1
 fi
 if [[ "${DS4_SERVER_Q8_BATCH_FAST:-0}" == "1" ]]; then
   export DS4_HIP_Q8_BATCH_FAST=1
