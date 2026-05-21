@@ -82,7 +82,7 @@ Environment:
   DS4_SESSION_PROGRESS_CHUNK_TOKENS=512    Cap cancellable prefill chunks; 0 disables cap
 
 Safety/perf toggles:
-  DS4_SERVER_PERFLEVEL=high|auto  Optional rocm-smi --setperflevel
+  DS4_SERVER_PERFLEVEL=high|auto  Optional rocm-smi --setperflevel; set empty/off/skip to bypass
   DS4_SERVER_DEVICE_TENSORS=1     Use faster hipMalloc device tensors
   DS4_SERVER_TOP_ONLY=1           Greedy top-only decode
   DS4_SERVER_CACHE_FINAL_Q8=1     Cache final Q8 projection
@@ -112,7 +112,7 @@ TRACE="${DS4_SERVER_TRACE:-}"
 # One-command max-performance profile.  Individual env vars may still be set
 # by the caller before this script to override these defaults.
 if [[ "${DS4_SERVER_FAST_FULL:-0}" == "1" ]]; then
-  export DS4_SERVER_PERFLEVEL="${DS4_SERVER_PERFLEVEL:-high}"
+  export DS4_SERVER_PERFLEVEL="${DS4_SERVER_PERFLEVEL-high}"
   export DS4_SERVER_PREFILL_CHUNK="${DS4_SERVER_PREFILL_CHUNK:-2048}"
   export DS4_SERVER_DEVICE_TENSORS="${DS4_SERVER_DEVICE_TENSORS:-1}"
   export DS4_SERVER_COPY_MODEL="${DS4_SERVER_COPY_MODEL:-1}"
@@ -198,6 +198,9 @@ fi
 # Examples:
 #   DS4_SERVER_PERFLEVEL=high scripts/start_ds4_server.sh
 #   DS4_SERVER_PERFLEVEL=auto scripts/start_ds4_server.sh
+if [[ "${DS4_SERVER_PERFLEVEL:-}" == "off" || "${DS4_SERVER_PERFLEVEL:-}" == "skip" || "${DS4_SERVER_PERFLEVEL:-}" == "none" ]]; then
+  DS4_SERVER_PERFLEVEL=""
+fi
 if [[ -n "${DS4_SERVER_PERFLEVEL:-}" ]]; then
   if command -v rocm-smi >/dev/null 2>&1; then
     echo "ds4-server: setting ROCm perflevel ${DS4_SERVER_PERFLEVEL}"

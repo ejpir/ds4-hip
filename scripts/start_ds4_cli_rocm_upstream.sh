@@ -44,7 +44,7 @@ Useful environment overrides:
   DS4_SERVER_SHARED_DOWN_F16_OUT=1       Opt in for large prefill only; default min tokens 128
   DS4_SERVER_SHARED_DOWN_F16_OUT_MIN_TOKENS=N       Override shared-down f16-output minimum
   DS4_SERVER_FAST_FULL=0       Disable the preset and use your explicit env
-  DS4_SERVER_PERFLEVEL=auto    Or empty to skip rocm-smi perflevel changes
+  DS4_SERVER_PERFLEVEL=auto    Or empty/off/skip to bypass rocm-smi perflevel changes
 EOF
 }
 
@@ -84,7 +84,7 @@ arg_present() {
 
 # This script is intentionally fast by default.
 export DS4_SERVER_FAST_FULL="${DS4_SERVER_FAST_FULL:-1}"
-export DS4_SERVER_PERFLEVEL="${DS4_SERVER_PERFLEVEL:-high}"
+export DS4_SERVER_PERFLEVEL="${DS4_SERVER_PERFLEVEL-high}"
 
 if [[ "${DS4_SERVER_FAST_FULL:-0}" == "1" ]]; then
   export DS4_SERVER_PREFILL_CHUNK="${DS4_SERVER_PREFILL_CHUNK:-2048}"
@@ -221,6 +221,9 @@ if [[ -f /tmp/ds4.lock ]]; then
   fi
 fi
 
+if [[ "${DS4_SERVER_PERFLEVEL:-}" == "off" || "${DS4_SERVER_PERFLEVEL:-}" == "skip" || "${DS4_SERVER_PERFLEVEL:-}" == "none" ]]; then
+  DS4_SERVER_PERFLEVEL=""
+fi
 if [[ -n "${DS4_SERVER_PERFLEVEL:-}" ]] && command -v rocm-smi >/dev/null 2>&1; then
   echo "ds4-cli-rocm-upstream: setting ROCm perflevel ${DS4_SERVER_PERFLEVEL}" >&2
   rocm-smi --setperflevel "${DS4_SERVER_PERFLEVEL}" >&2 || true

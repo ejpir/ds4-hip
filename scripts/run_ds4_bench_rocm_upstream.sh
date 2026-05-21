@@ -20,7 +20,7 @@ If no ds4-bench args are supplied, defaults are:
 Environment:
   DS4_MODEL=FILE                         GGUF model path
   DS4_SERVER_FAST_FULL=1                 Apply the same fast-full preset shape as the server launcher
-  DS4_SERVER_PERFLEVEL=high|auto         rocm-smi perflevel; defaults to high
+  DS4_SERVER_PERFLEVEL=high|auto         rocm-smi perflevel; defaults to high; set empty/off/skip to bypass
   DS4_BENCH_ALLOW_WITH_SERVER=1          Allow running while ds4-server pidfile process is alive
   DS4_BENCH_PROMPT_FILE=FILE             Default prompt file
   DS4_BENCH_CTX_START=N                  Default ctx-start; default 2048
@@ -81,7 +81,7 @@ export_pair_value() {
 
 # One-command max-performance profile. Keep this intentionally aligned with
 # scripts/start_ds4_server.sh, but export CUDA aliases too for ds4_cuda.cu.
-export DS4_SERVER_PERFLEVEL="${DS4_SERVER_PERFLEVEL:-high}"
+export DS4_SERVER_PERFLEVEL="${DS4_SERVER_PERFLEVEL-high}"
 
 if [[ "${DS4_SERVER_FAST_FULL:-0}" == "1" ]]; then
   export DS4_SERVER_PREFILL_CHUNK="${DS4_SERVER_PREFILL_CHUNK:-2048}"
@@ -205,6 +205,9 @@ export_pair_flag COPY_MODEL "${DS4_SERVER_COPY_MODEL:-0}"
 export_pair_value COPY_MODEL_CHUNK_MB "${DS4_SERVER_COPY_MODEL_CHUNK_MB:-}"
 export_pair_flag CACHE_FINAL_Q8 "${DS4_SERVER_CACHE_FINAL_Q8:-0}"
 
+if [[ "${DS4_SERVER_PERFLEVEL:-}" == "off" || "${DS4_SERVER_PERFLEVEL:-}" == "skip" || "${DS4_SERVER_PERFLEVEL:-}" == "none" ]]; then
+  DS4_SERVER_PERFLEVEL=""
+fi
 if [[ -n "${DS4_SERVER_PERFLEVEL:-}" ]] && command -v rocm-smi >/dev/null 2>&1; then
   echo "ds4-bench-rocm-upstream: setting ROCm perflevel ${DS4_SERVER_PERFLEVEL}" >&2
   rocm-smi --setperflevel "${DS4_SERVER_PERFLEVEL}" >&2 || true
