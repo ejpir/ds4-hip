@@ -11313,7 +11313,11 @@ static bool metal_graph_encode_token_raw_swa(
      * point where the prefix is large enough to hide useful work without
      * starving the second command buffer.
      */
+#ifdef DS4_USE_GPU_API
+    uint32_t split_after_layers = 0;
+#else
     uint32_t split_after_layers = 4;
+#endif
     const char *split_env = getenv("DS4_METAL_GRAPH_TOKEN_SPLIT_LAYERS");
     if (split_env && split_env[0]) {
         char *end = NULL;
@@ -11480,10 +11484,18 @@ static bool metal_graph_upload_token_embedding_hc(
         int                 token,
         uint32_t            n_hc) {
 #ifdef DS4_USE_GPU_API
-    /* The upstream-shaped CUDA/ROCm embedding entry point is still F16-layout
-     * only.  CyberNeurova stores token_embd.weight as Q8_0, so decode must use
-     * the same CPU dequant/upload fallback as short-prefill until the generic
-     * GPU API carries embedding tensor type/layout information. */
+    if (weights->token_embd->type == DS4_TENSOR_Q8_0 &&
+        getenv("DS4_CUDA_NO_Q8_TOKEN_EMBED") == NULL &&
+        getenv("DS4_HIP_NO_Q8_TOKEN_EMBED") == NULL) {
+        return ds4_metal_embed_token_hc_q8_0_tensor(out_hc,
+                                                    model->map,
+                                                    model->size,
+                                                    weights->token_embd->abs_offset,
+                                                    (uint32_t)weights->token_embd->dim[1],
+                                                    (uint32_t)token,
+                                                    DS4_N_EMBD,
+                                                    n_hc) != 0;
+    }
     if (weights->token_embd->type != DS4_TENSOR_F16) {
         float *plain = xmalloc((size_t)DS4_N_EMBD * sizeof(plain[0]));
         float *hc = xmalloc((size_t)n_hc * DS4_N_EMBD * sizeof(hc[0]));
@@ -11528,10 +11540,19 @@ static bool metal_graph_upload_prompt_embeddings_hc(
 
     if (tokens && n_tokens >= gpu_min) {
 #ifdef DS4_USE_GPU_API
-        /* The upstream-shaped CUDA/ROCm embedding kernel is F16-layout only.
-         * CyberNeurova stores token_embd.weight as Q8_0, so keep the existing
-         * CPU upload path for that dialect until the generic GPU API carries
-         * embedding tensor type/layout information. */
+        if (weights->token_embd->type == DS4_TENSOR_Q8_0 &&
+            getenv("DS4_CUDA_NO_Q8_TOKEN_EMBED") == NULL &&
+            getenv("DS4_HIP_NO_Q8_TOKEN_EMBED") == NULL) {
+            return ds4_metal_embed_tokens_hc_q8_0_tensor(out_hc,
+                                                         tokens,
+                                                         model->map,
+                                                         model->size,
+                                                         weights->token_embd->abs_offset,
+                                                         (uint32_t)weights->token_embd->dim[1],
+                                                         n_tokens,
+                                                         DS4_N_EMBD,
+                                                         DS4_N_HC) != 0;
+        }
         if (weights->token_embd->type == DS4_TENSOR_F16)
 #endif
         return ds4_metal_embed_tokens_hc_tensor(out_hc,
