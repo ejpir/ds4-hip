@@ -38,8 +38,8 @@ Environment:
   DS4_SERVER_ATTN_Q_B_CUBLAS=1 Use f16 GEMM/cache for the large q_b projection in upstream-shaped ROCm
   DS4_SERVER_ATTN_Q_B_PRELOAD=1 Preload q_b Q8_0 weights into the f16 cache
   DS4_SERVER_ATTN_Q_B_F16_OUT=1 Write q_b GEMM to f16 and fuse head norm/rope to float; FAST_FULL default 1
-  DS4_SERVER_ATTENTION_OUTPUT_F16_OUT=1 Write attention output projection to f16 and fuse HC expand; FAST_FULL default 1
-  DS4_SERVER_SHARED_DOWN_F16_OUT=1 Write shared-down projection to f16 and fuse HC expand-add; FAST_FULL default 1
+  DS4_SERVER_ATTENTION_OUTPUT_F16_OUT=1 Unsafe opt-in: attention output f16 projection; fastest Promessi prefill, can degrade chat output
+  DS4_SERVER_SHARED_DOWN_F16_OUT=1 Unsafe opt-in: shared-down f16 projection; fastest Promessi prefill, can degrade chat output
   DS4_SERVER_Q8_BATCH_FAST=0|1   Batched Q8_0 prefill matmul is default-on in HIP; set 0 to disable
   DS4_SERVER_Q8_BATCH_TILE=32    Token tile for Q8 batch fast; passed through when set
   DS4_SERVER_Q8_BATCH_RPB=N      Rows/block for Q8 batch fast; default 32
@@ -121,8 +121,10 @@ if [[ "${DS4_SERVER_FAST_FULL:-0}" == "1" ]]; then
   export DS4_SERVER_ATTN_Q_B_CUBLAS="${DS4_SERVER_ATTN_Q_B_CUBLAS:-1}"
   export DS4_SERVER_ATTN_Q_B_PRELOAD="${DS4_SERVER_ATTN_Q_B_PRELOAD:-1}"
   export DS4_SERVER_ATTN_Q_B_F16_OUT="${DS4_SERVER_ATTN_Q_B_F16_OUT:-1}"
-  export DS4_SERVER_ATTENTION_OUTPUT_F16_OUT="${DS4_SERVER_ATTENTION_OUTPUT_F16_OUT:-1}"
-  export DS4_SERVER_SHARED_DOWN_F16_OUT="${DS4_SERVER_SHARED_DOWN_F16_OUT:-1}"
+  # Keep f16-output projection shortcuts opt-in for serving/chat quality. They
+  # improve long Promessi prefill benchmarks but can move first-token decisions.
+  export DS4_SERVER_ATTENTION_OUTPUT_F16_OUT="${DS4_SERVER_ATTENTION_OUTPUT_F16_OUT:-0}"
+  export DS4_SERVER_SHARED_DOWN_F16_OUT="${DS4_SERVER_SHARED_DOWN_F16_OUT:-0}"
   export DS4_SERVER_Q8_BATCH_FAST="${DS4_SERVER_Q8_BATCH_FAST:-1}"
   export DS4_SERVER_Q8_BATCH_SHARED_X="${DS4_SERVER_Q8_BATCH_SHARED_X:-1}"
   export DS4_SERVER_Q8_BATCH_TILE="${DS4_SERVER_Q8_BATCH_TILE:-32}"

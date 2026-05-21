@@ -39,6 +39,8 @@ Useful environment overrides:
   DS4_CLI_TOKENS=N
   DS4_CLI_STOP_SERVER=1
   DS4_CLI_ALLOW_WITH_SERVER=1
+  DS4_SERVER_ATTENTION_OUTPUT_F16_OUT=1  Unsafe opt-in: fastest Promessi prefill, but can degrade chat output
+  DS4_SERVER_SHARED_DOWN_F16_OUT=1       Unsafe opt-in: fastest Promessi prefill, but can degrade chat output
   DS4_SERVER_FAST_FULL=0       Disable the preset and use your explicit env
   DS4_SERVER_PERFLEVEL=auto    Or empty to skip rocm-smi perflevel changes
 EOF
@@ -122,8 +124,11 @@ if [[ "${DS4_SERVER_FAST_FULL:-0}" == "1" ]]; then
   export DS4_SERVER_ATTN_Q_B_CUBLAS="${DS4_SERVER_ATTN_Q_B_CUBLAS:-1}"
   export DS4_SERVER_ATTN_Q_B_PRELOAD="${DS4_SERVER_ATTN_Q_B_PRELOAD:-1}"
   export DS4_SERVER_ATTN_Q_B_F16_OUT="${DS4_SERVER_ATTN_Q_B_F16_OUT:-1}"
-  export DS4_SERVER_ATTENTION_OUTPUT_F16_OUT="${DS4_SERVER_ATTENTION_OUTPUT_F16_OUT:-1}"
-  export DS4_SERVER_SHARED_DOWN_F16_OUT="${DS4_SERVER_SHARED_DOWN_F16_OUT:-1}"
+  # Keep the f16-output projection shortcuts opt-in for interactive chat: they
+  # are fast on long Promessi prefill benchmarks but can move first-token
+  # decisions enough to produce bad/garbled interactive replies.
+  export DS4_SERVER_ATTENTION_OUTPUT_F16_OUT="${DS4_SERVER_ATTENTION_OUTPUT_F16_OUT:-0}"
+  export DS4_SERVER_SHARED_DOWN_F16_OUT="${DS4_SERVER_SHARED_DOWN_F16_OUT:-0}"
   export DS4_CUDA_ATTENTION_OUTPUT_CUBLAS_ALL="${DS4_CUDA_ATTENTION_OUTPUT_CUBLAS_ALL:-1}"
   export DS4_CUDA_ATTENTION_OUTPUT_PACKED_B_CUBLAS="${DS4_CUDA_ATTENTION_OUTPUT_PACKED_B_CUBLAS:-1}"
   export DS4_CUDA_ATTENTION_OUTPUT_INTERLEAVED_B_CUBLAS="${DS4_CUDA_ATTENTION_OUTPUT_INTERLEAVED_B_CUBLAS:-1}"
