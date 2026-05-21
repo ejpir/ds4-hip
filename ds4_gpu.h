@@ -141,6 +141,16 @@ int ds4_gpu_matmul_q8_0_tensor(
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
 
+int ds4_gpu_matmul_q8_0_f16_out_tensor(
+        ds4_gpu_tensor       *out_h,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                n_tok);
+
 int ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
         ds4_gpu_tensor       *gate,
         ds4_gpu_tensor       *up,
@@ -849,6 +859,15 @@ int ds4_gpu_hc_expand_add_split_tensor(
         ds4_gpu_tensor       *out_hc,
         const ds4_gpu_tensor *block_out,
         const ds4_gpu_tensor *block_add,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split,
+        uint32_t                n_embd,
+        uint32_t                n_hc);
+
+int ds4_gpu_hc_expand_add_split_half_add_tensor(
+        ds4_gpu_tensor       *out_hc,
+        const ds4_gpu_tensor *block_out,
+        const ds4_gpu_tensor *block_add_h,
         const ds4_gpu_tensor *residual_hc,
         const ds4_gpu_tensor *split,
         uint32_t                n_embd,

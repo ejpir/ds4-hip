@@ -13277,21 +13277,38 @@ static bool metal_graph_encode_layer_ffn_batch(
         metal_graph_debug_dump_tensor("ffn_shexp_mid", g->batch_shared_mid,
                                       (uint64_t)n_tokens * shared_dim, il, pos0);
     }
-    if (ok) ok = ds4_metal_matmul_q8_0_tensor(g->batch_shared_out,
-                                              model->map,
-                                              model->size,
-                                              layer->ffn_down_shexp->abs_offset,
-                                              shared_dim,
-                                              DS4_N_EMBD,
-                                              g->batch_shared_mid,
-                                              n_tokens) != 0;
+    const bool keep_ffn_out = metal_graph_needs_ffn_out(g, il, pos0);
+    bool shared_down_f16 = false;
+#if defined(DS4_USE_GPU_API)
+    const bool shared_down_f16_enabled = (getenv("DS4_CUDA_SHARED_DOWN_F16_OUT") != NULL ||
+                                          getenv("DS4_HIP_SHARED_DOWN_F16_OUT") != NULL) &&
+                                         getenv("DS4_METAL_GRAPH_DUMP_PREFIX") == NULL &&
+                                         !keep_ffn_out;
+    if (ok && shared_down_f16_enabled) {
+        shared_down_f16 = ds4_metal_matmul_q8_0_f16_out_tensor(g->batch_q_half,
+                                                               model->map,
+                                                               model->size,
+                                                               layer->ffn_down_shexp->abs_offset,
+                                                               shared_dim,
+                                                               DS4_N_EMBD,
+                                                               g->batch_shared_mid,
+                                                               n_tokens) != 0;
+    }
+#endif
+    if (ok && !shared_down_f16) ok = ds4_metal_matmul_q8_0_tensor(g->batch_shared_out,
+                                                                  model->map,
+                                                                  model->size,
+                                                                  layer->ffn_down_shexp->abs_offset,
+                                                                  shared_dim,
+                                                                  DS4_N_EMBD,
+                                                                  g->batch_shared_mid,
+                                                                  n_tokens) != 0;
     DS4_METAL_PROFILE_FFN_STAGE("shared_down");
-    if (ok) {
+    if (ok && !shared_down_f16) {
         metal_graph_debug_dump_tensor("ffn_shexp", g->batch_shared_out,
                                       (uint64_t)n_tokens * DS4_N_EMBD, il, pos0);
     }
 
-    const bool keep_ffn_out = metal_graph_needs_ffn_out(g, il, pos0);
     if (ok && keep_ffn_out) {
         ok = metal_graph_ensure_batch_ffn_out(g) &&
              ds4_metal_add_tensor(g->batch_ffn_out,
@@ -13303,13 +13320,26 @@ static bool metal_graph_encode_layer_ffn_batch(
         metal_graph_debug_dump_tensor("ffn_out", g->batch_ffn_out,
                                       (uint64_t)n_tokens * DS4_N_EMBD, il, pos0);
     }
-    if (ok) ok = ds4_metal_hc_expand_add_split_tensor(next_hc_view,
-                                                       g->batch_routed_out,
-                                                       g->batch_shared_out,
-                                                       g->batch_after_attn_hc,
-                                                       hc_split_view,
-                                                       DS4_N_EMBD,
-                                                       DS4_N_HC) != 0;
+#if defined(DS4_USE_GPU_API)
+    if (shared_down_f16) {
+        if (ok) ok = ds4_metal_hc_expand_add_split_half_add_tensor(next_hc_view,
+                                                                   g->batch_routed_out,
+                                                                   g->batch_q_half,
+                                                                   g->batch_after_attn_hc,
+                                                                   hc_split_view,
+                                                                   DS4_N_EMBD,
+                                                                   DS4_N_HC) != 0;
+    } else
+#endif
+    {
+        if (ok) ok = ds4_metal_hc_expand_add_split_tensor(next_hc_view,
+                                                          g->batch_routed_out,
+                                                          g->batch_shared_out,
+                                                          g->batch_after_attn_hc,
+                                                          hc_split_view,
+                                                          DS4_N_EMBD,
+                                                          DS4_N_HC) != 0;
+    }
     if (ok) {
         metal_graph_debug_dump_tensor("hc_ffn_post", g->batch_next_hc,
                                       (uint64_t)n_tokens * hc_dim, il, pos0);
