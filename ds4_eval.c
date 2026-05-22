@@ -1209,6 +1209,7 @@ typedef struct {
     bool plain;
     bool warm_weights;
     bool quality;
+    bool prompt_final_newline;
 } eval_config;
 
 typedef struct {
@@ -1499,6 +1500,8 @@ static void usage(FILE *fp) {
         "  --min-p F              Keep tokens scoring at least F times the top token. Default: 0.05\n"
         "  --seed N               Sampling seed. Default: time-based\n"
         "  --trace FILE           Write questions, outputs, and grading decisions.\n"
+        "  --prompt-final-newline Append one trailing newline to rendered question prompts.\n"
+        "                         Also enabled by DS4_EVAL_PROMPT_FINAL_NEWLINE=1.\n"
         "  --think                Enable thinking mode. Default\n"
         "  --nothink              Disable thinking mode.\n"
         "  --soft-limit-reply-budget N\n"
@@ -1529,6 +1532,11 @@ static eval_config parse_options(int argc, char **argv) {
         .soft_limit_think_close_rank = 3,
         .think_mode = DS4_THINK_HIGH,
     };
+    const char *prompt_final_newline_env = getenv("DS4_EVAL_PROMPT_FINAL_NEWLINE");
+    if (prompt_final_newline_env && prompt_final_newline_env[0] &&
+        strcmp(prompt_final_newline_env, "0") != 0) {
+        c.prompt_final_newline = true;
+    }
 
     for (int i = 1; i < argc; i++) {
         const char *arg = argv[i];
@@ -1553,6 +1561,8 @@ static eval_config parse_options(int argc, char **argv) {
             c.seed = parse_u64_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--trace")) {
             c.trace_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--prompt-final-newline")) {
+            c.prompt_final_newline = true;
         } else if (!strcmp(arg, "--soft-limit-reply-budget")) {
             c.soft_limit_reply_budget = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--hard-limit-reply-budget")) {
@@ -2280,7 +2290,7 @@ static const char *eval_system_prompt(void) {
            "The final answer must follow the requested format exactly.";
 }
 
-static char *build_question_prompt(const eval_case *tc) {
+static char *build_question_prompt(const eval_case *tc, bool prompt_final_newline) {
     byte_buf b = {0};
     int nchoices = eval_case_nchoices(tc);
     buf_appendf(&b, "%s\n", tc->question);
@@ -2313,6 +2323,7 @@ static char *build_question_prompt(const eval_case *tc) {
                    "format and do not write anything after it:\n"
                    "Answer: <integer>"));
     }
+    if (prompt_final_newline) buf_append(&b, "\n", 1);
     if (b.v) return b.v;
     char *empty = malloc(1);
     if (empty) empty[0] = '\0';
@@ -2332,7 +2343,7 @@ static int eval_max_prompt_tokens(ds4_engine *engine,
         ds4_think_mode_for_context(cfg->think_mode, ctx_for_think_mode);
 
     for (int i = 0; i < ncases; i++) {
-        char *question = build_question_prompt(&cases[i]);
+        char *question = build_question_prompt(&cases[i], cfg->prompt_final_newline);
         if (!question) {
             fprintf(stderr, "ds4-eval: failed to allocate prompt\n");
             exit(1);
@@ -2435,6 +2446,7 @@ static void trace_write_header(FILE *trace, const eval_config *cfg, int ncases, 
             "min_p: %.6g\n"
             "seed: %llu\n"
             "think_mode_requested: %s\n"
+            "prompt_final_newline: %d\n"
             "soft_limit_reply_budget: %d\n"
             "hard_limit_reply_budget: %d\n"
             "soft_limit_think_close_rank: %d\n"
@@ -2451,6 +2463,7 @@ static void trace_write_header(FILE *trace, const eval_config *cfg, int ncases, 
             cfg->min_p,
             (unsigned long long)cfg->seed,
             ds4_think_mode_name(cfg->think_mode),
+            cfg->prompt_final_newline ? 1 : 0,
             cfg->soft_limit_reply_budget,
             cfg->hard_limit_reply_budget,
             cfg->soft_limit_think_close_rank);
@@ -2830,7 +2843,7 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
     const ds4_think_mode think_mode = ds4_think_mode_for_context(cfg->think_mode, cfg->ctx_size);
     const char *system = eval_system_prompt();
 
-    char *question = build_question_prompt(tc);
+    char *question = build_question_prompt(tc, cfg->prompt_final_newline);
     if (!question) {
         fprintf(stderr, "ds4-eval: failed to allocate prompt\n");
         return EVAL_RUN_ERROR;

@@ -232,13 +232,22 @@ generated tokens, pass/fail state, the model answer, and the correct answer.
 ./ds4-eval -m ds4flash.gguf --trace /tmp/ds4-eval.txt
 ```
 
+For the optimized upstream-shaped ROCm/CyberNeurova setup in this fork, use:
+
+```sh
+scripts/run_ds4_eval_rocm_upstream.sh
+```
+
 The default run uses `--tokens 16000`, thinking mode enabled, and a soft/hard
 `</think>` budget cutoff so the model has room to produce a visible answer.
 `ds4-eval` sizes the context internally from the largest selected prompt plus
 the generation budget, and refuses runs that would need more than 1M context
 tokens. Press `p` to pause, `q` to exit and print the report, Up/Down to
 inspect or select another question, and Enter to run the selected question next.
-`--plain` disables the TUI.
+`--plain` disables the TUI. `--prompt-final-newline` (or
+`DS4_EVAL_PROMPT_FINAL_NEWLINE=1`) appends one newline to the rendered question
+prompt for compatibility checks against runs that include a final prompt-file
+newline; leave it unset for the canonical embedded prompt bytes.
 
 The first 75 embedded questions are interleaved as 25 GPQA Diamond, 25 audited
 SuperGPQA, and 25 AIME 2025 problems. The final 17 are an audited COMPSEC
