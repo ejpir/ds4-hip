@@ -7,6 +7,7 @@
 /ds4-server-rocm-upstream
 /ds4-bench-rocm-upstream
 /ds4-eval-rocm-upstream
+/ds4-agent-rocm-upstream
 /ds4-mtp-oracle-bench-rocm-upstream
 /ds4_native
 /ds4_server_test

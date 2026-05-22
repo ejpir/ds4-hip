@@ -67,7 +67,7 @@ help:
 	@echo "  make cpu          Build CPU-only ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, and ./ds4-agent"
 	@echo "  make rocm         Build ROCm upstream-shaped binaries"
 	@echo "  make rocm-upstream Build ROCm upstream-shaped binaries"
-	@echo "                  (CLI, server, benchmark, and eval)"
+	@echo "                  (CLI, server, benchmark, eval, and agent)"
 	@echo "  make test         Build and run tests"
 	@echo "  make clean        Remove build outputs"
 
@@ -113,7 +113,7 @@ cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o ds4_eval_cpu.o ds4_agent_cpu
 cuda-regression:
 	@echo "CUDA is not supported in this HIP/ROCm fork; use make rocm-upstream"
 
-rocm rocm-upstream: ds4-rocm-upstream ds4-server-rocm-upstream ds4-bench-rocm-upstream ds4-eval-rocm-upstream
+rocm rocm-upstream: ds4-rocm-upstream ds4-server-rocm-upstream ds4-bench-rocm-upstream ds4-eval-rocm-upstream ds4-agent-rocm-upstream
 	@echo "ROCm upstream-shaped binaries built with ROCM_ARCH=$(ROCM_ARCH)"
 
 ds4-mtp-oracle-bench-rocm-upstream: tools/mtp_oracle_microbench_gpuapi.o ds4_gpuapi.o ds4_cuda.o
@@ -129,6 +129,9 @@ ds4-bench-rocm-upstream: ds4_bench_gpuapi.o ds4_gpuapi.o ds4_cuda.o
 	$(ROCM_HIPCC) -o $@ $^ $(ROCM_LDLIBS)
 
 ds4-eval-rocm-upstream: ds4_eval_gpuapi.o ds4_gpuapi.o ds4_cuda.o
+	$(ROCM_HIPCC) -o $@ $^ $(ROCM_LDLIBS)
+
+ds4-agent-rocm-upstream: ds4_agent_gpuapi.o ds4_kvstore.o linenoise.o ds4_gpuapi.o ds4_cuda.o
 	$(ROCM_HIPCC) -o $@ $^ $(ROCM_LDLIBS)
 
 ds4.o: ds4.c ds4.h ds4_metal.h ds4_gpu.h
@@ -209,6 +212,9 @@ ds4_bench_gpuapi.o: ds4_bench.c ds4.h
 ds4_eval_gpuapi.o: ds4_eval.c ds4.h
 	$(CC) $(CFLAGS) -DDS4_USE_GPU_API -DDS4_USE_HIP -c -o $@ ds4_eval.c
 
+ds4_agent_gpuapi.o: ds4_agent.c ds4.h ds4_kvstore.h linenoise.h
+	$(CC) $(CFLAGS) -DDS4_USE_GPU_API -DDS4_USE_HIP -c -o $@ ds4_agent.c
+
 tools/mtp_oracle_microbench_gpuapi.o: tools/mtp_oracle_microbench.c ds4.h
 	$(CC) $(CFLAGS) -DDS4_USE_GPU_API -DDS4_USE_HIP -I. -c -o $@ tools/mtp_oracle_microbench.c
 
@@ -237,4 +243,4 @@ test: ds4_test
 	./ds4_test
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4-rocm-upstream ds4-server-rocm-upstream ds4-bench-rocm-upstream ds4-eval-rocm-upstream ds4_cpu ds4_native ds4_server_test ds4_test hip-rocwmma-smoke hip-q2-moe-wmma-bench hip-q8-wmma-bench *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4-rocm-upstream ds4-server-rocm-upstream ds4-bench-rocm-upstream ds4-eval-rocm-upstream ds4-agent-rocm-upstream ds4_cpu ds4_native ds4_server_test ds4_test hip-rocwmma-smoke hip-q2-moe-wmma-bench hip-q8-wmma-bench *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
