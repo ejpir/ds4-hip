@@ -2109,9 +2109,35 @@ extern "C" int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_
 
 extern "C" void ds4_gpu_print_memory_report(const char *label) {
     size_t free_b = 0, total_b = 0;
-    (void)cudaMemGetInfo(&free_b, &total_b);
-    fprintf(stderr, "ds4: CUDA memory report %s: free %.2f MiB total %.2f MiB\n",
-            label ? label : "", (double)free_b / 1048576.0, (double)total_b / 1048576.0);
+    cudaError_t err = cudaMemGetInfo(&free_b, &total_b);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "ds4: CUDA memory %s: query failed: %s\n",
+                label ? label : "", cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        return;
+    }
+    const uint64_t used_b = (uint64_t)total_b - (uint64_t)free_b;
+    const char *placement = g_model_device_owned ? "device_copy" :
+                            (g_model_registered ? "host_registered" :
+                             (g_model_hmm_direct ? "hmm_direct" : "mapped/range_cache"));
+    fprintf(stderr,
+            "ds4: CUDA memory %s: used=%.2f GiB free=%.2f GiB total=%.2f GiB "
+            "placement=%s model_image=%.2f GiB range_cache=%.2f GiB "
+            "q8_f16_cache=%.2f GiB q8_f32_cache=%.2f GiB scratch=%.2f GiB",
+            label ? label : "",
+            (double)used_b / 1073741824.0,
+            (double)free_b / 1073741824.0,
+            (double)total_b / 1073741824.0,
+            placement,
+            g_model_device_owned ? (double)g_model_registered_size / 1073741824.0 : 0.0,
+            (double)g_model_range_bytes / 1073741824.0,
+            (double)g_q8_f16_bytes / 1073741824.0,
+            (double)g_q8_f32_bytes / 1073741824.0,
+            (double)g_cuda_tmp_bytes / 1073741824.0);
+#ifdef __HIP_PLATFORM_AMD__
+    fprintf(stderr, " moe_dense_cache=%.2f GiB", (double)g_moe_dense_hot_cache_bytes / 1073741824.0);
+#endif
+    fprintf(stderr, "\n");
 }
 
 extern "C" void ds4_gpu_set_quality(bool quality) {
