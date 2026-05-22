@@ -17,7 +17,7 @@ an interactive ds4> prompt.
 
 Defaults:
   DS4_MODEL=$CyberNeurova_Q2_K_GGUF
-  DS4_CLI_CTX=4096
+  DS4_CLI_CTX=131072
   DS4_CLI_TOKENS=1024
   DS4_SERVER_FAST_FULL=1
   DS4_SERVER_PERFLEVEL=high
@@ -255,7 +255,7 @@ if ! arg_present -m --model "${args[@]}"; then
   args=(-m "$MODEL" "${args[@]}")
 fi
 if ! arg_present -c --ctx "${args[@]}"; then
-  args=(--ctx "${DS4_CLI_CTX:-4096}" "${args[@]}")
+  args=(--ctx "${DS4_CLI_CTX:-131072}" "${args[@]}")
 fi
 if ! arg_present -n --tokens "${args[@]}"; then
   args=(--tokens "${DS4_CLI_TOKENS:-1024}" "${args[@]}")
