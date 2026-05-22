@@ -2806,9 +2806,9 @@ static double tui_wait_if_paused(eval_ui *ui, const char *phase) {
     return now_sec() - start;
 }
 
-static void eval_prefill_progress(void *ud, const char *event, int current, int total) {
+static bool eval_prefill_progress(void *ud, const char *event, int current, int total) {
     eval_ui *ui = ud;
-    if (!ui || !event || strcmp(event, "prefill_chunk")) return;
+    if (!ui || !event || strcmp(event, "prefill_chunk")) return true;
     tui_consume_input(ui);
     tui_run_clock_tick(ui);
     ui->prefill_current = current;
@@ -2818,6 +2818,7 @@ static void eval_prefill_progress(void *ud, const char *event, int current, int 
     tui_refresh(ui, "prefill");
     double paused_sec = tui_wait_if_paused(ui, "prefill");
     if (paused_sec > 0.0) ui->phase_start_sec += paused_sec;
+    return true;
 }
 
 static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
