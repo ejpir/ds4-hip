@@ -55,6 +55,7 @@ Environment:
                                 Enabled by DS4_SERVER_FAST_FULL=1.
   DS4_SERVER_Q8_PREQUANT_DECODE=0 Disable FAST_FULL q-side prequantized Q8 decode matvecs in upstream-shaped ROCm
   DS4_SERVER_ATTN_OUT_LOW_SPLITK=1 Restore old split-K decode attn_output_a path; FAST_FULL defaults to prequant
+  DS4_SERVER_SHARED_GATE_UP_FUSED_W32=1 Restore old fused shared gate/up float-row decode path; FAST_FULL defaults to prequant pair
   DS4_SERVER_Q8_HIPBLASLT=1      Opt-in q-side hipBLASLt xsplit path for small prefill batches
   DS4_SERVER_Q8_HIPBLASLT_MAX_TOKENS=N  Max batch routed to hipBLASLt; default 256
   DS4_SERVER_MOE_EXPERT_BATCH=1  Experimental expert-bucketed Q2_K MoE for faster prefill
@@ -172,6 +173,7 @@ if [[ "${DS4_SERVER_FAST_FULL:-0}" == "1" ]]; then
   export DS4_SERVER_Q8_WMMA_FAST="${DS4_SERVER_Q8_WMMA_FAST:-1}"
   export DS4_SERVER_Q8_PREQUANT_DECODE="${DS4_SERVER_Q8_PREQUANT_DECODE:-1}"
   export DS4_SERVER_ATTN_OUT_LOW_SPLITK="${DS4_SERVER_ATTN_OUT_LOW_SPLITK:-0}"
+  export DS4_SERVER_SHARED_GATE_UP_FUSED_W32="${DS4_SERVER_SHARED_GATE_UP_FUSED_W32:-0}"
   export DS4_SERVER_MOE_WMMA_HOT="${DS4_SERVER_MOE_WMMA_HOT:-1}"
   export DS4_SERVER_MOE_WMMA_GATE_HOT="${DS4_SERVER_MOE_WMMA_GATE_HOT:-8}"
   export DS4_SERVER_MOE_WMMA_DOWN_HOT="${DS4_SERVER_MOE_WMMA_DOWN_HOT:-8}"
@@ -390,6 +392,11 @@ if [[ "${DS4_SERVER_ATTN_OUT_LOW_SPLITK:-0}" == "1" ]]; then
   unset DS4_CUDA_DISABLE_SPLITK_ATTN_OUT_LOW || true
 else
   export DS4_CUDA_DISABLE_SPLITK_ATTN_OUT_LOW=1
+fi
+if [[ "${DS4_SERVER_SHARED_GATE_UP_FUSED_W32:-1}" == "1" ]]; then
+  unset DS4_CUDA_DISABLE_SHARED_GATE_UP_FUSED_W32 || true
+else
+  export DS4_CUDA_DISABLE_SHARED_GATE_UP_FUSED_W32=1
 fi
 if [[ "${DS4_SERVER_Q8_HIPBLASLT:-0}" == "1" ]]; then
   export DS4_HIP_Q8_HIPBLASLT=1

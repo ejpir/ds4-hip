@@ -35,6 +35,7 @@ Environment:
   DS4_CUDA_ATTN_Q_B_F16_OUT=1            Write q_b GEMM to f16 and fuse head norm/rope to float
   DS4_SERVER_Q8_PREQUANT_DECODE=0        Disable default FAST_FULL prequantized Q8 decode matvecs
   DS4_SERVER_ATTN_OUT_LOW_SPLITK=1       Restore old split-K decode attn_output_a path; FAST_FULL defaults to prequant
+  DS4_SERVER_SHARED_GATE_UP_FUSED_W32=1  Restore old fused shared gate/up float-row decode path; FAST_FULL defaults to prequant pair
   DS4_SERVER_ATTENTION_OUTPUT_F16_OUT=0  Disable default FAST_FULL attention-output f16 projection
   DS4_SERVER_ATTENTION_OUTPUT_F16_OUT_MIN_TOKENS=N Optional attention f16-output minimum; default 0
   DS4_SERVER_SHARED_DOWN_F16_OUT=0       Disable default FAST_FULL shared-down f16 projection
@@ -112,6 +113,7 @@ if [[ "${DS4_SERVER_FAST_FULL:-0}" == "1" ]]; then
   export DS4_SERVER_Q8_WMMA_FAST="${DS4_SERVER_Q8_WMMA_FAST:-1}"
   export DS4_SERVER_Q8_PREQUANT_DECODE="${DS4_SERVER_Q8_PREQUANT_DECODE:-1}"
   export DS4_SERVER_ATTN_OUT_LOW_SPLITK="${DS4_SERVER_ATTN_OUT_LOW_SPLITK:-0}"
+  export DS4_SERVER_SHARED_GATE_UP_FUSED_W32="${DS4_SERVER_SHARED_GATE_UP_FUSED_W32:-0}"
   export DS4_SERVER_MOE_WMMA_HOT="${DS4_SERVER_MOE_WMMA_HOT:-1}"
   export DS4_SERVER_MOE_WMMA_GATE_HOT="${DS4_SERVER_MOE_WMMA_GATE_HOT:-8}"
   export DS4_SERVER_MOE_WMMA_DOWN_HOT="${DS4_SERVER_MOE_WMMA_DOWN_HOT:-8}"
@@ -179,6 +181,11 @@ if [[ "${DS4_SERVER_ATTN_OUT_LOW_SPLITK:-0}" == "1" ]]; then
   unset DS4_CUDA_DISABLE_SPLITK_ATTN_OUT_LOW || true
 else
   export DS4_CUDA_DISABLE_SPLITK_ATTN_OUT_LOW=1
+fi
+if [[ "${DS4_SERVER_SHARED_GATE_UP_FUSED_W32:-1}" == "1" ]]; then
+  unset DS4_CUDA_DISABLE_SHARED_GATE_UP_FUSED_W32 || true
+else
+  export DS4_CUDA_DISABLE_SHARED_GATE_UP_FUSED_W32=1
 fi
 export_pair_flag Q8_HIPBLASLT "${DS4_SERVER_Q8_HIPBLASLT:-0}"
 export_pair_value Q8_HIPBLASLT_MAX_TOKENS "${DS4_SERVER_Q8_HIPBLASLT_MAX_TOKENS:-}"
