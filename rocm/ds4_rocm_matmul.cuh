@@ -831,18 +831,10 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
     const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "f16");
     if (!wptr) return 0;
     const __half *w = (const __half *)wptr;
-    const int serial_f16 = getenv("DS4_CUDA_SERIAL_F16_MATMUL") != NULL;
-    const int router_shape = in_dim == 4096u && out_dim == 256u && n_tok == 1u;
-    const int serial_router =
-        !serial_f16 &&
-        router_shape &&
-        getenv("DS4_CUDA_SERIAL_ROUTER") != NULL;
     const int ordered_router =
-        !serial_f16 &&
-        !serial_router &&
         n_tok == 1u &&
         getenv("DS4_CUDA_NO_ORDERED_F16_MATMUL") == NULL;
-    if (!serial_f16 && g_cublas_ready && n_tok > 1) {
+    if (g_cublas_ready && n_tok > 1) {
         const uint64_t xh_count = n_tok * in_dim;
         __half *xh = (__half *)cuda_tmp_alloc(xh_count * sizeof(__half), "f16 gemm activations");
         if (!xh) return 0;
@@ -872,10 +864,6 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
         return cublas_ok(st, "f16 matmul");
     }
     dim3 grid((unsigned)out_dim, (unsigned)n_tok, 1);
-    if (serial_f16 || serial_router) {
-        matmul_f16_serial_kernel<<<grid, 1>>>((float *)out->ptr, w, (const float *)x->ptr, in_dim, out_dim, n_tok);
-        return cuda_ok(cudaGetLastError(), serial_router ? "matmul_f16_router_serial launch" : "matmul_f16_serial launch");
-    }
     if (ordered_router) {
         matmul_f16_ordered_chunks_kernel<<<grid, 32>>>((float *)out->ptr, w, (const float *)x->ptr, in_dim, out_dim, n_tok);
         return cuda_ok(cudaGetLastError(), "matmul_f16_ordered_chunks launch");
@@ -900,8 +888,6 @@ extern "C" int ds4_gpu_matmul_f16_pair_tensor(
     }
     if (n_tok != 1 ||
         getenv("DS4_CUDA_NO_F16_PAIR_MATMUL") != NULL ||
-        getenv("DS4_CUDA_SERIAL_F16_MATMUL") != NULL ||
-        getenv("DS4_CUDA_SERIAL_ROUTER") != NULL ||
         getenv("DS4_CUDA_NO_ORDERED_F16_MATMUL") != NULL) {
         return ds4_gpu_matmul_f16_tensor(out0, model_map, model_size, weight0_offset,
                                            in_dim, out_dim, x, n_tok) &&

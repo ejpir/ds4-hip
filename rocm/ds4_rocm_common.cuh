@@ -110,26 +110,6 @@ __global__ static void matmul_f16_kernel(
     if (threadIdx.x == 0) out[tok * out_dim + row] = partial[0];
 }
 
-__global__ static void matmul_f16_serial_kernel(
-        float *out,
-        const __half *w,
-        const float *x,
-        uint64_t in_dim,
-        uint64_t out_dim,
-        uint64_t n_tok) {
-    uint64_t row = (uint64_t)blockIdx.x;
-    uint64_t tok = (uint64_t)blockIdx.y;
-    if (row >= out_dim || tok >= n_tok || threadIdx.x != 0) return;
-
-    float sum = 0.0f;
-    const __half *wr = w + row * in_dim;
-    const float *xr = x + tok * in_dim;
-    for (uint64_t i = 0; i < in_dim; i++) {
-        sum += __half2float(wr[i]) * xr[i];
-    }
-    out[tok * out_dim + row] = sum;
-}
-
 __global__ static void matmul_f16_ordered_chunks_kernel(
         float *out,
         const __half *w,

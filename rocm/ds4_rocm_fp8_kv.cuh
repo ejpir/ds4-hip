@@ -4,30 +4,6 @@
 // kernels can reuse the backend's existing device helpers without HIP device
 // linking or behavior changes.
 
-__global__ static void fp8_kv_quantize_serial_groups_kernel(float *x, uint32_t n_tok, uint32_t head_dim, uint32_t n_rot) {
-    uint32_t row = blockIdx.x;
-    uint32_t tid = threadIdx.x;
-    uint32_t n_nope = head_dim - n_rot;
-    float *xr = x + (uint64_t)row * head_dim;
-    __shared__ float scratch[64];
-    for (uint32_t off = 0; off < n_nope; off += 64) {
-        float v = 0.0f;
-        if (off + tid < n_nope) v = xr[off + tid];
-        scratch[tid] = off + tid < n_nope ? fabsf(v) : 0.0f;
-        __syncthreads();
-        for (uint32_t stride = 32; stride > 0; stride >>= 1) {
-            if (tid < stride) scratch[tid] = fmaxf(scratch[tid], scratch[tid + stride]);
-            __syncthreads();
-        }
-        float scale = exp2f(ceilf(log2f(fmaxf(scratch[0], 1.0e-4f) / 448.0f)));
-        if (off + tid < n_nope) {
-            float q = dsv4_e4m3fn_dequant_dev(fminf(448.0f, fmaxf(-448.0f, v / scale))) * scale;
-            xr[off + tid] = q;
-        }
-        __syncthreads();
-    }
-}
-
 __global__ static void fp8_kv_quantize_kernel(float *x, uint32_t n_tok, uint32_t head_dim, uint32_t n_rot) {
     const uint32_t row = blockIdx.x;
     const uint32_t grp = blockIdx.y;
