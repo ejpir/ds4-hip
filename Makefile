@@ -239,8 +239,7 @@ endif
 ds4_test: ds4_test.o ds4_kvstore.o rax.o $(TEST_CORE_OBJS)
 	$(TEST_LINK) -o $@ ds4_test.o ds4_kvstore.o rax.o $(TEST_CORE_OBJS) $(LDLIBS)
 
-test: ds4_test ds4-eval
-	./ds4-eval --self-test-extractors
+test: ds4_test
 	./ds4_test
 
 clean:

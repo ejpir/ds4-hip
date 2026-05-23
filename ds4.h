@@ -64,12 +64,6 @@ typedef struct ds4_session ds4_session;
 typedef bool (*ds4_session_progress_fn)(void *ud, const char *event, int current, int total);
 
 typedef struct {
-    unsigned char *ptr;
-    uint64_t len;
-    uint64_t cap;
-} ds4_session_snapshot;
-
-typedef struct {
     const char *model_path;
     const char *mtp_path;
     ds4_backend backend;
@@ -99,7 +93,6 @@ typedef struct {
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt);
 void ds4_engine_close(ds4_engine *e);
 void ds4_engine_summary(ds4_engine *e);
-int ds4_engine_vocab_size(ds4_engine *e);
 const char *ds4_backend_name(ds4_backend backend);
 bool ds4_think_mode_enabled(ds4_think_mode mode);
 const char *ds4_think_mode_name(ds4_think_mode mode);
@@ -156,9 +149,6 @@ int ds4_token_assistant(ds4_engine *e);
 int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size);
 void ds4_session_free(ds4_session *s);
 void ds4_session_set_progress(ds4_session *s, ds4_session_progress_fn fn, void *ud);
-/* UI-only progress. It may report fine-grained progress inside a prefill chunk;
- * callers must not treat it as a durable KV checkpoint boundary. */
-void ds4_session_set_display_progress(ds4_session *s, ds4_session_progress_fn fn, void *ud);
 
 typedef enum {
     DS4_SESSION_REWRITE_ERROR = -1,
@@ -181,7 +171,6 @@ int ds4_session_argmax(ds4_session *s);
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng);
 int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k);
 int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out);
-int ds4_session_copy_logits(ds4_session *s, float *out, int cap);
 int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen);
 int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                         int max_tokens, int eos_token,
@@ -205,8 +194,5 @@ const ds4_tokens *ds4_session_tokens(ds4_session *s);
 uint64_t ds4_session_payload_bytes(ds4_session *s);
 int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen);
 int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, char *err, size_t errlen);
-int ds4_session_save_snapshot(ds4_session *s, ds4_session_snapshot *snap, char *err, size_t errlen);
-int ds4_session_load_snapshot(ds4_session *s, const ds4_session_snapshot *snap, char *err, size_t errlen);
-void ds4_session_snapshot_free(ds4_session_snapshot *snap);
 
 #endif
