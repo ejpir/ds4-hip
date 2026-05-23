@@ -2263,6 +2263,87 @@ static bool chat_history_uses_tool_context(const chat_msgs *msgs,
     return false;
 }
 
+static int server_env_flag(const char *name) {
+    const char *env = getenv(name);
+    return env && env[0] && strcmp(env, "0") != 0;
+}
+
+static int server_env_int(const char *name, int def, int min, int max) {
+    const char *env = getenv(name);
+    if (!env || !env[0]) return def;
+    char *end = NULL;
+    long v = strtol(env, &end, 10);
+    if (end == env) return def;
+    if (v < min) return min;
+    if (v > max) return max;
+    return (int)v;
+}
+
+static int chat_tool_result_count(const chat_msgs *msgs) {
+    int n = 0;
+    for (int i = 0; msgs && i < msgs->len; i++) {
+        const chat_msg *m = &msgs->v[i];
+        if (!strcmp(m->role, "tool") || !strcmp(m->role, "function")) n++;
+    }
+    return n;
+}
+
+static bool prior_tool_result_has_same_text(const chat_msgs *msgs, int idx) {
+    const char *text = msgs->v[idx].content ? msgs->v[idx].content : "";
+    for (int i = 0; i < idx; i++) {
+        const chat_msg *m = &msgs->v[i];
+        if (strcmp(m->role, "tool") && strcmp(m->role, "function")) continue;
+        const char *prev = m->content ? m->content : "";
+        if (!strcmp(prev, text)) return true;
+    }
+    return false;
+}
+
+static void append_compacted_tool_result_text(buf *out, const char *text,
+                                              size_t max_chars,
+                                              const char *reason) {
+    const size_t len = text ? strlen(text) : 0;
+    buf_puts(out, "[ds4-server: compacted older tool result");
+    if (reason && reason[0]) {
+        buf_puts(out, "; ");
+        buf_puts(out, reason);
+    }
+    buf_puts(out, ". Re-read or rerun the tool if exact omitted output is needed.]\n");
+    if (text && text[0] && max_chars > 0) {
+        const size_t n = len < max_chars ? len : max_chars;
+        char *prefix = xstrndup(text, n);
+        append_tool_result_text(out, prefix);
+        free(prefix);
+        if (n < len) {
+            buf_puts(out, "\n[... omitted ");
+            buf_printf(out, "%zu", len - n);
+            buf_puts(out, " bytes ...]");
+        }
+    }
+}
+
+static void append_rendered_tool_result_text(buf *out, const chat_msgs *msgs,
+                                             int idx, int tool_result_ordinal,
+                                             int total_tool_results) {
+    const char *text = msgs->v[idx].content ? msgs->v[idx].content : "";
+    const bool compact = server_env_flag("DS4_SERVER_COMPACT_TOOL_CONTEXT");
+    if (!compact) {
+        append_tool_result_text(out, text);
+        return;
+    }
+    const int keep_last = server_env_int("DS4_SERVER_TOOL_CONTEXT_KEEP_LAST", 8, 0, 1000);
+    const int older_max = server_env_int("DS4_SERVER_TOOL_CONTEXT_OLDER_CHARS", 1600, 80, 1000000);
+    const int dup_max = server_env_int("DS4_SERVER_TOOL_CONTEXT_DUP_CHARS", 280, 0, 1000000);
+    const bool old = tool_result_ordinal <= total_tool_results - keep_last;
+    if (old && prior_tool_result_has_same_text(msgs, idx)) {
+        append_compacted_tool_result_text(out, text, (size_t)dup_max, "duplicate output already appeared earlier in this request");
+    } else if (old && (int)strlen(text) > older_max) {
+        append_compacted_tool_result_text(out, text, (size_t)older_max, "older than keep-last window");
+    } else {
+        append_tool_result_text(out, text);
+    }
+}
+
 static char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_schemas,
                                      const tool_schema_orders *tool_orders,
                                      ds4_think_mode think_mode) {
@@ -2295,6 +2376,8 @@ static char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_sch
 
     bool pending_assistant = false;
     bool pending_tool_result = false;
+    const int total_tool_results = chat_tool_result_count(msgs);
+    int tool_result_ordinal = 0;
     for (int i = 0; i < msgs->len; i++) {
         const chat_msg *m = &msgs->v[i];
         if (role_is_system(m->role)) {
@@ -2305,9 +2388,10 @@ static char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_sch
             pending_assistant = true;
             pending_tool_result = false;
         } else if (!strcmp(m->role, "tool") || !strcmp(m->role, "function")) {
+            tool_result_ordinal++;
             if (!pending_tool_result) buf_puts(&out, "<｜User｜>");
             buf_puts(&out, "<tool_result>");
-            append_tool_result_text(&out, m->content);
+            append_rendered_tool_result_text(&out, msgs, i, tool_result_ordinal, total_tool_results);
             buf_puts(&out, "</tool_result>");
             pending_assistant = true;
             pending_tool_result = true;
