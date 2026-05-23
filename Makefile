@@ -218,7 +218,7 @@ ds4_agent_gpuapi.o: ds4_agent.c ds4.h ds4_kvstore.h linenoise.h
 tools/mtp_oracle_microbench_gpuapi.o: tools/mtp_oracle_microbench.c ds4.h
 	$(CC) $(CFLAGS) -DDS4_USE_GPU_API -DDS4_USE_HIP -I. -c -o $@ tools/mtp_oracle_microbench.c
 
-ds4_rocm.o: ds4_rocm.cu ds4_gpu.h ds4_iq2_tables_cuda.inc ds4_rocm.h rocm/ds4_rocm_runtime.cuh rocm/ds4_rocm_common.cuh rocm/ds4_rocm_q8.cuh rocm/ds4_rocm_norm_rope.cuh rocm/ds4_rocm_matmul.cuh rocm/ds4_rocm_fp8_kv.cuh rocm/ds4_rocm_attention.cuh rocm/ds4_rocm_attention_launch.cuh rocm/ds4_rocm_hc.cuh rocm/ds4_rocm_output.cuh rocm/ds4_rocm_indexer.cuh rocm/ds4_rocm_compressor.cuh rocm/ds4_rocm_router.cuh rocm/ds4_rocm_moe.cuh rocm/ds4_rocm_hipblaslt.cuh
+ds4_rocm.o: ds4_rocm.cu ds4_gpu.h ds4_iq2_tables_cuda.inc ds4_rocm.h rocm/ds4_rocm_runtime.cuh rocm/ds4_rocm_common.cuh rocm/ds4_rocm_q8.cuh rocm/ds4_rocm_norm_rope.cuh rocm/ds4_rocm_matmul.cuh rocm/ds4_rocm_fp8_kv.cuh rocm/ds4_rocm_attention.cuh rocm/ds4_rocm_attention_launch.cuh rocm/ds4_rocm_hc.cuh rocm/ds4_rocm_output.cuh rocm/ds4_rocm_indexer.cuh rocm/ds4_rocm_compressor.cuh rocm/ds4_rocm_shared_expert.cuh rocm/ds4_rocm_router.cuh rocm/ds4_rocm_moe.cuh rocm/ds4_rocm_hipblaslt.cuh
 	$(ROCM_HIPCC) $(ROCM_CFLAGS) -c -o $@ ds4_rocm.cu
 
 ifneq ($(HIPCC),)
