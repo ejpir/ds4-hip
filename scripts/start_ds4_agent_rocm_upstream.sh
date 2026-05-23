@@ -32,6 +32,7 @@ Useful environment overrides:
   DS4_AGENT_CTX=N
   DS4_AGENT_TOKENS=N
   DS4_AGENT_TRACE=FILE
+  DS4_AGENT_PREFILL_CHUNK=N    Default: 2048
   DS4_AGENT_STOP_SERVER=1
   DS4_AGENT_ALLOW_WITH_SERVER=1
   DS4_AGENT_PERFLEVEL=auto    Or empty/off/skip/none to bypass rocm-smi changes
@@ -123,8 +124,9 @@ export DS4_CUDA_COPY_MODEL="${DS4_CUDA_COPY_MODEL:-1}"
 export DS4_CUDA_Q8_PREQUANT_DECODE="${DS4_CUDA_Q8_PREQUANT_DECODE:-1}"
 export DS4_CUDA_DISABLE_SPLITK_ATTN_OUT_LOW="${DS4_CUDA_DISABLE_SPLITK_ATTN_OUT_LOW:-1}"
 export DS4_CUDA_DISABLE_SHARED_GATE_UP_FUSED_W32="${DS4_CUDA_DISABLE_SHARED_GATE_UP_FUSED_W32:-1}"
-export DS4_METAL_PREFILL_CHUNK="${DS4_METAL_PREFILL_CHUNK:-2048}"
-export DS4_SESSION_PROGRESS_CHUNK_TOKENS="${DS4_SESSION_PROGRESS_CHUNK_TOKENS:-$DS4_METAL_PREFILL_CHUNK}"
+export DS4_AGENT_PREFILL_CHUNK="${DS4_AGENT_PREFILL_CHUNK:-${DS4_SERVER_PREFILL_CHUNK:-2048}}"
+export DS4_METAL_PREFILL_CHUNK="$DS4_AGENT_PREFILL_CHUNK"
+export DS4_SESSION_PROGRESS_CHUNK_TOKENS="${DS4_SESSION_PROGRESS_CHUNK_TOKENS:-$DS4_AGENT_PREFILL_CHUNK}"
 
 args=("$@")
 if ! arg_present -m --model "${args[@]}"; then
@@ -144,5 +146,5 @@ if [[ -n "${DS4_AGENT_TRACE:-}" ]] && ! arg_present "" --trace "${args[@]}"; the
 fi
 
 echo "ds4-agent-rocm-upstream: model=$MODEL" >&2
-echo "ds4-agent-rocm-upstream: ctx=${DS4_AGENT_CTX:-131072} tokens=${DS4_AGENT_TOKENS:-8192}" >&2
+echo "ds4-agent-rocm-upstream: ctx=${DS4_AGENT_CTX:-131072} tokens=${DS4_AGENT_TOKENS:-8192} prefill_chunk=$DS4_AGENT_PREFILL_CHUNK" >&2
 exec ./ds4-agent-rocm-upstream "${args[@]}"

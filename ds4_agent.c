@@ -527,6 +527,20 @@ static agent_config parse_options(int argc, char **argv) {
     return c;
 }
 
+static void agent_apply_prefill_env_defaults(void) {
+    const char *chunk = getenv("DS4_METAL_PREFILL_CHUNK");
+    if (!chunk || !chunk[0]) {
+        chunk = getenv("DS4_AGENT_PREFILL_CHUNK");
+        if (!chunk || !chunk[0]) chunk = getenv("DS4_SERVER_PREFILL_CHUNK");
+        if (!chunk || !chunk[0]) chunk = "2048";
+        (void)setenv("DS4_METAL_PREFILL_CHUNK", chunk, 1);
+    }
+    const char *progress_chunk = getenv("DS4_SESSION_PROGRESS_CHUNK_TOKENS");
+    if (!progress_chunk || !progress_chunk[0]) {
+        (void)setenv("DS4_SESSION_PROGRESS_CHUNK_TOKENS", chunk, 1);
+    }
+}
+
 static void log_context_memory(ds4_backend backend, int ctx_size) {
     ds4_context_memory m = ds4_context_memory_estimate(backend, ctx_size);
     fprintf(stderr,
@@ -8005,6 +8019,7 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
 
 int main(int argc, char **argv) {
     agent_config cfg = parse_options(argc, argv);
+    agent_apply_prefill_env_defaults();
     log_context_memory(cfg.engine.backend, cfg.gen.ctx_size);
 
     ds4_engine *engine = NULL;
