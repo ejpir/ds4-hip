@@ -19,7 +19,7 @@ Environment:
   DS4_SERVER_HOST=127.0.0.1       Bind host
   DS4_SERVER_PORT=8000            Bind port
   DS4_SERVER_CTX=131072           Context size, standard default (128k)
-  DS4_SERVER_TOKENS=1024          Default max output tokens
+  DS4_SERVER_TOKENS=8192          Default max output tokens
   DS4_SERVER_KV_DIR=/tmp/ds4-kv   Disk KV directory
   DS4_SERVER_KV_MB=2048           Disk KV budget MB
   DS4_SERVER_KV_ALIGN_TOKENS=512  Cold KV prefix alignment; helps <2k agent prompts reuse
@@ -108,7 +108,7 @@ MODEL="${DS4_MODEL:-$MODEL_DEFAULT}"
 HOST="${DS4_SERVER_HOST:-127.0.0.1}"
 PORT="${DS4_SERVER_PORT:-8000}"
 CTX="${DS4_SERVER_CTX:-131072}"
-TOKENS="${DS4_SERVER_TOKENS:-1024}"
+TOKENS="${DS4_SERVER_TOKENS:-8192}"
 KV_DIR="${DS4_SERVER_KV_DIR:-/tmp/ds4-kv}"
 KV_MB="${DS4_SERVER_KV_MB:-2048}"
 KV_ALIGN="${DS4_SERVER_KV_ALIGN_TOKENS:-512}"
