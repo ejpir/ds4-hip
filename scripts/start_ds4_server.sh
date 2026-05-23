@@ -84,10 +84,11 @@ Environment:
   DS4_SERVER_COPY_MODEL_CHUNK_MB=256  Staged full-copy chunk size
   DS4_SESSION_PROGRESS_RAW_MAX_TOKENS=512  Use cancellable layer-by-layer prefill above this
   DS4_SESSION_PROGRESS_CHUNK_TOKENS=512    Cap cancellable prefill chunks; 0 disables cap
-  DS4_SERVER_COMPACT_TOOL_CONTEXT=1 Compact older tool results in rendered prompt context
-  DS4_SERVER_TOOL_CONTEXT_KEEP_LAST=8 Keep this many latest tool results full when compacting
-  DS4_SERVER_TOOL_CONTEXT_OLDER_CHARS=1600 Older long tool-result excerpt bytes/chars
-  DS4_SERVER_TOOL_CONTEXT_DUP_CHARS=280 Duplicate older tool-result excerpt bytes/chars
+  DS4_SERVER_COMPACT_TOOL_CONTEXT=1 Compact duplicate tool results in rendered prompt context
+  DS4_SERVER_TOOL_CONTEXT_COMPACT_UNIQUE=1 Also compact older unique tool results; off by default
+  DS4_SERVER_TOOL_CONTEXT_KEEP_LAST=8 Keep this many latest unique tool results full when compacting unique outputs
+  DS4_SERVER_TOOL_CONTEXT_OLDER_CHARS=1600 Older unique tool-result excerpt bytes/chars when COMPACT_UNIQUE=1
+  DS4_SERVER_TOOL_CONTEXT_DUP_CHARS=280 Duplicate tool-result excerpt bytes/chars
 
 Safety/perf toggles:
   DS4_SPEC_DRAFTER=ngram          Opt-in prompt-lookup/n-gram speculative drafter for greedy decode
@@ -120,6 +121,7 @@ LOG="${DS4_SERVER_LOG:-/tmp/ds4-server.log}"
 PIDFILE="${DS4_SERVER_PID:-/tmp/ds4-server.pid}"
 TRACE="${DS4_SERVER_TRACE:-}"
 export DS4_SERVER_COMPACT_TOOL_CONTEXT="${DS4_SERVER_COMPACT_TOOL_CONTEXT:-1}"
+export DS4_SERVER_TOOL_CONTEXT_COMPACT_UNIQUE="${DS4_SERVER_TOOL_CONTEXT_COMPACT_UNIQUE:-0}"
 export DS4_SERVER_TOOL_CONTEXT_KEEP_LAST="${DS4_SERVER_TOOL_CONTEXT_KEEP_LAST:-8}"
 export DS4_SERVER_TOOL_CONTEXT_OLDER_CHARS="${DS4_SERVER_TOOL_CONTEXT_OLDER_CHARS:-1600}"
 export DS4_SERVER_TOOL_CONTEXT_DUP_CHARS="${DS4_SERVER_TOOL_CONTEXT_DUP_CHARS:-280}"

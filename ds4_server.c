@@ -2332,12 +2332,13 @@ static void append_rendered_tool_result_text(buf *out, const chat_msgs *msgs,
         return;
     }
     const int keep_last = server_env_int("DS4_SERVER_TOOL_CONTEXT_KEEP_LAST", 8, 0, 1000);
-    const int older_max = server_env_int("DS4_SERVER_TOOL_CONTEXT_OLDER_CHARS", 1600, 80, 1000000);
+    const int older_max = server_env_int("DS4_SERVER_TOOL_CONTEXT_OLDER_CHARS", 1600, 0, 1000000);
     const int dup_max = server_env_int("DS4_SERVER_TOOL_CONTEXT_DUP_CHARS", 280, 0, 1000000);
+    const bool compact_unique = server_env_flag("DS4_SERVER_TOOL_CONTEXT_COMPACT_UNIQUE");
     const bool old = tool_result_ordinal <= total_tool_results - keep_last;
-    if (old && prior_tool_result_has_same_text(msgs, idx)) {
+    if (prior_tool_result_has_same_text(msgs, idx)) {
         append_compacted_tool_result_text(out, text, (size_t)dup_max, "duplicate output already appeared earlier in this request");
-    } else if (old && (int)strlen(text) > older_max) {
+    } else if (compact_unique && old && older_max > 0 && (int)strlen(text) > older_max) {
         append_compacted_tool_result_text(out, text, (size_t)older_max, "older than keep-last window");
     } else {
         append_tool_result_text(out, text);
