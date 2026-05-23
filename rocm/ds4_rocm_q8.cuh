@@ -1578,6 +1578,25 @@ __global__ static void dequant_q8_0_to_f32_kernel(
     out[gid] = scale * (float)q;
 }
 
+__global__ static void dequant_q8_0_to_f16_transpose_kernel(
+        __half *out,
+        const unsigned char *w,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint64_t blocks) {
+    const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t n = in_dim * out_dim;
+    if (gid >= n) return;
+    const uint64_t row = gid / in_dim;
+    const uint64_t i = gid - row * in_dim;
+    const uint64_t b = i / 32u;
+    const uint64_t j = i - b * 32u;
+    const unsigned char *blk = w + (row * blocks + b) * 34u;
+    const __half scale = *(const __half *)blk;
+    const int8_t q = *(const int8_t *)(blk + 2u + j);
+    out[i * out_dim + row] = __hmul(scale, __float2half((float)q));
+}
+
 __global__ static void grouped_q8_0_a_preq_warp8_kernel(
         float *low,
         const unsigned char *w,

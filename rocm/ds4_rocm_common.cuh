@@ -3,6 +3,11 @@
 // Included from ds4_cuda.cu before more specialized modules; these helpers are
 // intentionally kept static in the single translation unit.
 
+__global__ static void fill_f32_kernel(float *x, uint64_t n, float v) {
+    uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) x[i] = v;
+}
+
 __global__ static void embed_token_hc_kernel(float *out, const unsigned short *w, uint32_t token, uint32_t n_embd, uint32_t n_hc) {
     uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     uint32_t n = n_embd * n_hc;
