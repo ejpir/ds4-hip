@@ -1400,6 +1400,9 @@ static void gpu_fast_path_summary(bool quality) {
     const bool q8_prequant = env_truthy("DS4_CUDA_Q8_PREQUANT_DECODE");
     const bool splitk_attn_out_low = !env_truthy("DS4_CUDA_DISABLE_SPLITK_ATTN_OUT_LOW");
     const bool shared_gate_fused = !env_truthy("DS4_CUDA_DISABLE_SHARED_GATE_UP_FUSED_W32");
+    const bool shared_gate_pair_swiglu = q8_prequant && !shared_gate_fused &&
+                                        !env_truthy("DS4_CUDA_DISABLE_SHARED_GATE_UP_PAIR") &&
+                                        !env_truthy("DS4_CUDA_DISABLE_SHARED_GATE_UP_PAIR_SWIGLU");
     const bool attn_out_preload = env_truthy("DS4_CUDA_ATTENTION_OUTPUT_PRELOAD") ||
                                   env_truthy("DS4_CUDA_ATTENTION_OUTPUT_CUBLAS") ||
                                   env_truthy("DS4_CUDA_ATTENTION_OUTPUT_CUBLAS_ALL");
@@ -1411,6 +1414,7 @@ static void gpu_fast_path_summary(bool quality) {
             "ds4: ROCm fast paths: quality=%s copy_model=%s q8_prequant_decode=%s "
             "attn_out_low_splitk=%s attn_out_low_prequant=%s "
             "shared_gate_up_fused_w32=%s shared_gate_up_prequant_pair=%s "
+            "shared_gate_up_pair_swiglu=%s "
             "q8_fp16_preload(attn_out=%s,attn_q_b=%s,shared_down=%s)\n",
             onoff(quality),
             onoff(copy_model),
@@ -1419,6 +1423,7 @@ static void gpu_fast_path_summary(bool quality) {
             onoff(q8_prequant && !splitk_attn_out_low),
             onoff(shared_gate_fused),
             onoff(q8_prequant && !shared_gate_fused),
+            onoff(shared_gate_pair_swiglu),
             onoff(attn_out_preload),
             onoff(attn_q_b_preload),
             onoff(shared_down_preload));
