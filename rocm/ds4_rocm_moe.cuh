@@ -1,7 +1,7 @@
 // DS4 ROCm routed-MoE quantization/device helpers and kernels.
 //
-// Included from ds4_cuda.cu in the same translation unit so the existing
-// routed_moe_launch() policy/glue can keep using static kernels directly.
+// Included from the ROCm backend translation unit before
+// ds4_rocm_moe_launch.cuh so host policy/glue can keep using these static kernels directly.
 
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
 #include <rocwmma/rocwmma.hpp>
