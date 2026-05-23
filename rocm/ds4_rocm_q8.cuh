@@ -221,6 +221,51 @@ __global__ static void matmul_q8_0_pair_preq_warp8_kernel(
     }
 }
 
+__global__ static void shared_gate_up_swiglu_q8_0_pair_preq_warp8_kernel(
+        float *gate,
+        float *up,
+        float *mid,
+        const unsigned char *wg,
+        const unsigned char *wu,
+        const int8_t *xq,
+        const float *xscale,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint64_t blocks,
+        int use_dp4a,
+        int store_gate_up) {
+    const uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
+    const uint32_t lane = threadIdx.x & 31u;
+    if (row >= out_dim) return;
+    const unsigned char *gr = wg + row * blocks * 34u;
+    const unsigned char *ur = wu + row * blocks * 34u;
+    float g = 0.0f;
+    float u = 0.0f;
+    for (uint64_t b = lane; b < blocks; b += 32u) {
+        const uint64_t i0 = b * 32u;
+        const uint64_t bn = in_dim - i0 < 32u ? in_dim - i0 : 32u;
+        const int8_t *xqb = xq + b * 32u;
+        const float xs = xscale[b];
+        const __half *gscale_h = (const __half *)(gr + b * 34u);
+        const int8_t *gqs = (const int8_t *)(gr + b * 34u + 2u);
+        const __half *uscale_h = (const __half *)(ur + b * 34u);
+        const int8_t *uqs = (const int8_t *)(ur + b * 34u + 2u);
+        const int gdot = dot_i8_block(gqs, xqb, bn, use_dp4a);
+        const int udot = dot_i8_block(uqs, xqb, bn, use_dp4a);
+        g += __half2float(*gscale_h) * xs * (float)gdot;
+        u += __half2float(*uscale_h) * xs * (float)udot;
+    }
+    g = warp_sum_f32(g);
+    u = warp_sum_f32(u);
+    if (lane == 0u) {
+        if (store_gate_up) {
+            gate[row] = g;
+            up[row] = u;
+        }
+        mid[row] = (g / (1.0f + expf(-g))) * u;
+    }
+}
+
 __global__ static void matmul_q8_0_hc_expand_preq_warp8_kernel(
         float *out_hc,
         float *block_out,

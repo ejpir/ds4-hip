@@ -7404,6 +7404,46 @@ extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
         return cuda_ok(cudaGetLastError(), "shared gate/up fused q8 launch");
     }
     if (getenv("DS4_CUDA_DISABLE_SHARED_GATE_UP_PAIR") == NULL) {
+        if (getenv("DS4_CUDA_Q8_PREQUANT_DECODE") != NULL &&
+            getenv("DS4_CUDA_DISABLE_SHARED_GATE_UP_PAIR_SWIGLU") == NULL &&
+            gate && up && mid && x && out_dim <= UINT32_MAX &&
+            gate_offset <= model_size && up_offset <= model_size &&
+            weight_bytes <= model_size - gate_offset &&
+            weight_bytes <= model_size - up_offset &&
+            x->bytes >= in_dim * sizeof(float) &&
+            gate->bytes >= out_dim * sizeof(float) &&
+            up->bytes >= out_dim * sizeof(float) &&
+            mid->bytes >= out_dim * sizeof(float)) {
+            const char *wg = cuda_model_range_ptr(model_map, gate_offset, weight_bytes, "shared_gate_q8_pair");
+            const char *wu = cuda_model_range_ptr(model_map, up_offset, weight_bytes, "shared_up_q8_pair");
+            if (!wg || !wu) return 0;
+            const uint64_t xq_bytes = blocks * 32u;
+            const uint64_t scale_offset = (xq_bytes + 15u) & ~15ull;
+            const uint64_t tmp_bytes = scale_offset + blocks * sizeof(float);
+            void *tmp = cuda_tmp_alloc(tmp_bytes, "shared gate/up pair prequant swiglu");
+            if (!tmp) return 0;
+            int8_t *xq = (int8_t *)tmp;
+            float *xscale = (float *)((char *)tmp + scale_offset);
+            const int use_dp4a = cuda_q8_use_dp4a();
+            dim3 qgrid((unsigned)blocks, 1, 1);
+            quantize_q8_0_f32_kernel<<<qgrid, 32>>>(xq, xscale, (const float *)x->ptr, in_dim, blocks);
+            if (!cuda_ok(cudaGetLastError(), "shared gate/up pair quantize launch")) return 0;
+            const int store_gate_up = (g_quality_mode || getenv("DS4_METAL_GRAPH_DUMP_PREFIX") != NULL) ? 1 : 0;
+            shared_gate_up_swiglu_q8_0_pair_preq_warp8_kernel<<<((unsigned)out_dim + 7u) / 8u, 256>>>(
+                    (float *)gate->ptr,
+                    (float *)up->ptr,
+                    (float *)mid->ptr,
+                    reinterpret_cast<const unsigned char *>(wg),
+                    reinterpret_cast<const unsigned char *>(wu),
+                    xq,
+                    xscale,
+                    in_dim,
+                    out_dim,
+                    blocks,
+                    use_dp4a,
+                    store_gate_up);
+            return cuda_ok(cudaGetLastError(), "shared gate/up pair prequant swiglu launch");
+        }
         return ds4_gpu_matmul_q8_0_pair_tensor(gate, up,
                                                  model_map, model_size,
                                                  gate_offset, up_offset,
