@@ -1239,6 +1239,7 @@ static void print_size(uint64_t bytes) {
 }
 
 #include "ds4_gpu_startup.inc"
+#include "ds4_gpu_env.inc"
 
 static void model_summary(const ds4_model *m) {
     ds4_str name = {0};
@@ -9131,10 +9132,7 @@ static bool metal_graph_alloc_raw_cap(
         bool                    enable_mtp) {
     memset(g, 0, sizeof(*g));
     g->mtp_enabled = enable_mtp;
-    const bool enable_all_row_prefill_head =
-        getenv("DS4_METAL_PREFILL_ALL_ROW_HEAD") != NULL ||
-        getenv("DS4_HIP_PREFILL_ALL_ROW_HEAD") != NULL ||
-        getenv("DS4_CUDA_PREFILL_ALL_ROW_HEAD") != NULL;
+    const bool enable_all_row_prefill_head = ds4_gpu_env_prefill_all_row_head();
     const char *spec_drafter = getenv("DS4_SPEC_DRAFTER");
     const bool enable_ngram_spec =
         (spec_drafter && (!strcmp(spec_drafter, "ngram") ||
@@ -11452,8 +11450,7 @@ static bool metal_graph_upload_token_embedding_hc(
         uint32_t            n_hc) {
 #ifdef DS4_USE_GPU_API
     if (weights->token_embd->type == DS4_TENSOR_Q8_0 &&
-        getenv("DS4_CUDA_NO_Q8_TOKEN_EMBED") == NULL &&
-        getenv("DS4_HIP_NO_Q8_TOKEN_EMBED") == NULL) {
+        !ds4_gpu_env_no_q8_token_embed()) {
         return ds4_metal_embed_token_hc_q8_0_tensor(out_hc,
                                                     model->map,
                                                     model->size,
@@ -11508,8 +11505,7 @@ static bool metal_graph_upload_prompt_embeddings_hc(
     if (tokens && n_tokens >= gpu_min) {
 #ifdef DS4_USE_GPU_API
         if (weights->token_embd->type == DS4_TENSOR_Q8_0 &&
-            getenv("DS4_CUDA_NO_Q8_TOKEN_EMBED") == NULL &&
-            getenv("DS4_HIP_NO_Q8_TOKEN_EMBED") == NULL) {
+            !ds4_gpu_env_no_q8_token_embed()) {
             return ds4_metal_embed_tokens_hc_q8_0_tensor(out_hc,
                                                          tokens,
                                                          model->map,
@@ -11614,24 +11610,6 @@ static bool ds4_profile_env_u32_matches(const char *name, uint32_t value) {
     char *end = NULL;
     unsigned long v = strtoul(s, &end, 10);
     return end != s && v == (unsigned long)value;
-}
-
-static DS4_MAYBE_UNUSED uint32_t ds4_env_u32_default2(const char *name0, const char *name1, uint32_t def) {
-    const char *s = getenv(name0);
-    if ((!s || !s[0]) && name1) s = getenv(name1);
-    if (!s || !s[0]) return def;
-    char *end = NULL;
-    unsigned long v = strtoul(s, &end, 10);
-    if (end == s) return def;
-    if (v > UINT32_MAX) return UINT32_MAX;
-    return (uint32_t)v;
-}
-
-static DS4_MAYBE_UNUSED bool ds4_env_flag_enabled(const char *name) {
-    const char *s = getenv(name);
-    if (!s || !s[0]) return false;
-    return strcmp(s, "0") != 0 && strcmp(s, "false") != 0 &&
-           strcmp(s, "off") != 0 && strcmp(s, "no") != 0;
 }
 
 static bool metal_graph_layer_stage_profile_boundary(
@@ -11858,11 +11836,8 @@ static bool metal_graph_encode_layer_attention_batch(
     }
     DS4_METAL_PROFILE_Q_STAGE("q_a_norm");
 #if defined(DS4_USE_GPU_API)
-    const bool q_head_rope_fused = getenv("DS4_CUDA_NO_HEAD_RMS_ROPE_FUSED") == NULL &&
-                                   getenv("DS4_METAL_GRAPH_DUMP_PREFIX") == NULL;
-    const bool q_b_f16_out = q_head_rope_fused &&
-                             (getenv("DS4_CUDA_ATTN_Q_B_F16_OUT") != NULL ||
-                              getenv("DS4_HIP_ATTN_Q_B_F16_OUT") != NULL);
+    const bool q_head_rope_fused = ds4_gpu_env_q_head_rope_fused();
+    const bool q_b_f16_out = q_head_rope_fused && ds4_gpu_env_attn_q_b_f16_out();
     if (q_b_f16_out) {
         if (ok) ok = ds4_metal_attn_q_b_f16_head_rms_rope_tail_tensor(g->batch_q,
                                                                       g->batch_q_half,
@@ -12988,13 +12963,7 @@ static bool metal_graph_encode_layer_attention_batch(
     }
     DS4_METAL_PROFILE_ATTN_STAGE("inv_rope");
 #if defined(DS4_USE_GPU_API)
-    const uint32_t attn_out_f16_min = ds4_env_u32_default2("DS4_CUDA_ATTENTION_OUTPUT_F16_OUT_MIN_TOKENS",
-                                                           "DS4_HIP_ATTENTION_OUTPUT_F16_OUT_MIN_TOKENS",
-                                                           0u);
-    const bool attn_out_f16 = n_tokens >= attn_out_f16_min &&
-                              (ds4_env_flag_enabled("DS4_CUDA_ATTENTION_OUTPUT_F16_OUT") ||
-                               ds4_env_flag_enabled("DS4_HIP_ATTENTION_OUTPUT_F16_OUT")) &&
-                              getenv("DS4_METAL_GRAPH_DUMP_PREFIX") == NULL;
+    const bool attn_out_f16 = ds4_gpu_env_attn_output_f16_out(n_tokens);
     if (attn_out_f16) {
         if (ok) ok = ds4_metal_attention_output_q8_batch_f16_tensor(g->batch_q_half,
                                                                     g->batch_attn_low,
@@ -13251,7 +13220,7 @@ static bool metal_graph_encode_layer_ffn_batch(
     DS4_METAL_PROFILE_FFN_STAGE("routed_moe");
     bool shared_gate_up_fused_batch = false;
 #ifdef DS4_USE_GPU_API
-    if (ok && getenv("DS4_CUDA_SHARED_GATE_UP_BATCH_FUSED") != NULL) {
+    if (ok && ds4_gpu_env_shared_gate_up_batch_fused()) {
         ok = ds4_metal_shared_gate_up_swiglu_q8_0_batch_tensor(g->batch_shared_gate,
                                                                g->batch_shared_up,
                                                                g->batch_shared_mid,
@@ -13306,14 +13275,7 @@ static bool metal_graph_encode_layer_ffn_batch(
     const bool keep_ffn_out = metal_graph_needs_ffn_out(g, il, pos0);
     bool shared_down_f16 = false;
 #if defined(DS4_USE_GPU_API)
-    const uint32_t shared_down_f16_min = ds4_env_u32_default2("DS4_CUDA_SHARED_DOWN_F16_OUT_MIN_TOKENS",
-                                                              "DS4_HIP_SHARED_DOWN_F16_OUT_MIN_TOKENS",
-                                                              0u);
-    const bool shared_down_f16_enabled = n_tokens >= shared_down_f16_min &&
-                                         (ds4_env_flag_enabled("DS4_CUDA_SHARED_DOWN_F16_OUT") ||
-                                          ds4_env_flag_enabled("DS4_HIP_SHARED_DOWN_F16_OUT")) &&
-                                         getenv("DS4_METAL_GRAPH_DUMP_PREFIX") == NULL &&
-                                         !keep_ffn_out;
+    const bool shared_down_f16_enabled = ds4_gpu_env_shared_down_f16_out(n_tokens, keep_ffn_out);
     if (ok && shared_down_f16_enabled) {
         shared_down_f16 = ds4_metal_matmul_q8_0_f16_out_tensor(g->batch_q_half,
                                                                model->map,
@@ -13959,8 +13921,7 @@ static bool metal_graph_prefill_chunked_range(
     }
     if (progress && !progress(progress_ud, "prefill_warmup_done", (int)first_chunk, prompt->len)) return false;
 
-    const bool chunk_profile = getenv("DS4_METAL_GRAPH_PREFILL_CHUNK_PROFILE") != NULL ||
-                               getenv("DS4_HIP_PREFILL_CHUNK_PROFILE") != NULL;
+    const bool chunk_profile = ds4_gpu_env_prefill_chunk_profile();
     const bool profile = getenv("DS4_METAL_GRAPH_PREFILL_PROFILE") != NULL || chunk_profile;
     const double t0 = profile ? now_sec() : 0.0;
     double encode_s = 0.0;
@@ -14087,13 +14048,8 @@ static bool metal_graph_prefill_chunked_range(
     if (show_progress) fputc('\n', stderr);
     if (last_chunk_tokens == 0) return false;
 
-    const bool all_row_head = getenv("DS4_METAL_PREFILL_ALL_ROW_HEAD") != NULL ||
-                              getenv("DS4_HIP_PREFILL_ALL_ROW_HEAD") != NULL ||
-                              getenv("DS4_CUDA_PREFILL_ALL_ROW_HEAD") != NULL;
-    const bool all_row_topk = all_row_head &&
-                              (getenv("DS4_METAL_PREFILL_ALL_ROW_TOPK") != NULL ||
-                               getenv("DS4_HIP_PREFILL_ALL_ROW_TOPK") != NULL ||
-                               getenv("DS4_CUDA_PREFILL_ALL_ROW_TOPK") != NULL);
+    const bool all_row_head = ds4_gpu_env_prefill_all_row_head();
+    const bool all_row_topk = all_row_head && ds4_gpu_env_prefill_all_row_topk();
     ds4_metal_tensor *saved_cur = g->cur_hc;
 
     if (progress && !progress(progress_ud, "prefill_head_begin", (int)end, prompt->len)) return false;
@@ -16846,7 +16802,7 @@ int ds4_engine_collect_imatrix(
     (void)ctx_size;
     (void)max_prompts;
     (void)max_tokens;
-    fprintf(stderr, "ds4: imatrix collection is not available in this HIP/ROCm merge build\n");
+    fprintf(stderr, "ds4: imatrix collection is not available in this build\n");
     return 1;
 }
 
@@ -17096,7 +17052,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     if (e->mtp_draft_tokens > 16) e->mtp_draft_tokens = 16;
     e->mtp_margin = opt->mtp_margin >= 0.0f ? opt->mtp_margin : 3.0f;
     if (opt->directional_steering_file && opt->directional_steering_file[0]) {
-        fprintf(stderr, "ds4: directional steering is not available in this HIP/ROCm merge build\n");
+        fprintf(stderr, "ds4: directional steering is not available in this build\n");
         free(e);
         *out = NULL;
         return 1;
