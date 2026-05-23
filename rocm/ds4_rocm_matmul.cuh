@@ -257,8 +257,8 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
     const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "q8_0");
     if (!wptr) return 0;
     if (n_tok == 1 && !cuda_runtime_config()->q8_prequant_decode) {
-        if (getenv("DS4_CUDA_OLDHIP_Q8_SMALL_DECODE_BLOCK") != NULL &&
-            getenv("DS4_CUDA_NO_OLDHIP_Q8_SMALL_DECODE_BLOCK") == NULL &&
+        if (cuda_env_present("DS4_CUDA_OLDHIP_Q8_SMALL_DECODE_BLOCK") &&
+            !cuda_env_present("DS4_CUDA_NO_OLDHIP_Q8_SMALL_DECODE_BLOCK") &&
             cuda_offset_in_env_range(weight_offset,
                                      "DS4_CUDA_OLDHIP_Q8_SMALL_DECODE_OFFSETS",
                                      "DS4_CUDA_OLDHIP_Q8_SMALL_DECODE_MIN_OFFSET",
@@ -274,7 +274,7 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
                     blocks * 34u);
             return cuda_ok(cudaGetLastError(), "matmul_q8_0 f32 small-block launch");
         }
-        if (getenv("DS4_CUDA_NO_OLDHIP_Q8_DECODE_SHAREDX") == NULL &&
+        if (!cuda_env_present("DS4_CUDA_NO_OLDHIP_Q8_DECODE_SHAREDX") &&
             (in_dim & 31u) == 0u && in_dim <= 8192u) {
             const unsigned rows_per_block = 32u;
             const unsigned threads = rows_per_block * 32u;
@@ -301,7 +301,7 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
     }
     if (n_tok > 1 && !cuda_runtime_config()->q8_prequant_batch) {
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
-        if ((getenv("DS4_CUDA_Q8_WMMA_ONFLY") != NULL || getenv("DS4_CUDA_Q8_WMMA_FAST") != NULL) &&
+        if ((cuda_env_present("DS4_CUDA_Q8_WMMA_ONFLY") || cuda_env_present("DS4_CUDA_Q8_WMMA_FAST")) &&
             !g_quality_mode && (in_dim % 16u) == 0u && (out_dim % 16u) == 0u &&
             n_tok >= cuda_parse_u32_env_alias("DS4_CUDA_Q8_WMMA_MIN_TOKENS", "DS4_HIP_Q8_WMMA_MIN_TOKENS", 2u, 1u, 65535u) &&
             in_dim <= UINT32_MAX && out_dim <= UINT32_MAX && n_tok <= UINT32_MAX) {
@@ -354,7 +354,7 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
             return cuda_ok(cudaGetLastError(), "matmul_q8_0 f32 batch wmma onfly launch");
         }
 #endif
-        if (getenv("DS4_CUDA_NO_OLDHIP_Q8_BATCH_SHAREDX") == NULL &&
+        if (!cuda_env_present("DS4_CUDA_NO_OLDHIP_Q8_BATCH_SHAREDX") &&
             (in_dim & 31u) == 0u && out_dim <= UINT32_MAX && n_tok <= UINT32_MAX) {
             uint32_t rows_per_block = cuda_parse_u32_env_alias("DS4_CUDA_Q8_BATCH_RPB", "DS4_HIP_Q8_BATCH_RPB", 32u, 1u, 32u);
             if (rows_per_block == 0u) rows_per_block = 32u;
@@ -464,7 +464,7 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
                 use_dp4a);
         return cuda_ok(cudaGetLastError(), "matmul_q8_0 warp launch");
     }
-    if (getenv("DS4_CUDA_NO_Q8_BATCH_WARP") == NULL && blocks <= 32u) {
+    if (!cuda_env_present("DS4_CUDA_NO_Q8_BATCH_WARP") && blocks <= 32u) {
         dim3 bgrid(((unsigned)out_dim + 7u) / 8u, (unsigned)n_tok, 1);
         matmul_q8_0_preq_batch_warp8_kernel<<<bgrid, 256>>>(
                 (float *)out->ptr,
@@ -534,8 +534,8 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
     if (!w0 || !w1) return 0;
     if (!cuda_runtime_config()->q8_prequant_decode) {
         const uint64_t max_out = out0_dim > out1_dim ? out0_dim : out1_dim;
-        if (getenv("DS4_CUDA_NO_OLDHIP_Q8_DECODE_SHAREDX") == NULL &&
-            getenv("DS4_CUDA_NO_OLDHIP_Q8_PAIR_DECODE_SHAREDX") == NULL &&
+        if (!cuda_env_present("DS4_CUDA_NO_OLDHIP_Q8_DECODE_SHAREDX") &&
+            !cuda_env_present("DS4_CUDA_NO_OLDHIP_Q8_PAIR_DECODE_SHAREDX") &&
             (in_dim & 31u) == 0u && in_dim <= 8192u) {
             const unsigned rows_per_block = 32u;
             const unsigned threads = rows_per_block * 32u;
@@ -637,8 +637,8 @@ static int cuda_matmul_q8_0_hc_expand_tensor_labeled(
          * fused kernel. */
         const int store_block_out = (g_quality_mode || cuda_runtime_config()->graph_dump) ? 1 : 0;
         if (!block_add &&
-            getenv("DS4_CUDA_SPLITK_ATTN_OUT_B") != NULL &&
-            getenv("DS4_CUDA_DISABLE_SPLITK_ATTN_OUT_B") == NULL &&
+            cuda_env_present("DS4_CUDA_SPLITK_ATTN_OUT_B") &&
+            !cuda_env_present("DS4_CUDA_DISABLE_SPLITK_ATTN_OUT_B") &&
             cuda_offset_in_env_range(weight_offset,
                                      "DS4_CUDA_SPLITK_ATTN_OUT_B_OFFSETS",
                                      "DS4_CUDA_SPLITK_ATTN_OUT_B_MIN_OFFSET",
@@ -694,8 +694,8 @@ static int cuda_matmul_q8_0_hc_expand_tensor_labeled(
             return cuda_ok(cudaGetLastError(), "matmul_q8_0_hc_expand attn_out_b splitk expand launch");
         }
         if (block_add &&
-            getenv("DS4_CUDA_SPLITK_SHARED_DOWN") != NULL &&
-            getenv("DS4_CUDA_DISABLE_SPLITK_SHARED_DOWN") == NULL &&
+            cuda_env_present("DS4_CUDA_SPLITK_SHARED_DOWN") &&
+            !cuda_env_present("DS4_CUDA_DISABLE_SPLITK_SHARED_DOWN") &&
             cuda_offset_in_env_range(weight_offset,
                                      "DS4_CUDA_SPLITK_SHARED_DOWN_OFFSETS",
                                      "DS4_CUDA_SPLITK_SHARED_DOWN_MIN_OFFSET",
@@ -752,7 +752,7 @@ static int cuda_matmul_q8_0_hc_expand_tensor_labeled(
             }
             return cuda_ok(cudaGetLastError(), "matmul_q8_0_hc_expand shared_down splitk expand launch");
         }
-        if (getenv("DS4_CUDA_NO_OLDHIP_Q8_HC_EXPAND_SHAREDX") == NULL &&
+        if (!cuda_env_present("DS4_CUDA_NO_OLDHIP_Q8_HC_EXPAND_SHAREDX") &&
             (in_dim & 31u) == 0u && in_dim <= 8192u) {
             const unsigned rows_per_block = 32u;
             const unsigned threads = rows_per_block * 32u;
@@ -833,7 +833,7 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
     const __half *w = (const __half *)wptr;
     const int ordered_router =
         n_tok == 1u &&
-        getenv("DS4_CUDA_NO_ORDERED_F16_MATMUL") == NULL;
+        !cuda_env_present("DS4_CUDA_NO_ORDERED_F16_MATMUL");
     if (g_cublas_ready && n_tok > 1) {
         const uint64_t xh_count = n_tok * in_dim;
         __half *xh = (__half *)cuda_tmp_alloc(xh_count * sizeof(__half), "f16 gemm activations");
@@ -887,8 +887,8 @@ extern "C" int ds4_gpu_matmul_f16_pair_tensor(
         return 0;
     }
     if (n_tok != 1 ||
-        getenv("DS4_CUDA_NO_F16_PAIR_MATMUL") != NULL ||
-        getenv("DS4_CUDA_NO_ORDERED_F16_MATMUL") != NULL) {
+        cuda_env_present("DS4_CUDA_NO_F16_PAIR_MATMUL") ||
+        cuda_env_present("DS4_CUDA_NO_ORDERED_F16_MATMUL")) {
         return ds4_gpu_matmul_f16_tensor(out0, model_map, model_size, weight0_offset,
                                            in_dim, out_dim, x, n_tok) &&
                ds4_gpu_matmul_f16_tensor(out1, model_map, model_size, weight1_offset,

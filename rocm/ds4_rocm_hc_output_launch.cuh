@@ -105,7 +105,7 @@ extern "C" int ds4_gpu_hc_split_weighted_sum_norm_tensor(
         uint32_t                sinkhorn_iters,
         float                   eps,
         float                   norm_eps) {
-    if (getenv("DS4_CUDA_DISABLE_HC_SPLIT_NORM_FUSED") == NULL) {
+    if (!cuda_env_present("DS4_CUDA_DISABLE_HC_SPLIT_NORM_FUSED")) {
         if (!out || !norm_out || !split || !mix || !residual_hc || !model_map ||
             n_embd == 0 || n_hc != 4) {
             return 0;
@@ -141,8 +141,8 @@ extern "C" int ds4_gpu_hc_split_weighted_sum_norm_tensor(
                     (uint64_t)n_embd * sizeof(float), "hc_norm_weight");
             if (!scale || !base || !norm_w) return 0;
             if (n_rows == 1 &&
-                getenv("DS4_CUDA_OLDHIP_HC_SPLIT_NORM") != NULL &&
-                getenv("DS4_CUDA_NO_OLDHIP_HC_SPLIT_NORM") == NULL &&
+                cuda_env_present("DS4_CUDA_OLDHIP_HC_SPLIT_NORM") &&
+                !cuda_env_present("DS4_CUDA_NO_OLDHIP_HC_SPLIT_NORM") &&
                 cuda_offset_in_env_range(norm_weight_offset,
                                          "DS4_CUDA_OLDHIP_HC_SPLIT_NORM_OFFSETS",
                                          "DS4_CUDA_OLDHIP_HC_SPLIT_NORM_MIN_OFFSET",
@@ -351,7 +351,7 @@ extern "C" int ds4_gpu_shared_down_hc_expand_q8_0_tensor(
         const ds4_gpu_tensor *split,
         uint32_t                n_embd,
         uint32_t                n_hc) {
-    if (getenv("DS4_CUDA_DISABLE_Q8_HC_EXPAND_FUSED") == NULL) {
+    if (!cuda_env_present("DS4_CUDA_DISABLE_Q8_HC_EXPAND_FUSED")) {
         return cuda_matmul_q8_0_hc_expand_tensor_labeled(out_hc, shared_out,
                                                         model_map, model_size,
                                                         weight_offset,
@@ -383,7 +383,7 @@ extern "C" int ds4_gpu_matmul_q8_0_hc_expand_tensor(
         const ds4_gpu_tensor *split,
         uint32_t                n_embd,
         uint32_t                n_hc) {
-    if (getenv("DS4_CUDA_DISABLE_Q8_HC_EXPAND_FUSED") == NULL) {
+    if (!cuda_env_present("DS4_CUDA_DISABLE_Q8_HC_EXPAND_FUSED")) {
         return cuda_matmul_q8_0_hc_expand_tensor_labeled(out_hc, block_out,
                                                         model_map, model_size,
                                                         weight_offset,

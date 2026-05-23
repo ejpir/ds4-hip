@@ -54,8 +54,8 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
     const float *sinks = (const float *)cuda_model_range_ptr(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
     if (!sinks) return 0;
-    if (getenv("DS4_CUDA_OLDHIP_ATTENTION_DECODE") != NULL &&
-        getenv("DS4_CUDA_NO_OLDHIP_ATTENTION_DECODE") == NULL &&
+    if (cuda_env_present("DS4_CUDA_OLDHIP_ATTENTION_DECODE") &&
+        !cuda_env_present("DS4_CUDA_NO_OLDHIP_ATTENTION_DECODE") &&
         cuda_offset_in_env_range(sinks_offset,
                                  "DS4_CUDA_OLDHIP_ATTENTION_DECODE_OFFSETS",
                                  "DS4_CUDA_OLDHIP_ATTENTION_DECODE_MIN_OFFSET",
@@ -84,7 +84,7 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
     }
     if (!cuda_attention_score_buffer_fits(n_comp)) {
         if (!use_mask && head_dim == 512u &&
-            getenv("DS4_CUDA_NO_WINDOW_ATTENTION") == NULL) {
+            !cuda_env_present("DS4_CUDA_NO_WINDOW_ATTENTION")) {
             dim3 online_grid(1, (n_head + 7u) / 8u, 1);
             attention_decode_mixed_heads8_online_kernel<<<online_grid, 256>>>((float *)heads->ptr,
                                                                               sinks,
@@ -129,9 +129,9 @@ extern "C" int ds4_gpu_attention_prefill_raw_heads_tensor(ds4_gpu_tensor *heads,
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
     if (!sinks) return 0;
     if (n_tokens > 1 && head_dim == 512 &&
-        getenv("DS4_CUDA_NO_WINDOW_ATTENTION") == NULL &&
-        (getenv("DS4_CUDA_WINDOW_ATTENTION") != NULL ||
-         getenv("DS4_CUDA_PREFILL_RAW_FAST") != NULL ||
+        !cuda_env_present("DS4_CUDA_NO_WINDOW_ATTENTION") &&
+        (cuda_env_present("DS4_CUDA_WINDOW_ATTENTION") ||
+         cuda_env_present("DS4_CUDA_PREFILL_RAW_FAST") ||
          (!g_quality_mode && n_tokens >= 128u)) &&
         ((window != 0u ? window : n_tokens) <= 768u)) {
         dim3 grid(n_tokens, (n_head + 7u) / 8u, 1);
@@ -149,7 +149,7 @@ extern "C" int ds4_gpu_attention_prefill_raw_heads_tensor(ds4_gpu_tensor *heads,
         return cuda_ok(cudaGetLastError(), "attention raw window launch");
     }
     if (g_cublas_ready && n_tokens > 1 && head_dim == 512 &&
-        getenv("DS4_CUDA_NO_CUBLAS_ATTENTION") == NULL) {
+        !cuda_env_present("DS4_CUDA_NO_CUBLAS_ATTENTION")) {
         const uint32_t n_keys = n_tokens;
         const uint64_t score_count = (uint64_t)n_head * n_tokens * n_keys;
         const uint64_t out_count = (uint64_t)n_head * n_tokens * head_dim;
@@ -262,7 +262,7 @@ static int attention_decode_batch_launch(
         cuda_env_flag_any3("DS4_CUDA_PREFILL_MIXED_FAST", "DS4_HIP_PREFILL_MIXED_FAST", NULL);
     if (!cuda_attention_score_buffer_fits(n_comp)) {
         if (!use_comp_mask && head_dim == 512u &&
-            getenv("DS4_CUDA_NO_WINDOW_ATTENTION") == NULL) {
+            !cuda_env_present("DS4_CUDA_NO_WINDOW_ATTENTION")) {
             dim3 online_grid(n_tokens, (n_head + 7u) / 8u, 1);
             attention_decode_mixed_heads8_online_kernel<<<online_grid, 256>>>((float *)heads->ptr,
                                                                               sinks,
@@ -285,7 +285,7 @@ static int attention_decode_batch_launch(
         return 0;
     }
     if (!use_comp_mask && n_tokens > 1 && head_dim == 512 &&
-        getenv("DS4_CUDA_NO_WINDOW_ATTENTION") == NULL &&
+        !cuda_env_present("DS4_CUDA_NO_WINDOW_ATTENTION") &&
         fast_window_attention) {
         dim3 grid(n_tokens, (n_head + 7u) / 8u, 1);
         attention_decode_mixed_heads8_online_kernel<<<grid, 256>>>((float *)heads->ptr,
@@ -402,7 +402,7 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
     if (!sinks) return 0;
     const int32_t *topk_ptr = (const int32_t *)topk->ptr;
     if (n_tokens > 1u && top_k == 512u &&
-        getenv("DS4_CUDA_NO_INDEXED_TOPK_SORT") == NULL) {
+        !cuda_env_present("DS4_CUDA_NO_INDEXED_TOPK_SORT")) {
         const uint64_t sort_bytes = (uint64_t)n_tokens * top_k * sizeof(int32_t);
         int32_t *sorted = (int32_t *)cuda_tmp_alloc(sort_bytes, "indexed attention topk sort");
         if (!sorted) return 0;
@@ -410,7 +410,7 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         if (!cuda_ok(cudaGetLastError(), "indexed attention topk sort launch")) return 0;
         topk_ptr = sorted;
     }
-    if (getenv("DS4_CUDA_INDEXED_SCALAR_DECODE") != NULL) {
+    if (cuda_env_present("DS4_CUDA_INDEXED_SCALAR_DECODE")) {
         const uint64_t total = (uint64_t)n_tokens * n_head * head_dim;
         attention_indexed_mixed_scalar_kernel<<<(unsigned)((total + 255u) / 256u), 256>>>(
                 (float *)heads->ptr,
@@ -433,8 +433,8 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         return cuda_ok(cudaGetLastError(), "attention indexed scalar launch");
     }
     if (n_tokens > 1 && head_dim == 512 && top_k <= 512u &&
-        getenv("DS4_CUDA_NO_INDEXED_HEADS8") == NULL) {
-        if (getenv("DS4_CUDA_INDEXED_TWOPASS") == NULL) {
+        !cuda_env_present("DS4_CUDA_NO_INDEXED_HEADS8")) {
+        if (!cuda_env_present("DS4_CUDA_INDEXED_TWOPASS")) {
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
             if (cuda_env_flag_any3("DS4_CUDA_INDEXED_HEADS32", "DS4_HIP_INDEXED_HEADS32", NULL) &&
                 n_head <= 64u) {
@@ -551,9 +551,9 @@ static int attention_prefill_mixed_launch(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
     if (!sinks) return 0;
     if (!use_comp_mask && n_tokens > 1 && head_dim == 512 &&
-        getenv("DS4_CUDA_NO_WINDOW_ATTENTION") == NULL &&
-        (getenv("DS4_CUDA_WINDOW_ATTENTION") != NULL ||
-         getenv("DS4_CUDA_PREFILL_MIXED_FAST") != NULL ||
+        !cuda_env_present("DS4_CUDA_NO_WINDOW_ATTENTION") &&
+        (cuda_env_present("DS4_CUDA_WINDOW_ATTENTION") ||
+         cuda_env_present("DS4_CUDA_PREFILL_MIXED_FAST") ||
          (!g_quality_mode && n_tokens >= 128u)) &&
         ((window != 0u ? window : n_tokens) + n_comp <= 768u)) {
         dim3 grid(n_tokens, (n_head + 7u) / 8u, 1);
@@ -571,7 +571,7 @@ static int attention_prefill_mixed_launch(
         return cuda_ok(cudaGetLastError(), "attention mixed window launch");
     }
     if (g_cublas_ready && n_tokens > 1 && head_dim == 512 &&
-        getenv("DS4_CUDA_NO_CUBLAS_ATTENTION") == NULL) {
+        !cuda_env_present("DS4_CUDA_NO_CUBLAS_ATTENTION")) {
         const uint32_t n_keys = n_tokens + n_comp;
         const uint64_t kv_count = (uint64_t)n_keys * head_dim;
         const uint64_t score_count = (uint64_t)n_head * n_tokens * n_keys;
@@ -738,8 +738,8 @@ extern "C" int ds4_gpu_attention_output_q8_batch_f16_tensor(
     const __half *out_a_f16 = cuda_q8_f16_ptr(model_map, out_a_offset, out_a_bytes,
                                               group_dim, low_dim, "attn_output_a");
     if (!out_a_f16) return 0;
-    const int transposed_b = getenv("DS4_CUDA_ATTENTION_OUTPUT_NO_TRANSPOSED_B_CUBLAS") == NULL &&
-                             getenv("DS4_HIP_ATTENTION_OUTPUT_NO_TRANSPOSED_B_CUBLAS") == NULL;
+    const int transposed_b = !cuda_env_present("DS4_CUDA_ATTENTION_OUTPUT_NO_TRANSPOSED_B_CUBLAS") &&
+                             !cuda_env_present("DS4_HIP_ATTENTION_OUTPUT_NO_TRANSPOSED_B_CUBLAS");
     const __half *out_b_f16_t = transposed_b
         ? cuda_q8_f16_transpose_ptr(model_map, out_b_offset, out_b_bytes,
                                     low_dim, out_dim, "attn_output_b")
@@ -859,8 +859,8 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
     const int attn_output_cublas = cuda_runtime_config()->attention_output_cublas ||
                                     cuda_runtime_config()->attention_output_cublas_all;
     if (!cuda_runtime_config()->q8_prequant_batch && !attn_output_cublas) {
-        const int prof = getenv("DS4_CUDA_ATTN_OUT_STAGE_PROFILE") != NULL ||
-                         getenv("DS4_HIP_ATTN_OUT_STAGE_PROFILE") != NULL;
+        const int prof = cuda_env_present("DS4_CUDA_ATTN_OUT_STAGE_PROFILE") ||
+                         cuda_env_present("DS4_HIP_ATTN_OUT_STAGE_PROFILE");
         cudaEvent_t ev0 = NULL, ev1 = NULL, ev2 = NULL;
         if (prof) {
             (void)cudaEventCreate(&ev0);
@@ -869,8 +869,8 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
             if (ev0) (void)cudaEventRecord(ev0, 0);
         }
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
-        if ((getenv("DS4_CUDA_Q8_WMMA_ONFLY") != NULL || getenv("DS4_CUDA_Q8_WMMA_FAST") != NULL ||
-             getenv("DS4_CUDA_ATTN_OUT_A_WMMA_ONFLY") != NULL) &&
+        if ((cuda_env_present("DS4_CUDA_Q8_WMMA_ONFLY") || cuda_env_present("DS4_CUDA_Q8_WMMA_FAST") ||
+             cuda_env_present("DS4_CUDA_ATTN_OUT_A_WMMA_ONFLY")) &&
             !g_quality_mode && (group_dim % 16u) == 0u && (rank % 16u) == 0u &&
             n_tokens >= cuda_parse_u32_env_alias("DS4_CUDA_Q8_WMMA_MIN_TOKENS", "DS4_HIP_Q8_WMMA_MIN_TOKENS", 2u, 1u, 65535u)) {
             constexpr uint32_t tiles_n = 8u, bm = 16u, bn = 16u, bk = 16u;
@@ -891,7 +891,7 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
                     blocks_a * 34u);
         } else
 #endif
-        if (getenv("DS4_CUDA_NO_OLDHIP_ATTN_OUT_A_BATCH_SHAREDX") == NULL &&
+        if (!cuda_env_present("DS4_CUDA_NO_OLDHIP_ATTN_OUT_A_BATCH_SHAREDX") &&
             (group_dim & 31u) == 0u && rank <= UINT32_MAX && n_tokens <= UINT32_MAX) {
             uint32_t rows_per_block = cuda_parse_u32_env_alias("DS4_CUDA_Q8_GROUPED_BATCH_RPB", "DS4_HIP_Q8_BATCH_RPB", 32u, 1u, 32u);
             if (rows_per_block == 0u) rows_per_block = 32u;
@@ -967,22 +967,22 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
     if (!g_quality_mode &&
         g_cublas_ready &&
         n_tokens >= out_a_cublas_min_tokens &&
-        getenv("DS4_CUDA_NO_CUBLAS_ATTENTION_OUTPUT_A") == NULL) {
+        !cuda_env_present("DS4_CUDA_NO_CUBLAS_ATTENTION_OUTPUT_A")) {
         out_a_f16 = cuda_q8_f16_ptr(model_map, out_a_offset, out_a_bytes, group_dim, low_dim, "attn_output_a");
     }
     if (out_a_f16) {
         const int packed_b =
-            getenv("DS4_CUDA_ATTENTION_OUTPUT_PACKED_B_CUBLAS") != NULL ||
-            getenv("DS4_HIP_ATTENTION_OUTPUT_PACKED_B_CUBLAS") != NULL;
+            cuda_env_present("DS4_CUDA_ATTENTION_OUTPUT_PACKED_B_CUBLAS") ||
+            cuda_env_present("DS4_HIP_ATTENTION_OUTPUT_PACKED_B_CUBLAS");
         if (packed_b &&
-            (getenv("DS4_CUDA_ATTENTION_OUTPUT_B_CUBLAS") != NULL ||
+            (cuda_env_present("DS4_CUDA_ATTENTION_OUTPUT_B_CUBLAS") ||
              cuda_runtime_config()->attention_output_cublas_all) &&
             !g_quality_mode && !cuda_runtime_config()->graph_dump) {
-            const int interleaved_b = getenv("DS4_CUDA_ATTENTION_OUTPUT_INTERLEAVED_B_CUBLAS") != NULL ||
-                                      getenv("DS4_HIP_ATTENTION_OUTPUT_INTERLEAVED_B_CUBLAS") != NULL;
+            const int interleaved_b = cuda_env_present("DS4_CUDA_ATTENTION_OUTPUT_INTERLEAVED_B_CUBLAS") ||
+                                      cuda_env_present("DS4_HIP_ATTENTION_OUTPUT_INTERLEAVED_B_CUBLAS");
             const int transposed_b = interleaved_b &&
-                                     getenv("DS4_CUDA_ATTENTION_OUTPUT_NO_TRANSPOSED_B_CUBLAS") == NULL &&
-                                     getenv("DS4_HIP_ATTENTION_OUTPUT_NO_TRANSPOSED_B_CUBLAS") == NULL;
+                                     !cuda_env_present("DS4_CUDA_ATTENTION_OUTPUT_NO_TRANSPOSED_B_CUBLAS") &&
+                                     !cuda_env_present("DS4_HIP_ATTENTION_OUTPUT_NO_TRANSPOSED_B_CUBLAS");
             const __half *out_b_f16_t = transposed_b
                 ? cuda_q8_f16_transpose_ptr(model_map, out_b_offset, out_b_bytes,
                                             low_dim, out_dim, "attn_output_b")
@@ -1174,7 +1174,7 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
         if (!cuda_ok(cudaGetLastError(), "attention_output_q8_a preq launch")) return 0;
     }
 
-    if ((getenv("DS4_CUDA_ATTENTION_OUTPUT_B_CUBLAS") != NULL ||
+    if ((cuda_env_present("DS4_CUDA_ATTENTION_OUTPUT_B_CUBLAS") ||
          cuda_runtime_config()->attention_output_cublas_all) &&
         !g_quality_mode) {
         if (cuda_matmul_q8_0_tensor_f16_gemm(out,
@@ -1271,7 +1271,7 @@ extern "C" int ds4_gpu_attention_output_low_q8_tensor(
         return cuda_ok(cudaGetLastError(), "attention_output_low_q8 splitk sum launch");
     }
     if (!cuda_runtime_config()->q8_prequant_decode) {
-        if (getenv("DS4_CUDA_NO_OLDHIP_ATTN_OUT_LOW_SHAREDX") == NULL &&
+        if (!cuda_env_present("DS4_CUDA_NO_OLDHIP_ATTN_OUT_LOW_SHAREDX") &&
             (group_dim & 31u) == 0u && group_dim <= 4096u && (rank % 64u) == 0u) {
             const unsigned rows_per_block = 64u;
             grouped_q8_0_a_f32_sharedx_rows_w32_2row_kernel<<<

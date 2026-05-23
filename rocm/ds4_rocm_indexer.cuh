@@ -1081,7 +1081,7 @@ static int indexer_scores_launch(
     }
     if (causal && ratio == 0) return 0;
     if (n_tokens == 1u && head_dim == 128u && n_head == 64u &&
-        getenv("DS4_CUDA_NO_INDEXER_DIRECT_ONE") == NULL) {
+        !cuda_env_present("DS4_CUDA_NO_INDEXER_DIRECT_ONE")) {
         indexer_score_one_direct_kernel<<<n_comp, 128>>>((float *)scores->ptr,
                                                          (const float *)q->ptr,
                                                          (const float *)weights->ptr,
@@ -1091,8 +1091,8 @@ static int indexer_scores_launch(
         return cuda_ok(cudaGetLastError(), "indexer score one direct launch");
     }
     if (!g_quality_mode && head_dim == 128u && n_head == 64u &&
-        getenv("DS4_CUDA_NO_INDEXER_WMMA") == NULL) {
-        if (getenv("DS4_CUDA_NO_INDEXER_WMMA128") == NULL) {
+        !cuda_env_present("DS4_CUDA_NO_INDEXER_WMMA")) {
+        if (!cuda_env_present("DS4_CUDA_NO_INDEXER_WMMA128")) {
             dim3 grid((n_comp + 127u) / 128u, (n_tokens + 15u) / 16u, 1);
             indexer_scores_wmma128_kernel<<<grid, 256>>>((float *)scores->ptr,
                                                          (const float *)q->ptr,
@@ -1101,7 +1101,7 @@ static int indexer_scores_launch(
                                                          n_comp, n_tokens, pos0, n_head,
                                                          head_dim, ratio, scale, causal ? 1 : 0);
             return cuda_ok(cudaGetLastError(), "indexer scores wmma128 launch");
-        } else if (getenv("DS4_CUDA_NO_INDEXER_WMMA64") == NULL) {
+        } else if (!cuda_env_present("DS4_CUDA_NO_INDEXER_WMMA64")) {
             dim3 grid((n_comp + 63u) / 64u, (n_tokens + 15u) / 16u, 1);
             indexer_scores_wmma64_kernel<<<grid, 128>>>((float *)scores->ptr,
                                                         (const float *)q->ptr,
@@ -1110,7 +1110,7 @@ static int indexer_scores_launch(
                                                         n_comp, n_tokens, pos0, n_head,
                                                         head_dim, ratio, scale, causal ? 1 : 0);
             return cuda_ok(cudaGetLastError(), "indexer scores wmma64 launch");
-        } else if (getenv("DS4_CUDA_NO_INDEXER_WMMA32") == NULL) {
+        } else if (!cuda_env_present("DS4_CUDA_NO_INDEXER_WMMA32")) {
             dim3 grid((n_comp + 31u) / 32u, (n_tokens + 15u) / 16u, 1);
             indexer_scores_wmma32_kernel<<<grid, 64>>>((float *)scores->ptr,
                                                        (const float *)q->ptr,
@@ -1197,21 +1197,21 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
         return 0;
     }
     if (top_k == 512u && n_comp <= 1024u &&
-        getenv("DS4_CUDA_NO_TOPK1024") == NULL) {
+        !cuda_env_present("DS4_CUDA_NO_TOPK1024")) {
         indexer_topk_1024_kernel<<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
                                                      (const float *)scores->ptr,
                                                      n_comp, n_tokens, top_k);
         return cuda_ok(cudaGetLastError(), "indexer topk 1024 launch");
     }
     if (top_k == 512u && n_comp <= 2048u &&
-        getenv("DS4_CUDA_NO_TOPK2048") == NULL) {
+        !cuda_env_present("DS4_CUDA_NO_TOPK2048")) {
         indexer_topk_pow2_kernel<2048><<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
                                                            (const float *)scores->ptr,
                                                            n_comp, n_tokens, top_k);
         return cuda_ok(cudaGetLastError(), "indexer topk 2048 launch");
     }
     if (top_k == 512u && n_comp <= 4096u &&
-        getenv("DS4_CUDA_NO_TOPK2048") == NULL) {
+        !cuda_env_present("DS4_CUDA_NO_TOPK2048")) {
         if (n_comp == 4096u) {
             using TopkCubSort = cub::BlockRadixSort<uint64_t, 512, 16>;
             const int smem = (int)sizeof(typename TopkCubSort::TempStorage);
@@ -1241,8 +1241,8 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
         return cuda_ok(cudaGetLastError(), "indexer topk 4096 launch");
     }
     if (top_k == 512u && n_comp <= 8192u &&
-        getenv("DS4_CUDA_NO_TOPK2048") == NULL &&
-        getenv("DS4_CUDA_NO_TOPK8192") == NULL) {
+        !cuda_env_present("DS4_CUDA_NO_TOPK2048") &&
+        !cuda_env_present("DS4_CUDA_NO_TOPK8192")) {
         if (n_comp > 4096u) {
             using TopkCubSort = cub::BlockRadixSort<uint64_t, 512, 16>;
             const int smem = (int)sizeof(typename TopkCubSort::TempStorage);
@@ -1271,8 +1271,8 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
                                                                n_comp, n_tokens, top_k);
         return cuda_ok(cudaGetLastError(), "indexer topk 8192 launch");
     }
-    if (top_k == 512u && getenv("DS4_CUDA_NO_TOPK2048") == NULL &&
-        getenv("DS4_CUDA_NO_TOPK_CHUNKED") == NULL) {
+    if (top_k == 512u && !cuda_env_present("DS4_CUDA_NO_TOPK2048") &&
+        !cuda_env_present("DS4_CUDA_NO_TOPK_CHUNKED")) {
         const uint32_t chunk_n = 4096u;
         const uint32_t n_chunks = (n_comp + chunk_n - 1u) / chunk_n;
         const uint32_t candidate_stride = n_chunks * top_k;

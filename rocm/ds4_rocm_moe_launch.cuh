@@ -124,7 +124,7 @@ static int routed_moe_launch(
     if (!q2k_path && down->bytes >= xq_bytes && gate->bytes >= midq_bytes) {
         cuda_block_q8_K *xq = (cuda_block_q8_K *)down->ptr;
         cuda_block_q8_K *midq = (cuda_block_q8_K *)gate->ptr;
-        const uint32_t profile_moe = getenv("DS4_CUDA_MOE_PROFILE") != NULL;
+        const uint32_t profile_moe = cuda_env_present("DS4_CUDA_MOE_PROFILE");
         cudaEvent_t prof_ev[7] = {NULL, NULL, NULL, NULL, NULL, NULL, NULL};
         if (profile_moe) {
             for (uint32_t i = 0; i < 7u; i++) {
@@ -138,45 +138,45 @@ static int routed_moe_launch(
         }
         const uint32_t pair_count = n_tokens * n_expert;
         const uint32_t use_sorted_pairs = n_tokens > 1u;
-        const uint32_t use_expert_tiles = use_sorted_pairs && getenv("DS4_CUDA_MOE_NO_EXPERT_TILES") == NULL;
-        const uint32_t expert_tile_m = getenv("DS4_CUDA_MOE_TILE4") ? 4u : 8u;
-        const uint32_t write_gate_up = getenv("DS4_CUDA_MOE_WRITE_GATE_UP") != NULL;
-        const uint32_t use_p2_sorted = use_sorted_pairs && getenv("DS4_CUDA_MOE_NO_P2") == NULL;
+        const uint32_t use_expert_tiles = use_sorted_pairs && !cuda_env_present("DS4_CUDA_MOE_NO_EXPERT_TILES");
+        const uint32_t expert_tile_m = cuda_env_present("DS4_CUDA_MOE_TILE4") ? 4u : 8u;
+        const uint32_t write_gate_up = cuda_env_present("DS4_CUDA_MOE_WRITE_GATE_UP");
+        const uint32_t use_p2_sorted = use_sorted_pairs && !cuda_env_present("DS4_CUDA_MOE_NO_P2");
         const uint32_t use_atomic_down = use_expert_tiles &&
-            (getenv("DS4_CUDA_MOE_ATOMIC_DOWN") != NULL ||
-             (n_tokens >= 128u && getenv("DS4_CUDA_MOE_NO_ATOMIC_DOWN") == NULL));
+            (cuda_env_present("DS4_CUDA_MOE_ATOMIC_DOWN") ||
+             (n_tokens >= 128u && !cuda_env_present("DS4_CUDA_MOE_NO_ATOMIC_DOWN")));
         const uint32_t use_gate_row2048 = use_expert_tiles && expert_tile_m == 8u &&
-            (getenv("DS4_CUDA_MOE_GATE_ROW2048") != NULL ||
-             getenv("DS4_CUDA_MOE_GATE_ROW256") != NULL ||
-             getenv("DS4_CUDA_MOE_GATE_ROW128") != NULL ||
+            (cuda_env_present("DS4_CUDA_MOE_GATE_ROW2048") ||
+             cuda_env_present("DS4_CUDA_MOE_GATE_ROW256") ||
+             cuda_env_present("DS4_CUDA_MOE_GATE_ROW128") ||
              (n_tokens >= 128u &&
-              getenv("DS4_CUDA_MOE_NO_GATE_ROW2048") == NULL &&
-              getenv("DS4_CUDA_MOE_NO_GATE_ROW256") == NULL &&
-              getenv("DS4_CUDA_MOE_NO_GATE_ROW128") == NULL));
+              !cuda_env_present("DS4_CUDA_MOE_NO_GATE_ROW2048") &&
+              !cuda_env_present("DS4_CUDA_MOE_NO_GATE_ROW256") &&
+              !cuda_env_present("DS4_CUDA_MOE_NO_GATE_ROW128")));
         const uint32_t use_down_tile16 = use_atomic_down && expert_tile_m == 8u &&
-            n_tokens >= 128u && getenv("DS4_CUDA_MOE_NO_DOWN_TILE16") == NULL;
+            n_tokens >= 128u && !cuda_env_present("DS4_CUDA_MOE_NO_DOWN_TILE16");
         const uint32_t use_decode_lut_gate =
             n_tokens == 1u && xq_blocks <= 16u &&
-            getenv("DS4_CUDA_MOE_NO_DECODE_LUT_GATE") == NULL;
+            !cuda_env_present("DS4_CUDA_MOE_NO_DECODE_LUT_GATE");
         const uint32_t gate_row_span =
-            getenv("DS4_CUDA_MOE_GATE_ROW512") != NULL ? 512u :
-            getenv("DS4_CUDA_MOE_GATE_ROW2048") != NULL ? 2048u : 1024u;
+            cuda_env_present("DS4_CUDA_MOE_GATE_ROW512") ? 512u :
+            cuda_env_present("DS4_CUDA_MOE_GATE_ROW2048") ? 2048u : 1024u;
         const uint32_t down_row_span =
-            getenv("DS4_CUDA_MOE_DOWN_ROW512") != NULL ? 512u :
-            getenv("DS4_CUDA_MOE_DOWN_ROW1024") != NULL ? 1024u : 2048u;
+            cuda_env_present("DS4_CUDA_MOE_DOWN_ROW512") ? 512u :
+            cuda_env_present("DS4_CUDA_MOE_DOWN_ROW1024") ? 1024u : 2048u;
         const uint32_t use_down_row2048 = use_atomic_down && expert_tile_m == 8u &&
-            (getenv("DS4_CUDA_MOE_DOWN_ROW2048") != NULL ||
-             getenv("DS4_CUDA_MOE_DOWN_ROW256") != NULL ||
-             getenv("DS4_CUDA_MOE_DOWN_ROW128") != NULL ||
-             getenv("DS4_CUDA_MOE_DOWN_ROW64") != NULL ||
+            (cuda_env_present("DS4_CUDA_MOE_DOWN_ROW2048") ||
+             cuda_env_present("DS4_CUDA_MOE_DOWN_ROW256") ||
+             cuda_env_present("DS4_CUDA_MOE_DOWN_ROW128") ||
+             cuda_env_present("DS4_CUDA_MOE_DOWN_ROW64") ||
              (use_down_tile16 &&
-              getenv("DS4_CUDA_MOE_NO_DOWN_ROW2048") == NULL &&
-              getenv("DS4_CUDA_MOE_NO_DOWN_ROW256") == NULL &&
-              getenv("DS4_CUDA_MOE_NO_DOWN_ROW128") == NULL &&
-              getenv("DS4_CUDA_MOE_NO_DOWN_ROW64") == NULL));
+              !cuda_env_present("DS4_CUDA_MOE_NO_DOWN_ROW2048") &&
+              !cuda_env_present("DS4_CUDA_MOE_NO_DOWN_ROW256") &&
+              !cuda_env_present("DS4_CUDA_MOE_NO_DOWN_ROW128") &&
+              !cuda_env_present("DS4_CUDA_MOE_NO_DOWN_ROW64")));
         const uint32_t use_direct_down_sum6 =
             n_tokens == 1u && n_expert == 6u &&
-            getenv("DS4_CUDA_MOE_NO_DIRECT_DOWN_SUM6") == NULL;
+            !cuda_env_present("DS4_CUDA_MOE_NO_DIRECT_DOWN_SUM6");
         uint32_t *sorted_pairs = NULL;
         uint32_t *sorted_offsets = NULL;
         uint32_t *sorted_counts = NULL;
@@ -578,7 +578,7 @@ static int routed_moe_launch(
         n_tokens >= cuda_parse_u32_env_alias("DS4_CUDA_MOE_EXPERT_MIN_TOKENS",
                                              "DS4_HIP_MOE_EXPERT_MIN_TOKENS",
                                              32u, 1u, 65535u) &&
-        getenv("DS4_CUDA_NO_MOE_Q2_EXPERT_BATCH") == NULL &&
+        !cuda_env_present("DS4_CUDA_NO_MOE_Q2_EXPERT_BATCH") &&
         !cuda_runtime_config()->graph_dump) {
         const uint32_t pair_count = n_tokens * n_expert;
         const uint64_t counts_bytes = 256ull * sizeof(uint32_t);
@@ -594,8 +594,8 @@ static int routed_moe_launch(
         const uint32_t wmma_tile_capacity = (pair_count + 127u) / 128u + 256u;
         const uint64_t wmma_tile_bytes = (uint64_t)wmma_tile_capacity * sizeof(uint32_t);
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
-        const int moe_wmma_hot = (getenv("DS4_CUDA_MOE_WMMA_HOT") != NULL ||
-                                  getenv("DS4_HIP_MOE_WMMA_HOT") != NULL) &&
+        const int moe_wmma_hot = (cuda_env_present("DS4_CUDA_MOE_WMMA_HOT") ||
+                                  cuda_env_present("DS4_HIP_MOE_WMMA_HOT")) &&
                                  expert_in_dim % 16u == 0u && expert_mid_dim % 16u == 0u && out_dim % 16u == 0u;
 #else
         const int moe_wmma_hot = 0;
@@ -690,7 +690,7 @@ static int routed_moe_launch(
         __half *dense_gate_h = moe_dense_hot ? (__half *)(scratch + dense_gate_off) : NULL;
         __half *dense_up_h = moe_dense_hot ? (__half *)(scratch + dense_up_off) : NULL;
         __half *dense_down_h = moe_dense_hot ? (__half *)(scratch + dense_down_off) : NULL;
-        const uint32_t profile_q2_moe = getenv("DS4_CUDA_MOE_PROFILE") != NULL;
+        const uint32_t profile_q2_moe = cuda_env_present("DS4_CUDA_MOE_PROFILE");
         cudaEvent_t q2_prof[7] = {NULL, NULL, NULL, NULL, NULL, NULL, NULL};
         if (profile_q2_moe) {
             for (uint32_t i = 0; i < 7u; i++) {
@@ -1707,7 +1707,7 @@ static int routed_moe_launch(
     }
 
     if (q2k_path && n_expert == 6u &&
-        getenv("DS4_CUDA_NO_OLDHIP_MOE_Q2_ROWS") == NULL) {
+        !cuda_env_present("DS4_CUDA_NO_OLDHIP_MOE_Q2_ROWS")) {
         uint32_t rows_per_block = cuda_parse_u32_env_alias("DS4_CUDA_MOE_DECODE_RPB", "DS4_HIP_MOE_DECODE_RPB", 8u, 1u, 32u);
         if (rows_per_block != 1u && rows_per_block != 2u && rows_per_block != 4u &&
             rows_per_block != 8u && rows_per_block != 16u && rows_per_block != 32u) rows_per_block = 8u;

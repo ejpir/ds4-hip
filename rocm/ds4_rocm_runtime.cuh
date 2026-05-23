@@ -350,8 +350,13 @@ static int cuda_offset_in_env_range(uint64_t offset, const char *list_name, cons
     return 1;
 }
 
+static int cuda_env_present(const char *name) {
+    const char *env = name ? getenv(name) : NULL;
+    return env != NULL;
+}
+
 static int cuda_env_flag(const char *name) {
-    const char *env = getenv(name);
+    const char *env = name ? getenv(name) : NULL;
     return env != NULL && env[0] != '\0' && strcmp(env, "0") != 0;
 }
 
@@ -390,7 +395,7 @@ static const ds4_rocm_runtime_config *cuda_runtime_config(void) {
         g_rocm_cfg.attention_output_cublas_all = cuda_env_flag("DS4_CUDA_ATTENTION_OUTPUT_CUBLAS_ALL");
         g_rocm_cfg.shared_expert_cublas = cuda_env_flag("DS4_CUDA_SHARED_EXPERT_CUBLAS");
         g_rocm_cfg.shared_down_cublas = cuda_env_flag("DS4_CUDA_SHARED_DOWN_CUBLAS");
-        g_rocm_cfg.graph_dump = getenv("DS4_METAL_GRAPH_DUMP_PREFIX") != NULL;
+        g_rocm_cfg.graph_dump = cuda_env_present("DS4_METAL_GRAPH_DUMP_PREFIX");
         g_rocm_cfg.initialized = 1;
     }
     return &g_rocm_cfg;

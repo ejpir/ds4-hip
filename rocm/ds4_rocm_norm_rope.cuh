@@ -456,7 +456,7 @@ extern "C" int ds4_gpu_dsv4_qkv_rms_norm_rows_tensor(
         uint32_t                kv_n,
         uint32_t                rows,
         float                   eps) {
-    if (getenv("DS4_CUDA_DISABLE_QKV_RMS_FUSED") == NULL) {
+    if (!cuda_env_present("DS4_CUDA_DISABLE_QKV_RMS_FUSED")) {
         if (!q_out || !q || !kv_out || !kv || !model_map ||
             q_weight_offset > model_size ||
             kv_weight_offset > model_size ||

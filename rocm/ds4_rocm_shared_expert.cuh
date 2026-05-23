@@ -29,7 +29,7 @@ extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
         const char *wu = cuda_model_range_ptr(model_map, up_offset, weight_bytes, "shared_up_q8");
         if (!wg || !wu) return 0;
         const int store_gate_up = (g_quality_mode || cuda_runtime_config()->graph_dump) ? 1 : 0;
-        if (getenv("DS4_CUDA_NO_OLDHIP_SHARED_GATE_UP_ROWS") == NULL) {
+        if (!cuda_env_present("DS4_CUDA_NO_OLDHIP_SHARED_GATE_UP_ROWS")) {
             const unsigned rows_per_block = 32u;
             shared_gate_up_swiglu_q8_0_rows_w32_kernel<<<
                     (unsigned)((out_dim + rows_per_block - 1u) / rows_per_block),
