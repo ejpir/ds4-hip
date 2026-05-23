@@ -674,6 +674,242 @@ static int ds4_gpu_use_compressor_pair_nr4(void) {
     return enabled;
 }
 
+static int ds4_gpu_device_name_contains(const char *needle);
+
+static int ds4_gpu_env_value_eq(const char *v, size_t n, const char *literal) {
+    size_t m = strlen(literal);
+    if (n != m) return 0;
+    for (size_t i = 0; i < n; i++) {
+        if (tolower((unsigned char)v[i]) != tolower((unsigned char)literal[i])) return 0;
+    }
+    return 1;
+}
+
+static int ds4_gpu_env_bool(const char *name) {
+    const char *v = getenv(name);
+    if (!v) return -1;
+
+    while (isspace((unsigned char)*v)) v++;
+    size_t n = strlen(v);
+    while (n > 0 && isspace((unsigned char)v[n - 1])) n--;
+    if (n == 0) return 1;
+
+    if (ds4_gpu_env_value_eq(v, n, "1") ||
+        ds4_gpu_env_value_eq(v, n, "true") ||
+        ds4_gpu_env_value_eq(v, n, "yes") ||
+        ds4_gpu_env_value_eq(v, n, "on")) {
+        return 1;
+    }
+    if (ds4_gpu_env_value_eq(v, n, "0") ||
+        ds4_gpu_env_value_eq(v, n, "false") ||
+        ds4_gpu_env_value_eq(v, n, "no") ||
+        ds4_gpu_env_value_eq(v, n, "off")) {
+        return 0;
+    }
+
+    if (!g_mpp_invalid_env_reported) {
+        fprintf(stderr,
+                "ds4: invalid Metal boolean environment value %s=%.*s; treating presence as enabled\n",
+                name, (int)n, v);
+        g_mpp_invalid_env_reported = 1;
+    }
+    return 1;
+}
+
+static int ds4_gpu_mpp_available(void) {
+    return g_metal4_tensor_api_enabled && !g_quality_mode;
+}
+
+/*
+ * Retained Metal4 defaults live here instead of behind user-visible options.
+ * The public runtime has one automatic accelerated path plus the global
+ * DS4_METAL_DISABLE_METAL4 comparison switch.  Benchmark-only alternatives that
+ * lost during M5 work are removed or kept out of the dispatch path so future
+ * changes do not accidentally turn old experiments into new modes.
+ */
+static int ds4_gpu_mpp_moe_fast_layout(void) {
+    /* This layout stores the routed RHS in the order consumed by the TensorOps
+     * kernel.  It is the retained MoE prefill win.  The 64-token-tile and
+     * paired gate/up variants were slower on the DS4 expert shape, so they are
+     * not kept as alternate runtime paths. */
+    return 1;
+}
+
+static int ds4_gpu_use_mpp_attn_out_low_matmul(void) {
+    return ds4_gpu_mpp_available();
+}
+
+enum {
+    DS4_METAL_ATTN_OUT_MPP_TILE_N = 64,
+
+    DS4_METAL_MOE_MPP_GATE = 1 << 0,
+    DS4_METAL_MOE_MPP_UP   = 1 << 1,
+    DS4_METAL_MOE_MPP_DOWN = 1 << 2,
+    DS4_METAL_MOE_MPP_TILE_N = 32,
+
+    DS4_METAL_MOE_MPP_DEFAULT_GATE_LAYER = 0,
+    DS4_METAL_MOE_MPP_DEFAULT_UP_LAYER   = 0,
+    DS4_METAL_MOE_MPP_DEFAULT_DOWN_LAYER = 0,
+};
+
+static int ds4_gpu_mpp_routed_moe_default_target(void) {
+    return ds4_gpu_mpp_available();
+}
+
+static int ds4_gpu_mpp_routed_moe_stage_mask(void) {
+    if (!ds4_gpu_mpp_routed_moe_default_target()) return 0;
+    /*
+     * Keep TensorOps on every routed-MoE layer, but do not put both SwiGLU
+     * operands on TensorOps.  The gate and up projections feed
+     * silu(gate) * up; each TensorOps projection is locally close to the legacy
+     * simdgroup path, but moving both operands changes the product enough to
+     * flip later router top-k decisions.  Once a router changes experts the
+     * graph diverges discontinuously and can fall into repetition on sensitive
+     * prompts.  Accelerating only the linear up operand, plus the down
+     * projection, keeps the retained speedup without relying on layer cutoffs.
+     */
+    return DS4_METAL_MOE_MPP_UP |
+           DS4_METAL_MOE_MPP_DOWN;
+}
+
+static int ds4_gpu_mpp_routed_moe_mask_for_layer(uint32_t layer_index) {
+    const int requested_mask = ds4_gpu_mpp_routed_moe_stage_mask();
+    if (!requested_mask) return 0;
+
+    int mask = 0;
+    if ((int)layer_index >= DS4_METAL_MOE_MPP_DEFAULT_DOWN_LAYER) mask |= DS4_METAL_MOE_MPP_DOWN;
+    if ((int)layer_index >= DS4_METAL_MOE_MPP_DEFAULT_UP_LAYER)   mask |= DS4_METAL_MOE_MPP_UP;
+    if ((int)layer_index >= DS4_METAL_MOE_MPP_DEFAULT_GATE_LAYER) mask |= DS4_METAL_MOE_MPP_GATE;
+    return mask & requested_mask;
+}
+
+static void ds4_gpu_warn_mpp_fallback(void) {
+    static int warned;
+    if (!warned) {
+        fprintf(stderr, "ds4: accelerated Metal prefill matmul unavailable; falling back to legacy kernel\n");
+        warned = 1;
+    }
+}
+
+static int ds4_gpu_device_name_contains(const char *needle) {
+    return g_metal_device_name[0] != '\0' && strstr(g_metal_device_name, needle) != NULL;
+}
+
+static int ds4_gpu_compile_tensor_probe(void) {
+#if defined(__MAC_OS_X_VERSION_MAX_ALLOWED) && __MAC_OS_X_VERSION_MAX_ALLOWED >= 260000
+    if (!g_device) return 0;
+    if (@available(macOS 26.0, *)) {
+        const char *src =
+            "#include <metal_stdlib>\n"
+            "#include <metal_tensor>\n"
+            "#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>\n"
+            "using namespace metal;\n"
+            "using namespace mpp::tensor_ops;\n"
+            "kernel void ds4_tensor_probe(\n"
+            "        tensor<device half,  dextents<int32_t, 2>> A [[buffer(0)]],\n"
+            "        tensor<device half,  dextents<int32_t, 2>> B [[buffer(1)]],\n"
+            "        device float *C [[buffer(2)]],\n"
+            "        uint2 tgid [[threadgroup_position_in_grid]]) {\n"
+            "    auto tA = A.slice(0, (int)tgid.y);\n"
+            "    auto tB = B.slice((int)tgid.x, 0);\n"
+            "    matmul2d<matmul2d_descriptor(16, 16, dynamic_extent), execution_simdgroups<4>> mm;\n"
+            "    auto cT = mm.get_destination_cooperative_tensor<decltype(tA), decltype(tB), float>();\n"
+            "    auto sA = tA.slice(0, 0);\n"
+            "    auto sB = tB.slice(0, 0);\n"
+            "    mm.run(sB, sA, cT);\n"
+            "    auto tC = tensor<device float, dextents<int32_t, 2>, tensor_inline>(C, dextents<int32_t, 2>(16, 16));\n"
+            "    cT.store(tC);\n"
+            "}\n";
+
+        NSError *error = nil;
+        NSString *source = [NSString stringWithUTF8String:src];
+        id<MTLLibrary> probe_library = [g_device newLibraryWithSource:source options:[MTLCompileOptions new] error:&error];
+        if (!probe_library) {
+            fprintf(stderr, "ds4: Metal 4 tensor API probe compile failed: %s\n",
+                    error ? [[error localizedDescription] UTF8String] : "(unknown)");
+            return 0;
+        }
+        id<MTLFunction> fn = [probe_library newFunctionWithName:@"ds4_tensor_probe"];
+        if (!fn) {
+            fprintf(stderr, "ds4: Metal 4 tensor API probe function missing\n");
+            return 0;
+        }
+        error = nil;
+        id<MTLComputePipelineState> pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        if (!pipeline) {
+            fprintf(stderr, "ds4: Metal 4 tensor API probe pipeline failed: %s\n",
+                    error ? [[error localizedDescription] UTF8String] : "(unknown)");
+            return 0;
+        }
+        return 1;
+    }
+#endif
+    return 0;
+}
+
+static void ds4_gpu_detect_metal4_features(void) {
+    g_metal4_runtime_available = 0;
+    g_metal4_family_supported = 0;
+    g_metal4_queue_supported = 0;
+    g_metal4_m5_neural_accelerators_hint = 0;
+    g_metal4_tensor_api_enabled = 0;
+    g_metal4_tensor_api_compile_supported = 0;
+    g_metal_device_name[0] = '\0';
+
+    if (!g_device) return;
+
+    const char *name = [[g_device name] UTF8String];
+    if (name) {
+        snprintf(g_metal_device_name, sizeof(g_metal_device_name), "%s", name);
+    }
+
+    const int metal4_disabled = ds4_gpu_env_bool("DS4_METAL_DISABLE_METAL4") > 0;
+
+#if defined(__MAC_OS_X_VERSION_MAX_ALLOWED) && __MAC_OS_X_VERSION_MAX_ALLOWED >= 260000
+    if (@available(macOS 26.0, *)) {
+        g_metal4_runtime_available = 1;
+        g_metal4_family_supported =
+            !metal4_disabled && [g_device supportsFamily:MTLGPUFamilyMetal4] ? 1 : 0;
+        g_metal4_queue_supported = [g_device respondsToSelector:@selector(newMTL4CommandQueue)] ? 1 : 0;
+
+        /*
+         * Apple does not currently expose a separate "Neural Accelerator" bit
+         * through Metal. On public M5 systems the hardware signal is the device
+         * generation plus Metal 4 support, so keep this as a conservative hint.
+         */
+        if (g_metal4_family_supported && ds4_gpu_device_name_contains("M5")) {
+            g_metal4_m5_neural_accelerators_hint = 1;
+        }
+
+        if (g_metal4_family_supported) {
+            const int default_enable =
+                ds4_gpu_device_name_contains("M5") ||
+                ds4_gpu_device_name_contains("M6") ||
+                ds4_gpu_device_name_contains("A19") ||
+                ds4_gpu_device_name_contains("A20");
+
+            /*
+             * Metal 4 TensorOps are portable in source, but on pre-M5 hardware
+             * they can map to ordinary shader fallbacks.  Keep the automatic
+             * fast path restricted to hardware generations where the Neural
+             * Accelerator/TensorOps path is expected to pay off; older Metal
+             * machines continue to use the established kernels unless a future
+             * device is explicitly added here.
+             */
+            if (default_enable) {
+                g_metal4_tensor_api_compile_supported = ds4_gpu_compile_tensor_probe();
+                g_metal4_tensor_api_enabled = g_metal4_tensor_api_compile_supported;
+                if (!g_metal4_tensor_api_enabled) {
+                    fprintf(stderr, "ds4: Metal 4 tensor API probe failed; using legacy Metal kernels\n");
+                }
+            } else {
+                fprintf(stderr, "ds4: Metal 4 tensor API disabled for pre-M5/pre-A19 devices\n");
+            }
+        }
+    }
+#endif
+}
+
 static int ds4_gpu_warm_model_views(void) {
     if (g_model_view_count == 0) return 1;
 
