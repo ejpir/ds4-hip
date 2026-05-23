@@ -9325,7 +9325,9 @@ static int routed_moe_launch(
 
     if (q2k_path && n_expert == 6u &&
         getenv("DS4_CUDA_NO_OLDHIP_MOE_Q2_ROWS") == NULL) {
-        const uint32_t rows_per_block = 8u;
+        uint32_t rows_per_block = cuda_parse_u32_env_alias("DS4_CUDA_MOE_DECODE_RPB", "DS4_HIP_MOE_DECODE_RPB", 8u, 1u, 32u);
+        if (rows_per_block != 1u && rows_per_block != 2u && rows_per_block != 4u &&
+            rows_per_block != 8u && rows_per_block != 16u && rows_per_block != 32u) rows_per_block = 8u;
         const uint32_t threads = rows_per_block * 32u;
         const int store_gate_up = (g_quality_mode || getenv("DS4_METAL_GRAPH_DUMP_PREFIX") != NULL) ? 1 : 0;
         dim3 gate_grid((expert_mid_dim + rows_per_block - 1u) / rows_per_block, n_tokens * n_expert, 1);
