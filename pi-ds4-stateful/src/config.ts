@@ -16,6 +16,17 @@ function envInt(name: string, fallback: number, min: number, max: number): numbe
 	return Math.max(min, Math.min(max, n));
 }
 
+function envFloat(names: string[], fallback: number, min: number, max: number): number {
+	for (const name of names) {
+		const raw = process.env[name];
+		if (!raw) continue;
+		const n = Number.parseFloat(raw);
+		if (!Number.isFinite(n)) continue;
+		return Math.max(min, Math.min(max, n));
+	}
+	return fallback;
+}
+
 export function parseUserTurnPolicy(value: unknown): UserTurnPolicy | undefined {
 	return value === "auto" || value === "reset" || value === "delta" ? value : undefined;
 }
@@ -55,5 +66,9 @@ export function loadRuntimeConfig(): RuntimeConfig {
 		readGuardMode: envReadGuardMode(),
 		turnFocusEnabled: process.env.PI_DS4_TURN_FOCUS !== "0",
 		userTurnPolicy: envUserTurnPolicy(),
+		presencePenalty: envFloat(["PI_DS4_PRESENCE_PENALTY", "DS4_STATEFUL_PRESENCE_PENALTY"], 0, -2, 2),
+		frequencyPenalty: envFloat(["PI_DS4_FREQUENCY_PENALTY", "DS4_STATEFUL_FREQUENCY_PENALTY"], 0, -2, 2),
+		repeatPenalty: envFloat(["PI_DS4_REPEAT_PENALTY", "DS4_STATEFUL_REPEAT_PENALTY"], 1, 1, 10),
+		repeatLastN: envInt("PI_DS4_REPEAT_LAST_N", envInt("DS4_STATEFUL_REPEAT_LAST_N", 1024, 0, 1048576), 0, 1048576),
 	};
 }

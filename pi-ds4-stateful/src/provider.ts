@@ -11,6 +11,16 @@ function isStatefulConflict(event: AssistantMessageEvent, pending: PendingCommit
 	return msg.includes("HTTP 409") || msg.includes("stateful continuation state");
 }
 
+function applySamplingConfig(payload: unknown, config: RuntimeConfig): unknown {
+	if (!payload || typeof payload !== "object") return payload;
+	const out = payload as Record<string, unknown>;
+	if (config.presencePenalty !== 0) out.presence_penalty = config.presencePenalty;
+	if (config.frequencyPenalty !== 0) out.frequency_penalty = config.frequencyPenalty;
+	if (config.repeatPenalty !== 1) out.repeat_penalty = config.repeatPenalty;
+	if (config.repeatLastN !== 1024) out.repeat_last_n = config.repeatLastN;
+	return out;
+}
+
 export function createDs4StatefulStream(config: RuntimeConfig, sessions: StatefulSessionStore) {
 	return function streamDs4Stateful(model: Model<Api>, context: Context, options?: SimpleStreamOptions) {
 		const outer = createAssistantMessageEventStream();
@@ -29,7 +39,7 @@ export function createDs4StatefulStream(config: RuntimeConfig, sessions: Statefu
 		};
 
 		const runOnce = async (forceReset: boolean, pendingRef: { current?: PendingCommit }) => {
-			const basePayload = buildOpenAIPayload(model, context, options);
+			const basePayload = applySamplingConfig(buildOpenAIPayload(model, context, options), config);
 			const selected = sessions.choosePayload(basePayload, key, forceReset, config);
 			pendingRef.current = selected.pending;
 			sessions.lastMode = selected.mode;

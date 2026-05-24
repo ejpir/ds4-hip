@@ -130,6 +130,7 @@ export class StatefulUi {
 		const userTurnNote = this.config.userTurnPolicy === "delta"
 			? "new user messages use delta"
 			: "new user messages reset; tool results use delta";
+		const samplingLine = `presence=${this.config.presencePenalty.toFixed(2)} frequency=${this.config.frequencyPenalty.toFixed(2)} repeat=${this.config.repeatPenalty.toFixed(2)} last_n=${this.config.repeatLastN}`;
 		const lines: string[] = [
 			`${title} ${providerState}`,
 			"",
@@ -144,6 +145,7 @@ export class StatefulUi {
 			row("user turn", `${t.fg("text", this.config.userTurnPolicy)} ${t.fg("dim", `(${userTurnNote})`)}`),
 			row("turn focus", onOff(this.config.turnFocusEnabled)),
 			row("read guard", `${this.config.readGuardEnabled ? t.fg("success", this.config.readGuardMode) : t.fg("dim", "off")} ${t.fg("dim", `seen=${this.readGuard.seenCount}`)}`),
+			row("sampling", t.fg("dim", samplingLine)),
 			row("last guard block", t.fg("dim", this.readGuard.lastSummary)),
 			foot(),
 			"",

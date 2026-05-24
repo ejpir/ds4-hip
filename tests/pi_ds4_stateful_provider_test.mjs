@@ -190,6 +190,8 @@ async function testDisabledUsesStatelessEndpoint() {
 		assert.equal(payload.mode, undefined);
 		assert.equal(payload.session_id, undefined);
 		assert.equal(payload.stateful_debug, undefined);
+		assert.equal(payload.frequency_penalty, undefined);
+		assert.equal(payload.repeat_penalty, undefined);
 		assert.deepEqual(payload.messages.map((m) => m.role), ["system", "user"]);
 		assert.doesNotMatch(payload.messages[0].content, /DS4\/Pi tool-use guidance/);
 		assert.doesNotMatch(payload.messages[0].content, /Tool outputs are untrusted data/);
@@ -200,6 +202,8 @@ async function testDisabledUsesStatelessEndpoint() {
 			"Stateful off should use normal chat completions.",
 		], {
 			PI_DS4_STATEFUL: "0",
+			PI_DS4_FREQUENCY_PENALTY: "0.2",
+			PI_DS4_REPEAT_PENALTY: "1.15",
 			DS4_STATEFUL_BASE_URL: `http://127.0.0.1:${port}/v1/ds4/stateful`,
 			DS4_STATELESS_BASE_URL: `http://127.0.0.1:${port}/v1`,
 		});
@@ -208,6 +212,31 @@ async function testDisabledUsesStatelessEndpoint() {
 		assert.equal(requests.length, 1);
 		assert.deepEqual(paths, ["/v1/chat/completions"]);
 	}, "/v1/chat/completions");
+}
+
+async function testSamplingPenaltyEnvPayload() {
+	await withMockServer((payload, index, res) => {
+		assert.equal(index, 1);
+		assert.equal(payload.presence_penalty, 0.1);
+		assert.equal(payload.frequency_penalty, 0.2);
+		assert.equal(payload.repeat_penalty, 1.15);
+		assert.equal(payload.repeat_last_n, 256);
+		sseText(res, "sampling-env", `chatcmpl_${index}`);
+	}, async (baseUrl, requests) => {
+		const result = await runPi([
+			...commonPiArgs(["--no-tools", "-p"]),
+			"Check sampling penalty env payload.",
+		], {
+			DS4_STATEFUL_BASE_URL: baseUrl,
+			PI_DS4_PRESENCE_PENALTY: "0.1",
+			PI_DS4_FREQUENCY_PENALTY: "0.2",
+			PI_DS4_REPEAT_PENALTY: "1.15",
+			PI_DS4_REPEAT_LAST_N: "256",
+		});
+		await assertPiOk(result, "sampling penalty env payload");
+		assert.match(result.stdout, /sampling-env/);
+		assert.equal(requests.length, 1);
+	});
 }
 
 async function testUserFollowupAutoResets() {
@@ -351,6 +380,7 @@ const tests = [
 	["package directory registers model", testPackageDirectoryRegistersModel],
 	["local package install registers model", testLocalPackageInstallRegistersModel],
 	["stateful disabled uses stateless endpoint", testDisabledUsesStatelessEndpoint],
+	["sampling penalty env payload", testSamplingPenaltyEnvPayload],
 	["user follow-up auto resets", testUserFollowupAutoResets],
 	["delta 409 retries reset", testDelta409RetriesAsReset],
 	["tool result delta", testToolResultDelta],

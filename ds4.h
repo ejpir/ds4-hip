@@ -54,6 +54,27 @@ typedef struct {
     float logprob;
 } ds4_token_score;
 
+typedef struct {
+    float temperature;
+    int top_k;
+    float top_p;
+    float min_p;
+    /* OpenAI-style penalties: subtract presence_penalty once for tokens that
+     * appeared in the penalty window, and frequency_penalty per occurrence. */
+    float presence_penalty;
+    float frequency_penalty;
+    /* llama.cpp-style repeat penalty. 1.0 disables it. Values >1 penalize
+     * recently generated tokens. */
+    float repeat_penalty;
+    /* Number of tokens before the current position considered for penalties.
+     * Values <=0 mean all tokens since penalty_start. */
+    int repeat_last_n;
+    /* First token index that may be counted for penalties. Server code sets
+     * this to the assistant generation frontier so prompt/tool text is not
+     * penalized by default. */
+    int penalty_start;
+} ds4_sampling_options;
+
 #define DS4_DEFAULT_TEMPERATURE 1.0f
 #define DS4_DEFAULT_TOP_P 1.0f
 #define DS4_DEFAULT_MIN_P 0.05f
@@ -172,6 +193,8 @@ ds4_session_rewrite_result ds4_session_rewrite_from_common(
 int ds4_session_common_prefix(ds4_session *s, const ds4_tokens *prompt);
 int ds4_session_argmax(ds4_session *s);
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng);
+int ds4_session_sample_with_options(ds4_session *s, const ds4_sampling_options *opt, uint64_t *rng);
+int ds4_sampling_selftest(void);
 int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k);
 int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out);
 int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen);

@@ -146,6 +146,17 @@ DS4_SERVER_DYNAMIC_PREFILL_MIN=128
 DS4_SERVER_DYNAMIC_PREFILL_MAX=4096
 ```
 
+Optional sampler repetition mitigations are request parameters on DS4-server and can be sent by the Pi package with env vars:
+
+```sh
+PI_DS4_PRESENCE_PENALTY=0
+PI_DS4_FREQUENCY_PENALTY=0.15
+PI_DS4_REPEAT_PENALTY=1
+PI_DS4_REPEAT_LAST_N=1024 # 0 = all generated tokens
+```
+
+Start with `frequency_penalty=0.10..0.20` for repeated-word loops; leave it at `0` for baseline A/B runs.
+
 ## Use in Pi
 
 Select:
@@ -195,6 +206,7 @@ Good cases to report:
 - Are duplicate or covered file reads blocked correctly?
 - Any prompt-injection-looking behavior from tool output?
 - Any unexpected HTTP `409` loops or repeated full resets?
+- For repetition tuning, compare fixed prompts/seeds with `PI_DS4_FREQUENCY_PENALTY=0` vs `0.10`, `0.15`, and `0.20`; report repeated-word loops, output token counts, and answer quality.
 
 ## Server logs to watch
 

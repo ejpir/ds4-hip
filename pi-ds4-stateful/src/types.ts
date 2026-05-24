@@ -16,6 +16,10 @@ export interface RuntimeConfig {
 	readGuardMode: ReadGuardMode;
 	turnFocusEnabled: boolean;
 	userTurnPolicy: UserTurnPolicy;
+	presencePenalty: number;
+	frequencyPenalty: number;
+	repeatPenalty: number;
+	repeatLastN: number;
 }
 
 export interface StatefulSession {

@@ -15698,6 +15698,190 @@ static int sample_top_p_min_p(
     return ids[filtered - 1];
 }
 
+static bool sampling_penalties_active(const ds4_sampling_options *opt) {
+    if (!opt) return false;
+    if (isfinite(opt->presence_penalty) && opt->presence_penalty != 0.0f) return true;
+    if (isfinite(opt->frequency_penalty) && opt->frequency_penalty != 0.0f) return true;
+    if (isfinite(opt->repeat_penalty) && opt->repeat_penalty > 0.0f &&
+        fabsf(opt->repeat_penalty - 1.0f) > 0.000001f)
+    {
+        return true;
+    }
+    return false;
+}
+
+static bool sampling_token_is_exempt(int token, const int *exempt, int exempt_len) {
+    if (token < 0) return true;
+    for (int i = 0; i < exempt_len; i++) {
+        if (token == exempt[i]) return true;
+    }
+    return false;
+}
+
+static const float *sampling_prepare_penalized_logits(
+        const float                 *logits,
+        uint32_t                     n_vocab,
+        const int                   *history,
+        int                          history_len,
+        const ds4_sampling_options  *opt,
+        const int                   *exempt,
+        int                          exempt_len,
+        float                       *scratch_logits,
+        int                         *counts,
+        int                         *touched,
+        int                         *touched_len_out) {
+    if (touched_len_out) *touched_len_out = 0;
+    if (!sampling_penalties_active(opt) || !logits || !history || history_len <= 0 ||
+        !scratch_logits || !counts || !touched)
+    {
+        return logits;
+    }
+
+    int start = opt->penalty_start;
+    if (start < 0) start = 0;
+    if (start > history_len) start = history_len;
+    int from = start;
+    if (opt->repeat_last_n > 0 && history_len - from > opt->repeat_last_n) {
+        from = history_len - opt->repeat_last_n;
+    }
+    if (from >= history_len) return logits;
+
+    memcpy(scratch_logits, logits, (size_t)n_vocab * sizeof(scratch_logits[0]));
+
+    int touched_len = 0;
+    for (int i = from; i < history_len; i++) {
+        const int tok = history[i];
+        if (tok < 0 || (uint32_t)tok >= n_vocab) continue;
+        if (sampling_token_is_exempt(tok, exempt, exempt_len)) continue;
+        if (counts[tok] == 0) touched[touched_len++] = tok;
+        counts[tok]++;
+    }
+
+    const float presence = isfinite(opt->presence_penalty) ? opt->presence_penalty : 0.0f;
+    const float frequency = isfinite(opt->frequency_penalty) ? opt->frequency_penalty : 0.0f;
+    const float repeat = (isfinite(opt->repeat_penalty) && opt->repeat_penalty > 0.0f) ?
+        opt->repeat_penalty : 1.0f;
+    const bool use_repeat = fabsf(repeat - 1.0f) > 0.000001f;
+    for (int i = 0; i < touched_len; i++) {
+        const int tok = touched[i];
+        float v = scratch_logits[tok];
+        if (isfinite(v)) {
+            if (use_repeat) {
+                if (v > 0.0f) v /= repeat;
+                else v *= repeat;
+            }
+            if (presence != 0.0f) v -= presence;
+            if (frequency != 0.0f) v -= frequency * (float)counts[tok];
+            scratch_logits[tok] = v;
+        }
+        counts[tok] = 0;
+    }
+    if (touched_len_out) *touched_len_out = touched_len;
+    return touched_len > 0 ? scratch_logits : logits;
+}
+
+static int sample_logits_with_history(
+        const float                 *logits,
+        uint32_t                     n_vocab,
+        const int                   *history,
+        int                          history_len,
+        const ds4_sampling_options  *opt,
+        const int                   *exempt,
+        int                          exempt_len,
+        float                       *scratch_logits,
+        int                         *counts,
+        int                         *touched,
+        uint64_t                    *rng) {
+    if (!opt) return sample_top_p_min_p(logits, n_vocab,
+                                        DS4_DEFAULT_TEMPERATURE, 0,
+                                        DS4_DEFAULT_TOP_P, DS4_DEFAULT_MIN_P,
+                                        rng);
+    int touched_len = 0;
+    const float *effective = sampling_prepare_penalized_logits(logits,
+                                                               n_vocab,
+                                                               history,
+                                                               history_len,
+                                                               opt,
+                                                               exempt,
+                                                               exempt_len,
+                                                               scratch_logits,
+                                                               counts,
+                                                               touched,
+                                                               &touched_len);
+    (void)touched_len;
+    return sample_top_p_min_p(effective, n_vocab,
+                              opt->temperature,
+                              opt->top_k,
+                              opt->top_p,
+                              opt->min_p,
+                              rng);
+}
+
+int ds4_sampling_selftest(void) {
+    float logits[4];
+    float scratch[4];
+    int counts[4] = {0};
+    int touched[4] = {0};
+    uint64_t rng = 1;
+    const int no_exempt[1] = {-1};
+
+    ds4_sampling_options opt = {
+        .temperature = 0.0f,
+        .top_k = 0,
+        .top_p = 1.0f,
+        .min_p = 0.0f,
+        .presence_penalty = 0.0f,
+        .frequency_penalty = 0.10f,
+        .repeat_penalty = 1.0f,
+        .repeat_last_n = 0,
+        .penalty_start = 0,
+    };
+    int hist_freq[10] = {0,0,0,0,0,0,0,0,0,0};
+    logits[0] = 10.0f; logits[1] = 9.5f; logits[2] = 0.0f; logits[3] = -1.0f;
+    if (sample_logits_with_history(logits, 4, hist_freq, 10, &opt,
+                                   no_exempt, 0, scratch, counts, touched, &rng) != 1) return 1;
+
+    opt.frequency_penalty = 0.0f;
+    opt.presence_penalty = 0.2f;
+    int hist_presence[1] = {0};
+    logits[0] = 10.0f; logits[1] = 9.9f;
+    if (sample_logits_with_history(logits, 4, hist_presence, 1, &opt,
+                                   no_exempt, 0, scratch, counts, touched, &rng) != 1) return 1;
+
+    opt.presence_penalty = 0.0f;
+    opt.repeat_penalty = 1.2f;
+    logits[0] = 10.0f; logits[1] = 9.0f;
+    if (sample_logits_with_history(logits, 4, hist_presence, 1, &opt,
+                                   no_exempt, 0, scratch, counts, touched, &rng) != 1) return 1;
+
+    opt.repeat_penalty = 1.0f;
+    opt.frequency_penalty = 1.0f;
+    opt.repeat_last_n = 1;
+    int hist_window[4] = {0,0,0,0};
+    logits[0] = 10.0f; logits[1] = 8.5f;
+    if (sample_logits_with_history(logits, 4, hist_window, 4, &opt,
+                                   no_exempt, 0, scratch, counts, touched, &rng) != 0) return 1;
+    opt.repeat_last_n = 2;
+    if (sample_logits_with_history(logits, 4, hist_window, 4, &opt,
+                                   no_exempt, 0, scratch, counts, touched, &rng) != 1) return 1;
+
+    int eos_exempt[1] = {0};
+    opt.repeat_last_n = 0;
+    opt.frequency_penalty = 10.0f;
+    logits[0] = 10.0f; logits[1] = 9.0f;
+    if (sample_logits_with_history(logits, 4, hist_freq, 10, &opt,
+                                   eos_exempt, 1, scratch, counts, touched, &rng) != 0) return 1;
+
+    opt.frequency_penalty = 0.0f;
+    opt.presence_penalty = 0.0f;
+    opt.repeat_penalty = 1.0f;
+    logits[0] = 10.0f; logits[1] = 9.5f;
+    if (sample_logits_with_history(logits, 4, hist_freq, 10, &opt,
+                                   no_exempt, 0, scratch, counts, touched, &rng) != 0) return 1;
+
+    return 0;
+}
+
 static void print_top_logits(
         FILE          * fp,
         const char    * label,
@@ -16110,6 +16294,9 @@ struct ds4_session {
     token_vec checkpoint;
     float *logits;
     float *mtp_logits;
+    float *sample_logits;
+    int *sample_counts;
+    int *sample_touched;
     int mtp_draft_token;
     uint64_t mtp_probe_total;
     uint64_t mtp_probe_hit;
@@ -17217,6 +17404,9 @@ void ds4_session_free(ds4_session *s) {
     token_vec_free(&s->checkpoint);
     free(s->logits);
     free(s->mtp_logits);
+    free(s->sample_logits);
+    free(s->sample_counts);
+    free(s->sample_touched);
     free(s);
 }
 
@@ -17508,8 +17698,58 @@ int ds4_session_argmax(ds4_session *s) {
     return sample_argmax(s->logits, DS4_N_VOCAB);
 }
 
+static void ds4_session_ensure_sampling_scratch(ds4_session *s) {
+    if (s->sample_logits && s->sample_counts && s->sample_touched) return;
+    if (!s->sample_logits) s->sample_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->sample_logits[0]));
+    if (!s->sample_counts) s->sample_counts = xcalloc((size_t)DS4_N_VOCAB, sizeof(s->sample_counts[0]));
+    if (!s->sample_touched) s->sample_touched = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->sample_touched[0]));
+}
+
+int ds4_session_sample_with_options(ds4_session *s, const ds4_sampling_options *opt, uint64_t *rng) {
+    if (!s || !opt) return s ? ds4_session_sample(s, DS4_DEFAULT_TEMPERATURE, 0,
+                                                  DS4_DEFAULT_TOP_P, DS4_DEFAULT_MIN_P, rng) : 0;
+    if (!sampling_penalties_active(opt)) {
+        return sample_top_p_min_p(s->logits, DS4_N_VOCAB,
+                                  opt->temperature, opt->top_k,
+                                  opt->top_p, opt->min_p, rng);
+    }
+    ds4_session_ensure_sampling_scratch(s);
+    const ds4_vocab *v = &s->engine->vocab;
+    int exempt[7] = {
+        v->bos_id,
+        v->eos_id,
+        v->user_id,
+        v->assistant_id,
+        v->think_start_id,
+        v->think_end_id,
+        v->dsml_id,
+    };
+    return sample_logits_with_history(s->logits,
+                                      DS4_N_VOCAB,
+                                      s->checkpoint.v,
+                                      s->checkpoint.len,
+                                      opt,
+                                      exempt,
+                                      (int)(sizeof(exempt) / sizeof(exempt[0])),
+                                      s->sample_logits,
+                                      s->sample_counts,
+                                      s->sample_touched,
+                                      rng);
+}
+
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng) {
-    return sample_top_p_min_p(s->logits, DS4_N_VOCAB, temperature, top_k, top_p, min_p, rng);
+    ds4_sampling_options opt = {
+        .temperature = temperature,
+        .top_k = top_k,
+        .top_p = top_p,
+        .min_p = min_p,
+        .presence_penalty = 0.0f,
+        .frequency_penalty = 0.0f,
+        .repeat_penalty = 1.0f,
+        .repeat_last_n = 0,
+        .penalty_start = 0,
+    };
+    return ds4_session_sample_with_options(s, &opt, rng);
 }
 
 int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k) {

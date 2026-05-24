@@ -78,6 +78,10 @@ PI_DS4_USER_TURN_MODE=auto     # auto | reset | delta
 PI_DS4_READ_GUARD=1
 PI_DS4_READ_GUARD_MODE=exact   # exact | strict
 PI_DS4_TURN_FOCUS=1
+PI_DS4_PRESENCE_PENALTY=0       # optional OpenAI-style sampling penalty
+PI_DS4_FREQUENCY_PENALTY=0      # try 0.10-0.20 when testing repetition loops
+PI_DS4_REPEAT_PENALTY=1         # llama.cpp-style; 1 disables
+PI_DS4_REPEAT_LAST_N=1024       # token window for penalties; 0 = all generated tokens
 DS4_STATEFUL_CONTEXT=100000
 DS4_STATEFUL_MAX_TOKENS=384000
 ```

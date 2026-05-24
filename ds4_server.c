@@ -605,6 +605,10 @@ typedef struct {
     float temperature;
     float top_p;
     float min_p;
+    float presence_penalty;
+    float frequency_penalty;
+    float repeat_penalty;
+    int repeat_last_n;
     uint64_t seed;
     bool stream;
     bool stream_include_usage;
@@ -779,6 +783,10 @@ static void request_init(request *r, req_kind kind, int max_tokens) {
     r->temperature = DS4_DEFAULT_TEMPERATURE;
     r->top_p = DS4_DEFAULT_TOP_P;
     r->min_p = DS4_DEFAULT_MIN_P;
+    r->presence_penalty = 0.0f;
+    r->frequency_penalty = 0.0f;
+    r->repeat_penalty = 1.0f;
+    r->repeat_last_n = 1024;
     r->think_mode = DS4_THINK_HIGH;
 }
 
@@ -2303,6 +2311,49 @@ static int server_env_int(const char *name, int def, int min, int max) {
     return (int)v;
 }
 
+static float clamp_float(double v, float def, float min, float max) {
+    if (!isfinite(v)) return def;
+    if (v < (double)min) return min;
+    if (v > (double)max) return max;
+    return (float)v;
+}
+
+static bool parse_float_clamped(const char **p, float *out,
+                                float def, float min, float max) {
+    double v = 0.0;
+    if (!json_number(p, &v)) return false;
+    *out = clamp_float(v, def, min, max);
+    return true;
+}
+
+static bool parse_sampling_parameter(request *r, const char *key, const char **p) {
+    if (!strcmp(key, "presence_penalty")) {
+        return parse_float_clamped(p, &r->presence_penalty, 0.0f, -2.0f, 2.0f);
+    }
+    if (!strcmp(key, "frequency_penalty")) {
+        return parse_float_clamped(p, &r->frequency_penalty, 0.0f, -2.0f, 2.0f);
+    }
+    if (!strcmp(key, "repeat_penalty") || !strcmp(key, "repetition_penalty")) {
+        return parse_float_clamped(p, &r->repeat_penalty, 1.0f, 1.0f, 10.0f);
+    }
+    if (!strcmp(key, "repeat_last_n") || !strcmp(key, "repetition_penalty_last_n")) {
+        return json_int(p, &r->repeat_last_n);
+    }
+    return false;
+}
+
+static bool request_sampling_penalties_active(const request *r) {
+    if (!r) return false;
+    if (isfinite(r->presence_penalty) && r->presence_penalty != 0.0f) return true;
+    if (isfinite(r->frequency_penalty) && r->frequency_penalty != 0.0f) return true;
+    if (isfinite(r->repeat_penalty) && r->repeat_penalty > 0.0f &&
+        fabsf(r->repeat_penalty - 1.0f) > 0.000001f)
+    {
+        return true;
+    }
+    return false;
+}
+
 static int chat_tool_result_count(const chat_msgs *msgs) {
     int n = 0;
     for (int i = 0; msgs && i < msgs->len; i++) {
@@ -2811,6 +2862,16 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
                 free(key);
                 goto bad;
             }
+        } else if (!strcmp(key, "presence_penalty") ||
+                   !strcmp(key, "frequency_penalty") ||
+                   !strcmp(key, "repeat_penalty") ||
+                   !strcmp(key, "repetition_penalty") ||
+                   !strcmp(key, "repeat_last_n") ||
+                   !strcmp(key, "repetition_penalty_last_n")) {
+            if (!parse_sampling_parameter(r, key, &p)) {
+                free(key);
+                goto bad;
+            }
         } else if (!strcmp(key, "seed")) {
             double v = 0.0;
             if (!json_number(&p, &v)) {
@@ -3261,6 +3322,16 @@ static bool parse_stateful_delta_request(ds4_engine *e, server *s,
                 free(key);
                 goto bad;
             }
+        } else if (!strcmp(key, "presence_penalty") ||
+                   !strcmp(key, "frequency_penalty") ||
+                   !strcmp(key, "repeat_penalty") ||
+                   !strcmp(key, "repetition_penalty") ||
+                   !strcmp(key, "repeat_last_n") ||
+                   !strcmp(key, "repetition_penalty_last_n")) {
+            if (!parse_sampling_parameter(r, key, &p)) {
+                free(key);
+                goto bad;
+            }
         } else if (!strcmp(key, "seed")) {
             double v = 0.0;
             if (!json_number(&p, &v)) {
@@ -3539,6 +3610,16 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
             r->top_p = (float)v;
         } else if (!strcmp(key, "top_k")) {
             if (!json_int(&p, &r->top_k)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "presence_penalty") ||
+                   !strcmp(key, "frequency_penalty") ||
+                   !strcmp(key, "repeat_penalty") ||
+                   !strcmp(key, "repetition_penalty") ||
+                   !strcmp(key, "repeat_last_n") ||
+                   !strcmp(key, "repetition_penalty_last_n")) {
+            if (!parse_sampling_parameter(r, key, &p)) {
                 free(key);
                 goto bad;
             }
@@ -4438,6 +4519,16 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
                 goto bad;
             }
             r->top_p = (float)v;
+        } else if (!strcmp(key, "presence_penalty") ||
+                   !strcmp(key, "frequency_penalty") ||
+                   !strcmp(key, "repeat_penalty") ||
+                   !strcmp(key, "repetition_penalty") ||
+                   !strcmp(key, "repeat_last_n") ||
+                   !strcmp(key, "repetition_penalty_last_n")) {
+            if (!parse_sampling_parameter(r, key, &p)) {
+                free(key);
+                goto bad;
+            }
         } else if (!strcmp(key, "stream")) {
             if (!json_bool(&p, &r->stream)) {
                 free(key);
@@ -4664,6 +4755,16 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
             r->min_p = (float)v;
         } else if (!strcmp(key, "top_k")) {
             if (!json_int(&p, &r->top_k)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "presence_penalty") ||
+                   !strcmp(key, "frequency_penalty") ||
+                   !strcmp(key, "repeat_penalty") ||
+                   !strcmp(key, "repetition_penalty") ||
+                   !strcmp(key, "repeat_last_n") ||
+                   !strcmp(key, "repetition_penalty_last_n")) {
+            if (!parse_sampling_parameter(r, key, &p)) {
                 free(key);
                 goto bad;
             }
@@ -9927,7 +10028,7 @@ static uint64_t trace_begin(
     fprintf(s->trace, "\n===== request %llu ", (unsigned long long)id);
     trace_time(s->trace);
     fprintf(s->trace,
-            " =====\nkind: %s\nmodel: %s\nstream: %d\ntools: %d\nthink_mode: %s\nprompt_tokens: %d\neffective_prompt_tokens: %d\ncached_tokens: %d\nmax_tokens: %d\ntemperature: %.3f\ntop_k: %d\ntop_p: %.3f\nmin_p: %.3f\nseed: %llu\n",
+            " =====\nkind: %s\nmodel: %s\nstream: %d\ntools: %d\nthink_mode: %s\nprompt_tokens: %d\neffective_prompt_tokens: %d\ncached_tokens: %d\nmax_tokens: %d\ntemperature: %.3f\ntop_k: %d\ntop_p: %.3f\nmin_p: %.3f\npresence_penalty: %.3f\nfrequency_penalty: %.3f\nrepeat_penalty: %.3f\nrepeat_last_n: %d\nseed: %llu\n",
             j->req.kind == REQ_CHAT ? "chat" : "completion",
             j->req.model ? j->req.model : "",
             j->req.stream ? 1 : 0,
@@ -9941,6 +10042,10 @@ static uint64_t trace_begin(
             j->req.top_k,
             j->req.top_p,
             j->req.min_p,
+            j->req.presence_penalty,
+            j->req.frequency_penalty,
+            j->req.repeat_penalty,
+            j->req.repeat_last_n,
             (unsigned long long)j->req.seed);
     fprintf(s->trace, "stream_include_usage: %d\n",
             j->req.stream_include_usage ? 1 : 0);
@@ -10994,6 +11099,7 @@ static void generate_job(server *s, job *j) {
     int completion = 0;
     int max_tokens = j->req.max_tokens;
     int room = ds4_session_ctx(s->session) - ds4_session_pos(s->session);
+    const int penalty_start = ds4_session_pos(s->session);
     bool saw_tool_start = false;
     bool saw_tool_end = false;
     bool saw_orphan_tool_end = false;
@@ -11036,7 +11142,19 @@ static void generate_job(server *s, job *j) {
         if (in_tool_call && !dsml_decode_state_uses_payload_sampling(dsml_state)) {
             temperature = 0.0f;
         }
-        int token = ds4_session_sample(s->session, temperature, top_k, top_p, min_p, &rng);
+        const bool apply_penalties = request_sampling_penalties_active(&j->req) && !in_tool_call;
+        ds4_sampling_options sample_opt = {
+            .temperature = temperature,
+            .top_k = top_k,
+            .top_p = top_p,
+            .min_p = min_p,
+            .presence_penalty = apply_penalties ? j->req.presence_penalty : 0.0f,
+            .frequency_penalty = apply_penalties ? j->req.frequency_penalty : 0.0f,
+            .repeat_penalty = apply_penalties ? j->req.repeat_penalty : 1.0f,
+            .repeat_last_n = j->req.repeat_last_n,
+            .penalty_start = penalty_start,
+        };
+        int token = ds4_session_sample_with_options(s->session, &sample_opt, &rng);
         if (token == ds4_token_eos(s->engine)) {
             finish = "stop";
             break;
@@ -11044,7 +11162,7 @@ static void generate_job(server *s, job *j) {
 
         int toks[17];
         int ntok = 0;
-        if (temperature <= 0.0f && server_spec_ngram_enabled()) {
+        if (temperature <= 0.0f && !apply_penalties && server_spec_ngram_enabled()) {
             ntok = ds4_session_eval_ngram_speculative_argmax(s->session,
                                                              token,
                                                              max_tokens - completion,
@@ -11057,7 +11175,7 @@ static void generate_job(server *s, job *j) {
                 finish = "error";
                 break;
             }
-        } else if (temperature <= 0.0f &&
+        } else if (temperature <= 0.0f && !apply_penalties &&
             ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL)
         {
@@ -11683,6 +11801,10 @@ static void append_model_json_values(buf *b, int ctx, int default_tokens) {
             "\"top_p\","
             "\"top_k\","
             "\"min_p\","
+            "\"presence_penalty\","
+            "\"frequency_penalty\","
+            "\"repeat_penalty\","
+            "\"repeat_last_n\","
             "\"stop\","
             "\"seed\","
             "\"stream\","
@@ -11998,8 +12120,9 @@ static void usage(FILE *fp) {
         "  Only reasoning_effort=max or output_config.effort=max requests Think Max.\n"
         "  Think Max is applied only when --ctx is at least 393216 tokens; smaller contexts use high.\n"
         "  thinking={type:disabled}, think=false, or model=deepseek-chat selects non-thinking mode.\n"
-        "  API defaults are temperature=1, top_p=1, min_p=0.05, and no top-k cap.\n"
-        "  In thinking mode, client sampling knobs are ignored like the official API.\n"
+        "  API defaults are temperature=1, top_p=1, min_p=0.05, no top-k cap,\n"
+        "  presence_penalty=0, frequency_penalty=0, repeat_penalty=1, repeat_last_n=1024.\n"
+        "  In thinking mode, temperature/top-p/min-p/top-k are reset like the official API.\n"
         "\n"
         "Disk KV cache:\n"
         "  --kv-disk-dir DIR\n"
@@ -13626,6 +13749,28 @@ static void test_request_defaults_use_min_p_filtering(void) {
     TEST_ASSERT(r.top_p == DS4_DEFAULT_TOP_P);
     TEST_ASSERT(r.top_k == 0);
     TEST_ASSERT(r.min_p == DS4_DEFAULT_MIN_P);
+    TEST_ASSERT(r.presence_penalty == 0.0f);
+    TEST_ASSERT(r.frequency_penalty == 0.0f);
+    TEST_ASSERT(r.repeat_penalty == 1.0f);
+    TEST_ASSERT(r.repeat_last_n == 1024);
+    request_free(&r);
+}
+
+static void test_sampling_parameter_parse_clamps(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    const char *p1 = "0.25";
+    TEST_ASSERT(parse_sampling_parameter(&r, "frequency_penalty", &p1));
+    TEST_ASSERT(r.frequency_penalty == 0.25f);
+    const char *p2 = "3.0";
+    TEST_ASSERT(parse_sampling_parameter(&r, "presence_penalty", &p2));
+    TEST_ASSERT(r.presence_penalty == 2.0f);
+    const char *p3 = "0.0";
+    TEST_ASSERT(parse_sampling_parameter(&r, "repeat_penalty", &p3));
+    TEST_ASSERT(r.repeat_penalty == 1.0f);
+    const char *p4 = "256";
+    TEST_ASSERT(parse_sampling_parameter(&r, "repeat_last_n", &p4));
+    TEST_ASSERT(r.repeat_last_n == 256);
     request_free(&r);
 }
 
@@ -15820,7 +15965,9 @@ static void test_thinking_canonical_non_thinking_mode_noop(void) {
 static void ds4_server_unit_tests_run(void) {
     test_stateful_envelope_parse();
     test_stateful_delta_rejects_assistant_messages();
+    TEST_ASSERT(ds4_sampling_selftest() == 0);
     test_request_defaults_use_min_p_filtering();
+    test_sampling_parameter_parse_clamps();
     test_reasoning_effort_mapping();
     test_api_thinking_controls_parse();
     test_render_think_max_prompt_prefix();

@@ -147,13 +147,13 @@ export class ReadGuard {
 	private duplicateReadReason(range: SeenReadRange): string {
 		const count = this.bumpBlocked(range.path);
 		this.lastSummary = `blocked duplicate read ${range.label} (turn blocks for path=${count})`;
-		return `Duplicate read blocked: ${range.label} was already read and is still in model context. Do not call read again just because a prior read had a continuation hint. Answer the latest user message from the existing context when possible. If one very specific missing fact is required, use grep/rg or an explicitly targeted unread range. Seen ranges for this file: ${this.seenReadRangesSummary(range.path)}.`;
+		return `Duplicate read blocked: ${range.label} was already read and is still in model context. Stop reading this range and answer from the existing context unless one very specific missing fact is required. If needed, use grep/rg or an explicitly targeted unread range instead of rereading. Seen ranges for this file: ${this.seenReadRangesSummary(range.path)}.`;
 	}
 
 	private coveredReadReason(range: SeenReadRange, coveredBy: SeenReadRange): string {
 		const count = this.bumpBlocked(range.path);
 		this.lastSummary = `blocked covered read ${range.label} covered by ${coveredBy.label} (turn blocks for path=${count})`;
-		return `Covered read blocked: ${range.label} is already covered by earlier read ${coveredBy.label}, which is still in model context. Do not split or reread already-seen ranges. Answer the latest user message from existing context when possible; if a different fact is needed, use grep/rg or an unread targeted range. Seen ranges for this file: ${this.seenReadRangesSummary(range.path)}.`;
+		return `Covered read blocked: ${range.label} is already covered by earlier read ${coveredBy.label}, which is still in model context. Stop reading this file range and answer from existing context unless a different precise fact is needed. If needed, use grep/rg or an unread targeted range instead of splitting/rereading already-seen ranges. Seen ranges for this file: ${this.seenReadRangesSummary(range.path)}.`;
 	}
 
 	private followupReadBlockedReason(range: SeenReadRange): string {
