@@ -29,6 +29,8 @@ Environment:
   DS4_SERVER_FAST_FULL=1          Max-performance preset: high perflevel, device tensors, staged full-copy, best prefill+decode flags
   DS4_SERVER_PREFILL_HEARTBEAT_SEC=2  Prefill heartbeat interval; 0 disables
   DS4_SERVER_PREFILL_CHUNK=N      Set prefill chunk/allocation cap
+  DS4_SERVER_DYNAMIC_PREFILL=1    Per-request prefill chunk cap from new suffix size
+  DS4_SERVER_DYNAMIC_PREFILL_MIN/MAX=N  Clamp dynamic chunk cap; defaults 128/4096
   DS4_SERVER_DECODE_PREFILL=1     Safest prompt path: prefill via decode kernels
   DS4_SERVER_PREFILL_STAGE_PROFILE=1  Log/sync prefill stages to isolate crashes
   DS4_SERVER_PREFILL_RAW_FAST=1  Experimental FlashAttention-style raw SWA prefill kernel
@@ -150,7 +152,7 @@ export_pair_value() {
 # by the caller before this script to override these defaults.
 if [[ "${DS4_SERVER_FAST_FULL:-0}" == "1" ]]; then
   export DS4_SERVER_PERFLEVEL="${DS4_SERVER_PERFLEVEL-high}"
-  export DS4_SERVER_PREFILL_CHUNK="${DS4_SERVER_PREFILL_CHUNK:-2048}"
+  export DS4_SERVER_PREFILL_CHUNK="${DS4_SERVER_PREFILL_CHUNK:-4096}"
   export DS4_SERVER_DEVICE_TENSORS="${DS4_SERVER_DEVICE_TENSORS:-1}"
   export DS4_SERVER_COPY_MODEL="${DS4_SERVER_COPY_MODEL:-1}"
   export DS4_SERVER_COPY_MODEL_CHUNK_MB="${DS4_SERVER_COPY_MODEL_CHUNK_MB:-}"

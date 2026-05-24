@@ -13873,7 +13873,7 @@ static bool metal_graph_prefill_batch_row_logits(
                                  (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
 }
 
-static uint32_t ds4_session_progress_chunk_tokens(void);
+static uint32_t ds4_session_env_progress_chunk_tokens(void);
 
 /* Prefill a contiguous token range in fixed-size chunks.
  *
@@ -13893,7 +13893,8 @@ static bool metal_graph_prefill_chunked_range(
         float                 *logits,
         bool                   show_progress,
         ds4_session_progress_fn progress,
-        void                  *progress_ud) {
+        void                  *progress_ud,
+        uint32_t               progress_chunk_tokens) {
     if (n_tokens == 0 || g->prefill_cap == 0) return false;
     if (start > (uint32_t)prompt->len) return false;
     if (n_tokens > (uint32_t)prompt->len - start) return false;
@@ -13901,7 +13902,9 @@ static bool metal_graph_prefill_chunked_range(
     uint32_t chunk_cap = g->prefill_cap;
     if (start != 0 && chunk_cap > g->raw_cap) chunk_cap = g->raw_cap;
     if (progress) {
-        const uint32_t progress_cap = ds4_session_progress_chunk_tokens();
+        const uint32_t progress_cap = progress_chunk_tokens ?
+                                      progress_chunk_tokens :
+                                      ds4_session_env_progress_chunk_tokens();
         if (progress_cap > 0 && progress_cap < chunk_cap) chunk_cap = progress_cap;
     }
     if (chunk_cap == 0) return false;
@@ -14134,7 +14137,8 @@ static bool metal_graph_prefill_chunked(
         float                 *logits,
         bool                   show_progress,
         ds4_session_progress_fn progress,
-        void                  *progress_ud) {
+        void                  *progress_ud,
+        uint32_t               progress_chunk_tokens) {
     if (n_tokens <= 0) return false;
     return metal_graph_prefill_chunked_range(g,
                                              model,
@@ -14145,7 +14149,8 @@ static bool metal_graph_prefill_chunked(
                                              logits,
                                              show_progress,
                                              progress,
-                                             progress_ud);
+                                             progress_ud,
+                                             progress_chunk_tokens);
 }
 
 /* Layer-major speculative target verifier for tiny MTP suffixes.
@@ -15879,7 +15884,7 @@ static int generate_metal_graph_raw_swa(
 
     const double t_prefill0 = now_sec();
     if (prefill_cap < (uint32_t)prompt->len) {
-        ok = metal_graph_prefill_chunked(&g, model, weights, prompt, prompt->len, logits, false, progress, progress_ud);
+        ok = metal_graph_prefill_chunked(&g, model, weights, prompt, prompt->len, logits, false, progress, progress_ud, 0);
     } else {
         ok = metal_graph_prefill_raw_swa(&g, model, weights, prompt, prompt->len, logits, true);
     }
@@ -16111,6 +16116,7 @@ struct ds4_session {
     ds4_session_progress_fn progress;
     void *progress_ud;
     uint32_t prefill_cap;
+    uint32_t progress_chunk_tokens;
     uint32_t ngram_spec_cooldown;
     int ctx_size;
     bool checkpoint_valid;
@@ -17220,6 +17226,11 @@ void ds4_session_set_progress(ds4_session *s, ds4_session_progress_fn fn, void *
     s->progress_ud = ud;
 }
 
+void ds4_session_set_prefill_chunk_tokens(ds4_session *s, uint32_t tokens) {
+    if (!s) return;
+    s->progress_chunk_tokens = tokens;
+}
+
 typedef struct {
     ds4_session *session;
     const ds4_tokens *prompt;
@@ -17249,7 +17260,7 @@ static uint32_t ds4_session_progress_raw_max_tokens(void) {
     return (uint32_t)v;
 }
 
-static uint32_t ds4_session_progress_chunk_tokens(void) {
+static uint32_t ds4_session_env_progress_chunk_tokens(void) {
     const char *env = getenv("DS4_SESSION_PROGRESS_CHUNK_TOKENS");
     if (!env || !env[0]) return 0;
     char *end = NULL;
@@ -17313,7 +17324,8 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
                                                         s->logits,
                                                         false,
                                                         progress_fn,
-                                                        progress_fn ? &progress : NULL);
+                                                        progress_fn ? &progress : NULL,
+                                                        s->progress_chunk_tokens);
             if (!ok) {
                 snprintf(err, errlen, "Metal resumed prefill failed while extending checkpoint");
                 s->checkpoint_valid = false;
@@ -17387,7 +17399,8 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
             s->progress ? ds4_session_note_prefill_progress : NULL;
         ok = metal_graph_prefill_chunked(&s->graph, &e->model, &e->weights,
                                          prompt, prompt->len, s->logits, false,
-                                         progress_fn, progress_fn ? &progress : NULL);
+                                         progress_fn, progress_fn ? &progress : NULL,
+                                         s->progress_chunk_tokens);
     } else {
         if (s->progress && !s->progress(s->progress_ud, "prefill_raw_begin", prompt->len, prompt->len)) {
             ok = false;

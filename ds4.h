@@ -149,6 +149,9 @@ int ds4_token_assistant(ds4_engine *e);
 int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size);
 void ds4_session_free(ds4_session *s);
 void ds4_session_set_progress(ds4_session *s, ds4_session_progress_fn fn, void *ud);
+/* Per-session cap for cancellable/chunked prefill. A value of 0 uses the
+ * process-wide DS4_SESSION_PROGRESS_CHUNK_TOKENS environment setting. */
+void ds4_session_set_prefill_chunk_tokens(ds4_session *s, uint32_t tokens);
 
 typedef enum {
     DS4_SESSION_REWRITE_ERROR = -1,

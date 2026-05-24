@@ -1,0 +1,15 @@
+{
+  "name": "pi-ds4-stateful",
+  "version": "0.1.0",
+  "description": "Pi provider extension for ds4.c stateful reset/delta chat sessions.",
+  "type": "module",
+  "keywords": ["pi-package", "pi", "ds4", "stateful", "coding-agent"],
+  "license": "MIT",
+  "pi": {
+    "extensions": ["./extensions/ds4-stateful.ts"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  }
+}

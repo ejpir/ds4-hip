@@ -57,7 +57,9 @@ TEST_LINK = $(CC)
 endif
 endif
 
-.PHONY: all help clean test cpu rocm rocm-upstream cuda-regression
+NODE ?= node
+
+.PHONY: all help clean test pi-stateful-test cpu rocm rocm-upstream cuda-regression
 
 all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
 
@@ -69,6 +71,7 @@ help:
 	@echo "  make rocm-upstream Build ROCm upstream-shaped binaries"
 	@echo "                  (CLI, server, benchmark, eval, and agent)"
 	@echo "  make test         Build and run tests"
+	@echo "  make pi-stateful-test  Run Pi DS4 stateful provider regression tests"
 	@echo "  make clean        Remove build outputs"
 
 ifeq ($(UNAME_S),Darwin)
@@ -239,7 +242,10 @@ endif
 ds4_test: ds4_test.o ds4_kvstore.o rax.o $(TEST_CORE_OBJS)
 	$(TEST_LINK) -o $@ ds4_test.o ds4_kvstore.o rax.o $(TEST_CORE_OBJS) $(LDLIBS)
 
-test: ds4_test
+pi-stateful-test:
+	$(NODE) tests/pi_ds4_stateful_provider_test.mjs
+
+test: ds4_test pi-stateful-test
 	./ds4_test
 
 clean:

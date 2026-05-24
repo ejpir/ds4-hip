@@ -585,6 +585,11 @@ static void id_list_push_unique(stop_list *ids, const char *id);
 static void id_list_free(stop_list *ids);
 static bool responses_live_has_call_id(server *s, const char *id);
 static bool anthropic_live_has_call_id(server *s, const char *id);
+static bool stateful_live_copy_config(server *s, const char *session_id,
+                                      uint64_t parent_revision,
+                                      bool *has_tools,
+                                      ds4_think_mode *think_mode,
+                                      tool_schema_orders *orders);
 
 typedef struct {
     req_kind kind;
@@ -634,6 +639,22 @@ typedef struct {
     bool anthropic_requires_live_tool_state;
     stop_list anthropic_live_call_ids;
     char *anthropic_live_suffix_text;
+    /* DS4-native stateful chat extension.  A reset request is rendered like a
+     * normal OpenAI chat request and then binds the resulting sampled KV
+     * frontier to session_id/revision.  A delta request carries only new
+     * user/tool messages; generate_job() validates the live binding and appends
+     * stateful_suffix_text to the sampled token prefix. */
+    bool stateful;
+    bool stateful_reset;
+    bool stateful_delta;
+    char *stateful_session_id;
+    uint64_t stateful_parent_revision;
+    char *stateful_suffix_text;
+    char *stateful_debug_reason;
+    int stateful_debug_full_messages;
+    int stateful_debug_sent_messages;
+    int stateful_debug_previous_messages;
+    uint64_t stateful_debug_stored_revision;
     tool_replay_stats tool_replay;
 } request;
 
@@ -774,6 +795,9 @@ static void request_free(request *r) {
     stop_list_clear(&r->anthropic_live_call_ids);
     free(r->anthropic_live_call_ids.v);
     free(r->anthropic_live_suffix_text);
+    free(r->stateful_session_id);
+    free(r->stateful_suffix_text);
+    free(r->stateful_debug_reason);
     tool_schema_orders_free(&r->tool_orders);
     memset(r, 0, sizeof(*r));
 }
@@ -2867,6 +2891,534 @@ bad:
     return false;
 }
 
+static bool parse_stateful_debug_value(const char **p,
+                                        char **debug_reason,
+                                        int *debug_full_messages,
+                                        int *debug_sent_messages,
+                                        int *debug_previous_messages,
+                                        uint64_t *debug_stored_revision) {
+    json_ws(p);
+    if (**p != '{') return false;
+    (*p)++;
+    json_ws(p);
+    while (**p && **p != '}') {
+        char *key = NULL;
+        if (!json_string(p, &key)) return false;
+        json_ws(p);
+        if (**p != ':') {
+            free(key);
+            return false;
+        }
+        (*p)++;
+        if (!strcmp(key, "reason")) {
+            free(*debug_reason);
+            if (!json_string(p, debug_reason)) {
+                free(key);
+                return false;
+            }
+        } else if (!strcmp(key, "full_messages") || !strcmp(key, "fullMessages")) {
+            if (!json_int(p, debug_full_messages)) {
+                free(key);
+                return false;
+            }
+        } else if (!strcmp(key, "sent_messages") || !strcmp(key, "sentMessages")) {
+            if (!json_int(p, debug_sent_messages)) {
+                free(key);
+                return false;
+            }
+        } else if (!strcmp(key, "previous_messages") || !strcmp(key, "previousMessages")) {
+            if (!json_int(p, debug_previous_messages)) {
+                free(key);
+                return false;
+            }
+        } else if (!strcmp(key, "stored_revision") || !strcmp(key, "storedRevision")) {
+            double v = 0.0;
+            if (!json_number(p, &v) || v < 0.0) {
+                free(key);
+                return false;
+            }
+            *debug_stored_revision = (uint64_t)v;
+        } else if (!json_skip_value(p)) {
+            free(key);
+            return false;
+        }
+        free(key);
+        json_ws(p);
+        if (**p == ',') (*p)++;
+        json_ws(p);
+    }
+    if (**p != '}') return false;
+    (*p)++;
+    return true;
+}
+
+static bool parse_stateful_envelope(const char *body,
+                                    char **session_id,
+                                    char **mode,
+                                    uint64_t *parent_revision,
+                                    bool *has_parent_revision,
+                                    char **debug_reason,
+                                    int *debug_full_messages,
+                                    int *debug_sent_messages,
+                                    int *debug_previous_messages,
+                                    uint64_t *debug_stored_revision,
+                                    char *err,
+                                    size_t errlen) {
+    *session_id = NULL;
+    *mode = NULL;
+    *parent_revision = 0;
+    *has_parent_revision = false;
+    *debug_reason = NULL;
+    *debug_full_messages = -1;
+    *debug_sent_messages = -1;
+    *debug_previous_messages = -1;
+    *debug_stored_revision = 0;
+
+    const char *p = body;
+    json_ws(&p);
+    if (*p != '{') goto bad;
+    p++;
+    json_ws(&p);
+    while (*p && *p != '}') {
+        char *key = NULL;
+        if (!json_string(&p, &key)) goto bad;
+        json_ws(&p);
+        if (*p != ':') {
+            free(key);
+            goto bad;
+        }
+        p++;
+        if (!strcmp(key, "session_id")) {
+            free(*session_id);
+            if (!json_string(&p, session_id)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "mode") || !strcmp(key, "stateful_mode")) {
+            free(*mode);
+            if (!json_string(&p, mode)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "parent_revision") ||
+                   !strcmp(key, "parentRevision")) {
+            double v = 0.0;
+            if (!json_number(&p, &v) || v < 0.0) {
+                free(key);
+                goto bad;
+            }
+            *parent_revision = (uint64_t)v;
+            *has_parent_revision = true;
+        } else if (!strcmp(key, "stateful_debug")) {
+            if (!parse_stateful_debug_value(&p, debug_reason,
+                                            debug_full_messages,
+                                            debug_sent_messages,
+                                            debug_previous_messages,
+                                            debug_stored_revision)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "stateful_debug_reason")) {
+            free(*debug_reason);
+            if (!json_string(&p, debug_reason)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "stateful_debug_full_messages")) {
+            if (!json_int(&p, debug_full_messages)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "stateful_debug_sent_messages")) {
+            if (!json_int(&p, debug_sent_messages)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "stateful_debug_previous_messages")) {
+            if (!json_int(&p, debug_previous_messages)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "stateful_debug_stored_revision")) {
+            double v = 0.0;
+            if (!json_number(&p, &v) || v < 0.0) {
+                free(key);
+                goto bad;
+            }
+            *debug_stored_revision = (uint64_t)v;
+        } else if (!json_skip_value(&p)) {
+            free(key);
+            goto bad;
+        }
+        free(key);
+        json_ws(&p);
+        if (*p == ',') p++;
+        json_ws(&p);
+    }
+    if (*p != '}') goto bad;
+    if (!*session_id || !(*session_id)[0]) {
+        snprintf(err, errlen, "missing session_id");
+        goto fail;
+    }
+    if (!*mode || !(*mode)[0]) {
+        snprintf(err, errlen, "missing mode");
+        goto fail;
+    }
+    return true;
+bad:
+    snprintf(err, errlen, "invalid JSON request");
+fail:
+    free(*session_id);
+    free(*mode);
+    free(*debug_reason);
+    *session_id = NULL;
+    *mode = NULL;
+    *debug_reason = NULL;
+    return false;
+}
+
+static bool parse_stateful_delta_value(const char **p,
+                                       chat_msgs *msgs,
+                                       bool *got_messages) {
+    json_ws(p);
+    if (**p == '[') {
+        chat_msgs_free(msgs);
+        if (!parse_messages(p, msgs)) return false;
+        *got_messages = true;
+        return true;
+    }
+    if (**p != '{') return false;
+    (*p)++;
+    json_ws(p);
+    while (**p && **p != '}') {
+        char *key = NULL;
+        if (!json_string(p, &key)) return false;
+        json_ws(p);
+        if (**p != ':') {
+            free(key);
+            return false;
+        }
+        (*p)++;
+        if (!strcmp(key, "messages")) {
+            chat_msgs_free(msgs);
+            if (!parse_messages(p, msgs)) {
+                free(key);
+                return false;
+            }
+            *got_messages = true;
+        } else if (!json_skip_value(p)) {
+            free(key);
+            return false;
+        }
+        free(key);
+        json_ws(p);
+        if (**p == ',') (*p)++;
+        json_ws(p);
+    }
+    if (**p != '}') return false;
+    (*p)++;
+    return true;
+}
+
+static bool stateful_delta_messages_allowed(const chat_msgs *msgs,
+                                            char *err,
+                                            size_t errlen) {
+    if (!msgs || msgs->len == 0) {
+        snprintf(err, errlen, "delta messages must not be empty");
+        return false;
+    }
+    for (int i = 0; i < msgs->len; i++) {
+        const char *role = msgs->v[i].role ? msgs->v[i].role : "";
+        if (!role_is_user_like(role)) {
+            snprintf(err, errlen,
+                     "stateful delta messages may only use user/tool/function roles");
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool parse_stateful_delta_request(ds4_engine *e, server *s,
+                                         const char *body,
+                                         int def_tokens,
+                                         int ctx_size,
+                                         request *r,
+                                         char *session_id,
+                                         uint64_t parent_revision,
+                                         char *err,
+                                         size_t errlen) {
+    request_init(r, REQ_CHAT, def_tokens);
+    r->api = API_OPENAI;
+    r->stateful = true;
+    r->stateful_delta = true;
+    r->stateful_session_id = session_id;
+    session_id = NULL;
+    r->stateful_parent_revision = parent_revision;
+
+    bool state_has_tools = false;
+    ds4_think_mode state_think = DS4_THINK_HIGH;
+    (void)stateful_live_copy_config(s, r->stateful_session_id,
+                                    r->stateful_parent_revision,
+                                    &state_has_tools,
+                                    &state_think,
+                                    &r->tool_orders);
+    r->has_tools = state_has_tools;
+    r->think_mode = state_think;
+
+    const char *p = body;
+    bool got_messages = false;
+    bool got_thinking = false;
+    bool thinking_enabled = ds4_think_mode_enabled(state_think);
+    ds4_think_mode reasoning_effort = state_think == DS4_THINK_MAX ?
+                                      DS4_THINK_MAX : DS4_THINK_HIGH;
+    bool tool_choice_none = false;
+    bool tools_seen = false;
+    chat_msgs msgs = {0};
+    char *tool_schemas = NULL;
+
+    json_ws(&p);
+    if (*p != '{') goto bad;
+    p++;
+    json_ws(&p);
+    while (*p && *p != '}') {
+        char *key = NULL;
+        if (!json_string(&p, &key)) goto bad;
+        json_ws(&p);
+        if (*p != ':') {
+            free(key);
+            goto bad;
+        }
+        p++;
+        if (!strcmp(key, "messages")) {
+            chat_msgs_free(&msgs);
+            if (!parse_messages(&p, &msgs)) {
+                free(key);
+                goto bad;
+            }
+            got_messages = true;
+        } else if (!strcmp(key, "delta")) {
+            if (!parse_stateful_delta_value(&p, &msgs, &got_messages)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "tools")) {
+            tools_seen = true;
+            free(tool_schemas);
+            tool_schemas = NULL;
+            tool_schema_orders_free(&r->tool_orders);
+            if (!parse_tools_value(&p, &tool_schemas, &r->tool_orders)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "tool_choice")) {
+            json_ws(&p);
+            if (*p == '"') {
+                char *choice = NULL;
+                if (!json_string(&p, &choice)) {
+                    free(key);
+                    goto bad;
+                }
+                tool_choice_none = !strcmp(choice, "none");
+                free(choice);
+            } else if (!json_skip_value(&p)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "model")) {
+            free(r->model);
+            if (!json_string(&p, &r->model)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "max_tokens") || !strcmp(key, "max_completion_tokens")) {
+            if (!json_int(&p, &r->max_tokens)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "temperature")) {
+            double v = 0.0;
+            if (!json_number(&p, &v)) {
+                free(key);
+                goto bad;
+            }
+            r->temperature = (float)v;
+        } else if (!strcmp(key, "top_p")) {
+            double v = 0.0;
+            if (!json_number(&p, &v)) {
+                free(key);
+                goto bad;
+            }
+            r->top_p = (float)v;
+        } else if (!strcmp(key, "min_p")) {
+            double v = 0.0;
+            if (!json_number(&p, &v)) {
+                free(key);
+                goto bad;
+            }
+            r->min_p = (float)v;
+        } else if (!strcmp(key, "top_k")) {
+            if (!json_int(&p, &r->top_k)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "seed")) {
+            double v = 0.0;
+            if (!json_number(&p, &v)) {
+                free(key);
+                goto bad;
+            }
+            r->seed = v > 0.0 ? (uint64_t)v : 0;
+        } else if (!strcmp(key, "stream")) {
+            if (!json_bool(&p, &r->stream)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "stream_options")) {
+            if (!parse_stream_options(&p, &r->stream_include_usage)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "thinking")) {
+            if (!parse_thinking_control_value(&p, &thinking_enabled)) {
+                free(key);
+                goto bad;
+            }
+            got_thinking = true;
+        } else if (!strcmp(key, "reasoning_effort")) {
+            if (!parse_reasoning_effort_value(&p, &reasoning_effort)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "think")) {
+            if (!json_bool(&p, &thinking_enabled)) {
+                free(key);
+                goto bad;
+            }
+            got_thinking = true;
+        } else if (!strcmp(key, "stop")) {
+            if (!parse_stop(&p, &r->stops)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!json_skip_value(&p)) {
+            free(key);
+            goto bad;
+        }
+        free(key);
+        json_ws(&p);
+        if (*p == ',') p++;
+        json_ws(&p);
+    }
+    if (*p != '}') goto bad;
+    if (!got_messages) {
+        snprintf(err, errlen, "missing delta.messages");
+        goto fail;
+    }
+    if (!stateful_delta_messages_allowed(&msgs, err, errlen)) goto fail;
+    if (tools_seen) r->has_tools = tool_schemas && tool_schemas[0] && !tool_choice_none;
+    else if (tool_choice_none) r->has_tools = false;
+    if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
+    if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
+    r->think_mode = ds4_think_mode_for_context(
+        think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
+    r->prompt_preserves_reasoning = true;
+    r->stateful_suffix_text = render_live_tool_tail(&msgs, 0, r->think_mode);
+    r->prompt_text = xstrdup(r->stateful_suffix_text ? r->stateful_suffix_text : "");
+    ds4_tokenize_rendered_chat(e, r->stateful_suffix_text ? r->stateful_suffix_text : "",
+                               &r->prompt);
+    chat_msgs_free(&msgs);
+    free(tool_schemas);
+    free(session_id);
+    return true;
+bad:
+    snprintf(err, errlen, "invalid JSON request");
+fail:
+    chat_msgs_free(&msgs);
+    free(tool_schemas);
+    free(session_id);
+    request_free(r);
+    return false;
+}
+
+static bool parse_stateful_chat_request(ds4_engine *e, server *s, const char *body,
+                                        int def_tokens, int ctx_size,
+                                        request *r, char *err, size_t errlen) {
+    char *session_id = NULL;
+    char *mode = NULL;
+    uint64_t parent_revision = 0;
+    bool has_parent_revision = false;
+    char *debug_reason = NULL;
+    int debug_full_messages = -1;
+    int debug_sent_messages = -1;
+    int debug_previous_messages = -1;
+    uint64_t debug_stored_revision = 0;
+    if (!parse_stateful_envelope(body, &session_id, &mode,
+                                 &parent_revision, &has_parent_revision,
+                                 &debug_reason,
+                                 &debug_full_messages,
+                                 &debug_sent_messages,
+                                 &debug_previous_messages,
+                                 &debug_stored_revision,
+                                 err, errlen)) {
+        return false;
+    }
+
+    if (!strcmp(mode, "reset")) {
+        bool ok = parse_chat_request(e, s, body, def_tokens, ctx_size,
+                                     r, err, errlen);
+        if (!ok) {
+            free(session_id);
+            free(mode);
+            free(debug_reason);
+            return false;
+        }
+        r->stateful = true;
+        r->stateful_reset = true;
+        r->stateful_session_id = session_id;
+        session_id = NULL;
+        r->stateful_parent_revision = has_parent_revision ? parent_revision : 0;
+        r->stateful_debug_reason = debug_reason;
+        debug_reason = NULL;
+        r->stateful_debug_full_messages = debug_full_messages;
+        r->stateful_debug_sent_messages = debug_sent_messages;
+        r->stateful_debug_previous_messages = debug_previous_messages;
+        r->stateful_debug_stored_revision = debug_stored_revision;
+        free(mode);
+        return true;
+    }
+
+    if (!strcmp(mode, "delta")) {
+        if (!has_parent_revision) {
+            snprintf(err, errlen, "missing parent_revision");
+            free(session_id);
+            free(mode);
+            free(debug_reason);
+            return false;
+        }
+        free(mode);
+        bool ok = parse_stateful_delta_request(e, s, body, def_tokens, ctx_size,
+                                               r, session_id, parent_revision,
+                                               err, errlen);
+        if (!ok) {
+            free(debug_reason);
+            return false;
+        }
+        r->stateful_debug_reason = debug_reason;
+        debug_reason = NULL;
+        r->stateful_debug_full_messages = debug_full_messages;
+        r->stateful_debug_sent_messages = debug_sent_messages;
+        r->stateful_debug_previous_messages = debug_previous_messages;
+        r->stateful_debug_stored_revision = debug_stored_revision;
+        return true;
+    }
+
+    snprintf(err, errlen, "unknown stateful mode");
+    free(session_id);
+    free(mode);
+    free(debug_reason);
+    return false;
+}
+
 static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, int def_tokens,
                                     int ctx_size, request *r, char *err, size_t errlen) {
     request_init(r, REQ_CHAT, def_tokens);
@@ -4784,10 +5336,52 @@ static void append_cors_headers(buf *h) {
     buf_puts(h,
         "Access-Control-Allow-Origin: *\r\n"
         "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
-        "Access-Control-Allow-Headers: *\r\n");
+        "Access-Control-Allow-Headers: *\r\n"
+        "Access-Control-Expose-Headers: X-DS4-Stateful, X-DS4-Session-Id, X-DS4-Session-Revision, X-DS4-Parent-Revision, X-DS4-Stateful-Mode\r\n");
 }
 
-static bool http_response(int fd, bool enable_cors, int code, const char *type, const char *body) {
+static uint64_t stateful_response_revision(const request *r) {
+    return r ? r->stateful_parent_revision + 1 : 0;
+}
+
+static void append_http_header_value(buf *h, const char *s) {
+    if (!s) return;
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        if (*p == '\r' || *p == '\n') buf_putc(h, ' ');
+        else if (*p >= 32 && *p < 127) buf_putc(h, (char)*p);
+        else buf_putc(h, '?');
+    }
+}
+
+static void append_stateful_response_headers(buf *h, const request *r) {
+    if (!r || !r->stateful || !r->stateful_session_id) return;
+    buf_puts(h, "X-DS4-Stateful: true\r\n");
+    buf_puts(h, "X-DS4-Session-Id: ");
+    append_http_header_value(h, r->stateful_session_id);
+    buf_puts(h, "\r\nX-DS4-Session-Revision: ");
+    buf_printf(h, "%llu", (unsigned long long)stateful_response_revision(r));
+    buf_puts(h, "\r\nX-DS4-Parent-Revision: ");
+    buf_printf(h, "%llu", (unsigned long long)r->stateful_parent_revision);
+    buf_puts(h, "\r\nX-DS4-Stateful-Mode: ");
+    buf_puts(h, r->stateful_delta ? "delta" : "reset");
+    buf_puts(h, "\r\n");
+}
+
+static void append_stateful_metadata_json(buf *b, const request *r) {
+    buf_puts(b, "{\"session_id\":");
+    json_escape(b, r && r->stateful_session_id ? r->stateful_session_id : "");
+    buf_puts(b, ",\"mode\":");
+    json_escape(b, r && r->stateful_delta ? "delta" : "reset");
+    buf_puts(b, ",\"parent_revision\":");
+    buf_printf(b, "%llu", (unsigned long long)(r ? r->stateful_parent_revision : 0));
+    buf_puts(b, ",\"revision\":");
+    buf_printf(b, "%llu", (unsigned long long)stateful_response_revision(r));
+    buf_putc(b, '}');
+}
+
+static bool http_response_ex(int fd, bool enable_cors, int code,
+                             const char *type, const char *body,
+                             const request *r) {
     const char *reason = code == 200 ? "OK" :
                          code == 204 ? "No Content" :
                          code == 400 ? "Bad Request" :
@@ -4805,12 +5399,23 @@ static bool http_response(int fd, bool enable_cors, int code, const char *type, 
         buf_puts(&h, type);
         buf_puts(&h, "\r\n");
     }
+    append_stateful_response_headers(&h, r);
     if (enable_cors) append_cors_headers(&h);
     buf_puts(&h, "Connection: close\r\n\r\n");
     bool ok = send_all(fd, h.ptr, h.len);
     if (ok && body_len) ok = send_all(fd, body, body_len);
     buf_free(&h);
     return ok;
+}
+
+static bool http_response(int fd, bool enable_cors, int code, const char *type, const char *body) {
+    return http_response_ex(fd, enable_cors, code, type, body, NULL);
+}
+
+static bool http_response_for_request(int fd, bool enable_cors, int code,
+                                      const char *type, const char *body,
+                                      const request *r) {
+    return http_response_ex(fd, enable_cors, code, type, body, r);
 }
 
 static bool http_error(int fd, bool enable_cors, int code, const char *msg) {
@@ -4873,12 +5478,13 @@ static bool http_error_context_length_exceeded(int fd, bool enable_cors,
 /* Streaming is a translation state machine over the raw DS4 text.  The model
  * may produce <think> and DSML tool blocks; clients should receive those as
  * protocol-native reasoning/tool deltas, never as visible assistant text. */
-static bool sse_headers(int fd, bool enable_cors) {
+static bool sse_headers_for_request(int fd, bool enable_cors, const request *r) {
     buf h = {0};
     buf_puts(&h,
         "HTTP/1.1 200 OK\r\n"
         "Content-Type: text/event-stream\r\n"
         "Cache-Control: no-cache\r\n");
+    append_stateful_response_headers(&h, r);
     if (enable_cors) append_cors_headers(&h);
     buf_puts(&h, "Connection: close\r\n\r\n");
     bool ok = send_all(fd, h.ptr, h.len);
@@ -4973,6 +5579,10 @@ static bool sse_usage_chunk(int fd, const request *r, const char *id,
         buf_puts(&b, ",\"choices\":[],\"usage\":");
     }
     append_openai_usage_json(&b, r, prompt_tokens, completion_tokens);
+    if (r && r->stateful) {
+        buf_puts(&b, ",\"ds4_stateful\":");
+        append_stateful_metadata_json(&b, r);
+    }
     buf_puts(&b, "}\n\n");
 
     bool ok = send_all(fd, b.ptr, b.len);
@@ -6816,8 +7426,12 @@ static bool final_response(int fd, bool enable_cors,
         buf_puts(&b, "}],\"usage\":");
     }
     append_openai_usage_json(&b, r, prompt_tokens, completion_tokens);
+    if (r && r->stateful) {
+        buf_puts(&b, ",\"ds4_stateful\":");
+        append_stateful_metadata_json(&b, r);
+    }
     buf_puts(&b, "}\n");
-    bool ok = http_response(fd, enable_cors, 200, "application/json", b.ptr);
+    bool ok = http_response_for_request(fd, enable_cors, 200, "application/json", b.ptr, r);
     buf_free(&b);
     return ok;
 }
@@ -7702,6 +8316,16 @@ typedef struct {
     size_t visible_len;
 } visible_live_state;
 
+typedef struct {
+    bool valid;
+    char *session_id;
+    uint64_t revision;
+    int live_tokens;
+    bool has_tools;
+    ds4_think_mode think_mode;
+    tool_schema_orders tool_orders;
+} stateful_live_state;
+
 static bool id_list_contains(const stop_list *ids, const char *id);
 static void id_list_push_unique(stop_list *ids, const char *id);
 
@@ -7714,6 +8338,7 @@ struct server {
     live_tool_state responses_live;
     live_tool_state anthropic_live;
     visible_live_state thinking_live;
+    stateful_live_state stateful_live;
     bool disable_exact_dsml_tool_replay;
     bool enable_cors;
     pthread_mutex_t tool_mu;
@@ -7930,6 +8555,31 @@ static void tool_memory_free(tool_memory *m) {
     memset(m, 0, sizeof(*m));
 }
 
+static void tool_schema_order_copy(tool_schema_order *dst,
+                                   const tool_schema_order *src) {
+    memset(dst, 0, sizeof(*dst));
+    if (!src) return;
+    dst->name = src->name ? xstrdup(src->name) : NULL;
+    dst->wire_name = src->wire_name ? xstrdup(src->wire_name) : NULL;
+    dst->namespace = src->namespace ? xstrdup(src->namespace) : NULL;
+    dst->responses_tool_search = src->responses_tool_search;
+    for (int i = 0; i < src->len; i++) {
+        tool_schema_order_prop_push(dst, src->prop[i] ? xstrdup(src->prop[i]) : xstrdup(""));
+    }
+}
+
+static void tool_schema_orders_copy(tool_schema_orders *dst,
+                                    const tool_schema_orders *src) {
+    tool_schema_orders_free(dst);
+    memset(dst, 0, sizeof(*dst));
+    if (!src) return;
+    for (int i = 0; i < src->len; i++) {
+        tool_schema_order order;
+        tool_schema_order_copy(&order, &src->v[i]);
+        tool_schema_orders_push(dst, order);
+    }
+}
+
 /* Single live protocol-tool state.
  *
  * This is not an implementation of durable remote conversation storage.  It is
@@ -7967,6 +8617,82 @@ static void visible_live_free(visible_live_state *st) {
     if (!st) return;
     visible_live_clear_locked(st);
     memset(st, 0, sizeof(*st));
+}
+
+static void stateful_live_clear_locked(stateful_live_state *st) {
+    if (!st) return;
+    free(st->session_id);
+    st->session_id = NULL;
+    tool_schema_orders_free(&st->tool_orders);
+    st->revision = 0;
+    st->live_tokens = 0;
+    st->has_tools = false;
+    st->think_mode = DS4_THINK_HIGH;
+    st->valid = false;
+}
+
+static void stateful_live_free(stateful_live_state *st) {
+    if (!st) return;
+    stateful_live_clear_locked(st);
+    memset(st, 0, sizeof(*st));
+}
+
+static bool stateful_live_matches_request(server *s, const char *session_id,
+                                          uint64_t parent_revision,
+                                          int live_tokens) {
+    if (!s || !session_id || !session_id[0]) return false;
+    pthread_mutex_lock(&s->tool_mu);
+    bool ok = s->stateful_live.valid &&
+              s->stateful_live.session_id &&
+              !strcmp(s->stateful_live.session_id, session_id) &&
+              s->stateful_live.revision == parent_revision &&
+              s->stateful_live.live_tokens == live_tokens;
+    pthread_mutex_unlock(&s->tool_mu);
+    return ok;
+}
+
+static bool stateful_live_copy_config(server *s, const char *session_id,
+                                      uint64_t parent_revision,
+                                      bool *has_tools,
+                                      ds4_think_mode *think_mode,
+                                      tool_schema_orders *orders) {
+    if (has_tools) *has_tools = false;
+    if (think_mode) *think_mode = DS4_THINK_HIGH;
+    if (!s || !session_id || !session_id[0]) return false;
+    pthread_mutex_lock(&s->tool_mu);
+    bool ok = s->stateful_live.valid &&
+              s->stateful_live.session_id &&
+              !strcmp(s->stateful_live.session_id, session_id) &&
+              s->stateful_live.revision == parent_revision;
+    if (ok) {
+        if (has_tools) *has_tools = s->stateful_live.has_tools;
+        if (think_mode) *think_mode = s->stateful_live.think_mode;
+        if (orders) tool_schema_orders_copy(orders, &s->stateful_live.tool_orders);
+    }
+    pthread_mutex_unlock(&s->tool_mu);
+    return ok;
+}
+
+static void stateful_live_remember(server *s, const request *r) {
+    if (!s || !r || !r->stateful || !r->stateful_session_id ||
+        !r->stateful_session_id[0]) return;
+    pthread_mutex_lock(&s->tool_mu);
+    stateful_live_clear_locked(&s->stateful_live);
+    s->stateful_live.session_id = xstrdup(r->stateful_session_id);
+    s->stateful_live.revision = r->stateful_parent_revision + 1;
+    s->stateful_live.live_tokens = ds4_session_pos(s->session);
+    s->stateful_live.has_tools = r->has_tools;
+    s->stateful_live.think_mode = r->think_mode;
+    tool_schema_orders_copy(&s->stateful_live.tool_orders, &r->tool_orders);
+    s->stateful_live.valid = true;
+    pthread_mutex_unlock(&s->tool_mu);
+}
+
+static void stateful_live_clear(server *s) {
+    if (!s) return;
+    pthread_mutex_lock(&s->tool_mu);
+    stateful_live_clear_locked(&s->stateful_live);
+    pthread_mutex_unlock(&s->tool_mu);
 }
 
 static void thinking_live_clear(server *s) {
@@ -8897,6 +9623,30 @@ static int anthropic_live_continuation_prompt(server *s, const request *req,
     return live_tokens->len;
 }
 
+/* DS4-native stateful delta continuation.
+ *
+ * The custom Pi provider can send only appended user/tool messages after a
+ * reset.  The session_id + parent_revision pair names the live sampled
+ * frontier; when it still matches the worker-owned KV session, append the
+ * rendered suffix directly and skip full transcript rendering/prefix proof. */
+static int stateful_live_delta_prompt(server *s, const request *req,
+                                      int live_pos,
+                                      ds4_tokens *effective_prompt) {
+    if (!s || !req || !effective_prompt) return 0;
+    if (!req->stateful_delta || !req->stateful_suffix_text) return 0;
+    if (!stateful_live_matches_request(s, req->stateful_session_id,
+                                       req->stateful_parent_revision,
+                                       live_pos)) return 0;
+
+    const ds4_tokens *live_tokens = ds4_session_tokens(s->session);
+    if (!live_tokens || live_tokens->len != live_pos) return 0;
+
+    build_prompt_from_exact_prefix_and_text_suffix(
+        s->engine, live_tokens, req->stateful_suffix_text,
+        effective_prompt);
+    return live_tokens->len;
+}
+
 /* Visible-replay Responses continuation.
  *
  * Other clients send the full visible transcript on every turn even though the
@@ -9307,12 +10057,32 @@ typedef struct {
     bool headers_sent;
     bool stream_failed;
     double last_keepalive;
+    const request *req;
 } server_prefill_progress;
 
 static void request_ctx_span(char *buf, size_t len, int cached, int prompt) {
     int suffix = prompt - cached;
     if (suffix < 0) suffix = 0;
     snprintf(buf, len, "%d..%d:%d", cached, prompt, suffix);
+}
+
+static uint32_t server_dynamic_prefill_chunk_tokens(int suffix_tokens) {
+    if (!server_env_flag("DS4_SERVER_DYNAMIC_PREFILL")) return 0;
+    if (suffix_tokens <= 0) return 0;
+
+    int chunk;
+    if (suffix_tokens <= 128) chunk = 128;
+    else if (suffix_tokens <= 512) chunk = 512;
+    else if (suffix_tokens <= 4096) chunk = 2048;
+    else chunk = 4096;
+
+    const int min_chunk = server_env_int("DS4_SERVER_DYNAMIC_PREFILL_MIN", 128, 1, 65536);
+    const int max_chunk = server_env_int("DS4_SERVER_DYNAMIC_PREFILL_MAX", 4096, 1, 65536);
+    if (chunk < min_chunk) chunk = min_chunk;
+    if (chunk > max_chunk) chunk = max_chunk;
+    if (chunk <= 0) return 0;
+    chunk = (chunk + 3) & ~3;
+    return (uint32_t)chunk;
 }
 
 static void log_flags(char *buf, size_t len, bool responses_protocol,
@@ -9402,7 +10172,7 @@ static thinking_state thinking_state_from_prompt(const request *r) {
 static bool should_remember_thinking_checkpoint(const request *r,
                                                 const thinking_state *thinking,
                                                 const char *finish) {
-    if (!r || r->kind != REQ_CHAT || r->has_tools) return false;
+    if (!r || r->kind != REQ_CHAT || r->has_tools || r->stateful) return false;
     if (r->prompt_preserves_reasoning) return false;
     if (!ds4_think_mode_enabled(r->think_mode)) return false;
     if (finish && (!strcmp(finish, "error") || !strcmp(finish, "length"))) return false;
@@ -9450,7 +10220,7 @@ static bool server_progress_cb(void *ud, const char *event, int current, int tot
     if (p->stream && p->fd >= 0 && !p->stream_failed) {
         if (!p->headers_sent) {
             p->headers_sent = true;
-            if (sse_headers(p->fd, p->enable_cors)) {
+            if (sse_headers_for_request(p->fd, p->enable_cors, p->req)) {
                 p->last_keepalive = now;
             } else {
                 p->stream_failed = true;
@@ -9807,22 +10577,44 @@ static void generate_job(server *s, job *j) {
     ds4_tokens effective_prompt = {0};
     const ds4_tokens *prompt_for_sync = &j->req.prompt;
     const bool responses_protocol = j->req.api == API_RESPONSES;
+    bool stateful_live_continuation = false;
     bool responses_live_continuation = false;
     bool anthropic_live_continuation = false;
     bool thinking_live_continuation = false;
     const char *responses_live_match = NULL;
     int responses_live_match_ids = 0;
     int anthropic_live_match_ids = 0;
-    /* Responses gets the first chance to continue from live state.  This is
+    int cached = stateful_live_delta_prompt(s, &j->req, old_pos,
+                                            &effective_prompt);
+    const char *cache_source = cached > 0 ? "stateful-delta" : "none";
+    if (cached > 0) {
+        stateful_live_continuation = true;
+        prompt_for_sync = &effective_prompt;
+    } else if (j->req.stateful_delta) {
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: stateful live continuation unavailable session=%s parent=%llu stored=%llu reason=\"%s\" live=%d prompt=%d common=%d",
+                   j->req.stateful_session_id ? j->req.stateful_session_id : "",
+                   (unsigned long long)j->req.stateful_parent_revision,
+                   (unsigned long long)j->req.stateful_debug_stored_revision,
+                   j->req.stateful_debug_reason ? j->req.stateful_debug_reason : "",
+                   old_pos,
+                   j->req.prompt.len,
+                   common);
+        ds4_tokens_free(&effective_prompt);
+        http_error(j->fd, s->enable_cors, 409,
+                   "DS4 stateful continuation state is not available; resend with mode=reset and full messages");
+        return;
+    }
+    /* Responses gets the next chance to continue from live state.  This is
      * the whole point of the API shape: a request that is bound to prior live
      * output by visible transcript or tool call ids does not need to prove an
      * exact token-prefix match.  Exact token/text/disk matching remains the
      * fallback when the live state is absent or no longer describes the
      * request. */
-    int cached = responses_live_visible_prefix_prompt(s, &j->req, old_pos,
-                                                      &effective_prompt);
-    const char *cache_source = cached > 0 ? "responses-visible" : "none";
-    if (cached > 0) {
+    if (cached == 0) cached = responses_live_visible_prefix_prompt(s, &j->req, old_pos,
+                                                                   &effective_prompt);
+    if (cached > 0 && !stateful_live_continuation) cache_source = "responses-visible";
+    if (cached > 0 && !stateful_live_continuation) {
         responses_live_match = "visible-prefix";
         if (responses_live_matches_request(s, &j->req.responses_live_call_ids,
                                            old_pos))
@@ -9837,10 +10629,10 @@ static void generate_job(server *s, job *j) {
         cache_source = cached > 0 ? "responses-tool-output" : "none";
         if (cached > 0) responses_live_match = "tool-output-ids";
     }
-    if (cached > 0) {
+    if (cached > 0 && !stateful_live_continuation) {
         responses_live_continuation = true;
         prompt_for_sync = &effective_prompt;
-    } else {
+    } else if (cached == 0) {
         cached = anthropic_live_continuation_prompt(s, &j->req, old_pos,
                                                     &effective_prompt,
                                                     &anthropic_live_match_ids);
@@ -9929,11 +10721,21 @@ static void generate_job(server *s, job *j) {
         j->req.responses_requires_live_reasoning &&
         !responses_reasoning_state_preserved;
     const int prompt_tokens = prompt_for_sync->len;
+    if (prompt_tokens >= ds4_session_ctx(s->session)) {
+        ds4_tokens_free(&effective_prompt);
+        http_error_context_length_exceeded(j->fd, s->enable_cors, &j->req,
+                                           prompt_tokens,
+                                           ds4_session_ctx(s->session));
+        return;
+    }
     /* OpenAI usage details: the reusable prefix is a cache read, while the
      * effective prompt suffix evaluated by ds4_session_sync() is written into
      * the live KV cache and can be reused by the next request. */
     j->req.cache_read_tokens = cached;
     j->req.cache_write_tokens = prompt_tokens > cached ? prompt_tokens - cached : 0;
+    const int suffix_tokens_for_plan = prompt_tokens > cached ? prompt_tokens - cached : prompt_tokens;
+    const uint32_t dynamic_prefill_chunk = server_dynamic_prefill_chunk_tokens(suffix_tokens_for_plan);
+    ds4_session_set_prefill_chunk_tokens(s->session, dynamic_prefill_chunk);
 
     const double t0 = now_sec();
     uint64_t trace_id = trace_begin(s, j, cached, prompt_tokens, &cache_diag,
@@ -9952,12 +10754,43 @@ static void generate_job(server *s, job *j) {
         .fd = j->fd,
         .stream = j->req.stream,
         .enable_cors = s->enable_cors,
+        .req = &j->req,
     };
     snprintf(progress.ctx, sizeof(progress.ctx), "%s", ctx_span);
     char req_flags[64];
     log_flags(req_flags, sizeof(req_flags), responses_protocol,
               j->req.has_tools, false, false, false);
-    if (responses_live_continuation) {
+    if (dynamic_prefill_chunk > 0) {
+        server_log(DS4_LOG_PREFILL,
+                   "ds4-server: prefill plan dynamic suffix=%d cached=%d prompt=%d chunk=%u",
+                   suffix_tokens_for_plan,
+                   cached,
+                   prompt_tokens,
+                   dynamic_prefill_chunk);
+    }
+    if (j->req.stateful) {
+        server_log(DS4_LOG_PREFILL,
+                   "ds4-server: stateful request mode=%s session=%s parent=%llu stored=%llu reason=\"%s\" messages=%d/%d prev=%d cached=%d prompt=%d",
+                   j->req.stateful_delta ? "delta" : "reset",
+                   j->req.stateful_session_id ? j->req.stateful_session_id : "",
+                   (unsigned long long)j->req.stateful_parent_revision,
+                   (unsigned long long)j->req.stateful_debug_stored_revision,
+                   j->req.stateful_debug_reason ? j->req.stateful_debug_reason : "",
+                   j->req.stateful_debug_sent_messages,
+                   j->req.stateful_debug_full_messages,
+                   j->req.stateful_debug_previous_messages,
+                   cached,
+                   prompt_tokens);
+    }
+    if (stateful_live_continuation) {
+        server_log(DS4_LOG_PREFILL,
+                   "ds4-server: stateful live continuation session=%s parent=%llu reason=\"%s\" cached=%d prompt=%d",
+                   j->req.stateful_session_id ? j->req.stateful_session_id : "",
+                   (unsigned long long)j->req.stateful_parent_revision,
+                   j->req.stateful_debug_reason ? j->req.stateful_debug_reason : "",
+                   cached,
+                   prompt_tokens);
+    } else if (responses_live_continuation) {
         server_log(DS4_LOG_PREFILL,
                    "ds4-server: responses live continuation RESPPROTO match=%s ids=%d cached=%d prompt=%d",
                    responses_live_match ? responses_live_match : "unknown",
@@ -10063,7 +10896,9 @@ static void generate_job(server *s, job *j) {
         return;
     }
     /* Once a non-live request wins, old protocol live bindings are stale. Keep
-     * a binding only when this request explicitly continued from it. */
+     * a binding only when this request explicitly continued from it or is a
+     * stateful reset that will replace the binding after generation. */
+    if (!stateful_live_continuation && !j->req.stateful_reset) stateful_live_clear(s);
     if (!responses_live_continuation) responses_live_clear(s);
     if (!anthropic_live_continuation) anthropic_live_clear(s);
     if (!thinking_live_continuation) thinking_live_clear(s);
@@ -10111,7 +10946,7 @@ static void generate_job(server *s, job *j) {
         /* The prefill progress callback may have already sent the SSE headers
          * to keep the connection alive during a long prefill. Only emit them
          * here when prefill never fired (e.g. fully cached prompt). */
-        if (!progress.headers_sent && !sse_headers(j->fd, s->enable_cors)) {
+        if (!progress.headers_sent && !sse_headers_for_request(j->fd, s->enable_cors, &j->req)) {
             server_log(DS4_LOG_GENERATION,
                        "ds4-server: %s ctx=%s%s%s sse headers failed",
                        j->req.kind == REQ_CHAT ? "chat" : "completion",
@@ -10520,8 +11355,26 @@ static void generate_job(server *s, job *j) {
             anthropic_live_clear(s);
         }
     }
+    if (j->req.stateful) {
+        if (strcmp(final_finish, "error")) {
+            stateful_live_remember(s, &j->req);
+            server_log(DS4_LOG_KVCACHE,
+                       "ds4-server: stateful checkpoint remembered session=%s revision=%llu live=%d",
+                       j->req.stateful_session_id ? j->req.stateful_session_id : "",
+                       (unsigned long long)(j->req.stateful_parent_revision + 1),
+                       ds4_session_pos(s->session));
+            trace_event(s, trace_id,
+                        "stateful checkpoint remembered: session=%s revision=%llu live=%d",
+                        j->req.stateful_session_id ? j->req.stateful_session_id : "",
+                        (unsigned long long)(j->req.stateful_parent_revision + 1),
+                        ds4_session_pos(s->session));
+        } else {
+            stateful_live_clear(s);
+        }
+    }
 
     if (j->req.kind == REQ_CHAT && parsed_calls.len &&
+        !j->req.stateful &&
         j->req.api != API_RESPONSES &&
         should_canonicalize_tool_checkpoint(s, &parsed_calls))
     {
@@ -10910,6 +11763,9 @@ static void *client_main(void *arg) {
     } else if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/chat/completions")) {
         ok = parse_chat_request(s->engine, s, hr.body, s->default_tokens,
                                 ctx_size, &req, err, sizeof(err));
+    } else if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/ds4/stateful/chat/completions")) {
+        ok = parse_stateful_chat_request(s->engine, s, hr.body, s->default_tokens,
+                                         ctx_size, &req, err, sizeof(err));
     } else if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/responses")) {
         ok = parse_responses_request(s->engine, s, hr.body, s->default_tokens,
                                      ctx_size, &req, err, sizeof(err));
@@ -11082,6 +11938,7 @@ static void server_close_resources(server *s) {
     live_tool_state_free(&s->responses_live);
     live_tool_state_free(&s->anthropic_live);
     visible_live_free(&s->thinking_live);
+    stateful_live_free(&s->stateful_live);
     pthread_mutex_destroy(&s->tool_mu);
     pthread_mutex_destroy(&s->trace_mu);
     pthread_cond_destroy(&s->clients_cv);
@@ -11176,7 +12033,7 @@ static void usage(FILE *fp) {
         "  ./ds4-server --ctx 100000 --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 8192\n"
         "\n"
         "Notes:\n"
-        "  Use /v1/chat/completions, /v1/responses, /v1/completions, or /v1/messages.\n"
+        "  Use /v1/chat/completions, /v1/ds4/stateful/chat/completions, /v1/responses, /v1/completions, or /v1/messages.\n"
         "  Larger --ctx values allocate more KV memory at startup; the startup log prints the estimate.\n"
         "  Disk KV caching is best for agents that resend long prompts with stable prefixes.\n"
         "\n"
@@ -11855,7 +12712,7 @@ static void test_cors_sse_headers(void) {
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
     if (sv[0] < 0 || sv[1] < 0) return;
 
-    TEST_ASSERT(sse_headers(sv[0], true));
+    TEST_ASSERT(sse_headers_for_request(sv[0], true, NULL));
     shutdown(sv[0], SHUT_WR);
     char *out = read_socket_text(sv[1]);
     TEST_ASSERT(strstr(out, "HTTP/1.1 200 OK") != NULL);
@@ -11865,6 +12722,76 @@ static void test_cors_sse_headers(void) {
     free(out);
     close(sv[0]);
     close(sv[1]);
+}
+
+static void test_server_dynamic_prefill_chunk_plan(void) {
+    char *old_dyn = getenv("DS4_SERVER_DYNAMIC_PREFILL") ? xstrdup(getenv("DS4_SERVER_DYNAMIC_PREFILL")) : NULL;
+    char *old_min = getenv("DS4_SERVER_DYNAMIC_PREFILL_MIN") ? xstrdup(getenv("DS4_SERVER_DYNAMIC_PREFILL_MIN")) : NULL;
+    char *old_max = getenv("DS4_SERVER_DYNAMIC_PREFILL_MAX") ? xstrdup(getenv("DS4_SERVER_DYNAMIC_PREFILL_MAX")) : NULL;
+
+    unsetenv("DS4_SERVER_DYNAMIC_PREFILL");
+    unsetenv("DS4_SERVER_DYNAMIC_PREFILL_MIN");
+    unsetenv("DS4_SERVER_DYNAMIC_PREFILL_MAX");
+    TEST_ASSERT(server_dynamic_prefill_chunk_tokens(4096) == 0);
+
+    setenv("DS4_SERVER_DYNAMIC_PREFILL", "1", 1);
+    TEST_ASSERT(server_dynamic_prefill_chunk_tokens(64) == 128);
+    TEST_ASSERT(server_dynamic_prefill_chunk_tokens(512) == 512);
+    TEST_ASSERT(server_dynamic_prefill_chunk_tokens(2048) == 2048);
+    TEST_ASSERT(server_dynamic_prefill_chunk_tokens(16000) == 4096);
+
+    setenv("DS4_SERVER_DYNAMIC_PREFILL_MAX", "1024", 1);
+    TEST_ASSERT(server_dynamic_prefill_chunk_tokens(16000) == 1024);
+    setenv("DS4_SERVER_DYNAMIC_PREFILL_MIN", "256", 1);
+    TEST_ASSERT(server_dynamic_prefill_chunk_tokens(64) == 256);
+
+    if (old_dyn) setenv("DS4_SERVER_DYNAMIC_PREFILL", old_dyn, 1); else unsetenv("DS4_SERVER_DYNAMIC_PREFILL");
+    if (old_min) setenv("DS4_SERVER_DYNAMIC_PREFILL_MIN", old_min, 1); else unsetenv("DS4_SERVER_DYNAMIC_PREFILL_MIN");
+    if (old_max) setenv("DS4_SERVER_DYNAMIC_PREFILL_MAX", old_max, 1); else unsetenv("DS4_SERVER_DYNAMIC_PREFILL_MAX");
+    free(old_dyn);
+    free(old_min);
+    free(old_max);
+}
+
+static void test_stateful_response_metadata(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.stateful = true;
+    r.stateful_delta = true;
+    r.stateful_session_id = xstrdup("pi-test");
+    r.stateful_parent_revision = 4;
+
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] >= 0 && sv[1] >= 0) {
+        TEST_ASSERT(sse_headers_for_request(sv[0], false, &r));
+        shutdown(sv[0], SHUT_WR);
+        char *out = read_socket_text(sv[1]);
+        TEST_ASSERT(strstr(out, "X-DS4-Stateful: true") != NULL);
+        TEST_ASSERT(strstr(out, "X-DS4-Session-Id: pi-test") != NULL);
+        TEST_ASSERT(strstr(out, "X-DS4-Session-Revision: 5") != NULL);
+        TEST_ASSERT(strstr(out, "X-DS4-Stateful-Mode: delta") != NULL);
+        free(out);
+        close(sv[0]);
+        close(sv[1]);
+    }
+
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] >= 0 && sv[1] >= 0) {
+        TEST_ASSERT(final_response(sv[0], false, &r, "chatcmpl_stateful", "OK", NULL, NULL, "stop", 9, 2));
+        shutdown(sv[0], SHUT_WR);
+        char *out = read_socket_text(sv[1]);
+        TEST_ASSERT(strstr(out, "X-DS4-Session-Revision: 5") != NULL);
+        TEST_ASSERT(strstr(out, "\"ds4_stateful\":{") != NULL);
+        TEST_ASSERT(strstr(out, "\"session_id\":\"pi-test\"") != NULL);
+        TEST_ASSERT(strstr(out, "\"parent_revision\":4") != NULL);
+        TEST_ASSERT(strstr(out, "\"revision\":5") != NULL);
+        free(out);
+        close(sv[0]);
+        close(sv[1]);
+    }
+
+    request_free(&r);
 }
 
 static void test_anthropic_live_stream_sends_incremental_blocks(void) {
@@ -12601,6 +13528,94 @@ static void test_streaming_holds_partial_utf8(void) {
     request_free(&r);
     close(sv[0]);
     close(sv[1]);
+}
+
+static void test_stateful_envelope_parse(void) {
+    char *sid = NULL;
+    char *mode = NULL;
+    uint64_t rev = 0;
+    bool has_rev = false;
+    char *debug_reason = NULL;
+    int debug_full = -1;
+    int debug_sent = -1;
+    int debug_prev = -1;
+    uint64_t debug_stored = 0;
+    char err[160] = {0};
+
+    TEST_ASSERT(parse_stateful_envelope(
+        "{\"session_id\":\"pi-1\",\"mode\":\"delta\",\"parent_revision\":42,\"stateful_debug_reason\":\"append-only delta\",\"stateful_debug_full_messages\":5,\"stateful_debug_sent_messages\":1,\"stateful_debug_previous_messages\":4,\"stateful_debug_stored_revision\":41,\"ignored\":true}",
+        &sid, &mode, &rev, &has_rev, &debug_reason, &debug_full,
+        &debug_sent, &debug_prev, &debug_stored, err, sizeof(err)));
+    TEST_ASSERT(!strcmp(sid, "pi-1"));
+    TEST_ASSERT(!strcmp(mode, "delta"));
+    TEST_ASSERT(has_rev);
+    TEST_ASSERT(rev == 42);
+    TEST_ASSERT(debug_reason && !strcmp(debug_reason, "append-only delta"));
+    TEST_ASSERT(debug_full == 5);
+    TEST_ASSERT(debug_sent == 1);
+    TEST_ASSERT(debug_prev == 4);
+    TEST_ASSERT(debug_stored == 41);
+    free(sid);
+    free(mode);
+    free(debug_reason);
+
+    sid = NULL;
+    mode = NULL;
+    debug_reason = NULL;
+    rev = 0;
+    has_rev = false;
+    debug_full = debug_sent = debug_prev = -1;
+    debug_stored = 0;
+    TEST_ASSERT(parse_stateful_envelope(
+        "{\"session_id\":\"pi-obj\",\"mode\":\"reset\",\"stateful_debug\":{\"reason\":\"object debug\",\"full_messages\":8,\"sent_messages\":8,\"previous_messages\":3,\"stored_revision\":2}}",
+        &sid, &mode, &rev, &has_rev, &debug_reason, &debug_full,
+        &debug_sent, &debug_prev, &debug_stored, err, sizeof(err)));
+    TEST_ASSERT(!strcmp(sid, "pi-obj"));
+    TEST_ASSERT(!strcmp(mode, "reset"));
+    TEST_ASSERT(!has_rev);
+    TEST_ASSERT(debug_reason && !strcmp(debug_reason, "object debug"));
+    TEST_ASSERT(debug_full == 8);
+    TEST_ASSERT(debug_sent == 8);
+    TEST_ASSERT(debug_prev == 3);
+    TEST_ASSERT(debug_stored == 2);
+    free(sid);
+    free(mode);
+    free(debug_reason);
+
+    sid = NULL;
+    mode = NULL;
+    debug_reason = NULL;
+    rev = 7;
+    has_rev = true;
+    debug_full = debug_sent = debug_prev = 99;
+    debug_stored = 99;
+    TEST_ASSERT(parse_stateful_envelope(
+        "{\"session_id\":\"pi-2\",\"mode\":\"reset\"}",
+        &sid, &mode, &rev, &has_rev, &debug_reason, &debug_full,
+        &debug_sent, &debug_prev, &debug_stored, err, sizeof(err)));
+    TEST_ASSERT(!strcmp(sid, "pi-2"));
+    TEST_ASSERT(!strcmp(mode, "reset"));
+    TEST_ASSERT(!has_rev);
+    TEST_ASSERT(rev == 0);
+    TEST_ASSERT(debug_reason == NULL);
+    TEST_ASSERT(debug_full == -1);
+    TEST_ASSERT(debug_sent == -1);
+    TEST_ASSERT(debug_prev == -1);
+    TEST_ASSERT(debug_stored == 0);
+    free(sid);
+    free(mode);
+}
+
+static void test_stateful_delta_rejects_assistant_messages(void) {
+    chat_msgs msgs = {0};
+    chat_msg msg = {0};
+    msg.role = xstrdup("assistant");
+    msg.content = xstrdup("do not replay assistant messages in deltas");
+    chat_msgs_push(&msgs, msg);
+    char err[160] = {0};
+    TEST_ASSERT(!stateful_delta_messages_allowed(&msgs, err, sizeof(err)));
+    TEST_ASSERT(strstr(err, "user/tool/function") != NULL);
+    chat_msgs_free(&msgs);
 }
 
 static void test_request_defaults_use_min_p_filtering(void) {
@@ -14803,6 +15818,8 @@ static void test_thinking_canonical_non_thinking_mode_noop(void) {
 }
 
 static void ds4_server_unit_tests_run(void) {
+    test_stateful_envelope_parse();
+    test_stateful_delta_rejects_assistant_messages();
     test_request_defaults_use_min_p_filtering();
     test_reasoning_effort_mapping();
     test_api_thinking_controls_parse();
@@ -14827,6 +15844,8 @@ static void ds4_server_unit_tests_run(void) {
     test_cors_headers_are_opt_in();
     test_cors_preflight_response_is_no_content();
     test_cors_sse_headers();
+    test_server_dynamic_prefill_chunk_plan();
+    test_stateful_response_metadata();
     test_anthropic_live_stream_sends_incremental_blocks();
     test_anthropic_usage_reports_cache_details();
     test_anthropic_tool_stream_sends_live_tool_use();
