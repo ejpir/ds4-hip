@@ -16800,7 +16800,14 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
     }
     ds4_metal_graph *g = &s->graph;
     const uint32_t saved_ctx = h[2];
+    /* Field 3 records the allocation-time prefill chunk used by the writer.
+     * It is diagnostic compatibility metadata rather than part of the logical
+     * KV state: raw rows are serialized in logical order below, so a snapshot
+     * can be restored into any current graph whose raw/compressed capacities
+     * are large enough.  Do not reject solely because the operator changed
+     * DS4_METAL_PREFILL_CHUNK / DS4_SERVER_PREFILL_CHUNK between runs. */
     const uint32_t saved_prefill_cap = h[3];
+    (void)saved_prefill_cap;
     const uint32_t saved_raw_cap = h[4];
     const uint32_t saved_raw_window = h[5];
     const uint32_t saved_comp_cap = h[6];
@@ -16816,8 +16823,8 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
         payload_set_err(err, errlen, "KV checkpoint was written for a different DS4 layout");
         return 1;
     }
-    if (saved_prefill_cap != s->prefill_cap || saved_raw_window != g->raw_window) {
-        payload_set_err(err, errlen, "KV checkpoint graph chunk layout does not match current runtime");
+    if (saved_raw_window != g->raw_window) {
+        payload_set_err(err, errlen, "KV checkpoint raw window does not match current runtime");
         return 1;
     }
     /* The raw rows in the file are logical rows.  We can restore them into any
