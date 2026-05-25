@@ -2420,6 +2420,13 @@ static void append_rendered_tool_result_text(buf *out, const chat_msgs *msgs,
     }
 }
 
+static void append_tool_result_focus_text(buf *out) {
+    buf_puts(out,
+             "\n[DS4 tool-result focus: Use the tool result(s) above to answer the latest user request. "
+             "Do not restate an earlier plan or continue exploring unless one specific missing fact remains. "
+             "If the result is sufficient, answer now.]\n");
+}
+
 static char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_schemas,
                                      const tool_schema_orders *tool_orders,
                                      ds4_think_mode think_mode) {
@@ -2472,6 +2479,7 @@ static char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_sch
             pending_tool_result = true;
         } else if (!strcmp(m->role, "assistant")) {
             if (pending_assistant) {
+                if (pending_tool_result) append_tool_result_focus_text(&out);
                 buf_puts(&out, "<｜Assistant｜>");
                 if (think) {
                     const bool preserve_reasoning = i > last_user_idx;
@@ -2495,6 +2503,7 @@ static char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_sch
     }
 
     if (pending_assistant) {
+        if (pending_tool_result) append_tool_result_focus_text(&out);
         buf_puts(&out, "<｜Assistant｜>");
         buf_puts(&out, think ? "<think>" : "</think>");
     }
@@ -2545,6 +2554,7 @@ static char *render_live_tool_tail(const chat_msgs *msgs, int start,
             pending_tool_result = true;
         } else if (!strcmp(m->role, "assistant")) {
             if (pending_assistant) {
+                if (pending_tool_result) append_tool_result_focus_text(&out);
                 buf_puts(&out, "<｜Assistant｜>");
                 if (think) {
                     buf_puts(&out, "<think>");
@@ -2563,6 +2573,7 @@ static char *render_live_tool_tail(const chat_msgs *msgs, int start,
     }
 
     if (pending_assistant) {
+        if (pending_tool_result) append_tool_result_focus_text(&out);
         buf_puts(&out, "<｜Assistant｜>");
         buf_puts(&out, think ? "<think>" : "</think>");
     }
@@ -14369,6 +14380,8 @@ static void test_stateful_tool_delta_tail_matches_full_replay_two_tool_rounds(vo
     char *full_prompt = render_chat_prompt_text(&full, tool_schemas,
                                                 &orders, think_mode);
     TEST_ASSERT(full_prompt != NULL);
+    TEST_ASSERT(stateful.ptr && strstr(stateful.ptr, "DS4 tool-result focus") != NULL);
+    TEST_ASSERT(full_prompt && strstr(full_prompt, "DS4 tool-result focus") != NULL);
     TEST_ASSERT(stateful.ptr && full_prompt && !strcmp(stateful.ptr, full_prompt));
 
     free(full_prompt);
