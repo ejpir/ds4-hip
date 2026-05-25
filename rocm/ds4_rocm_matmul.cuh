@@ -448,12 +448,33 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
     if (!tmp) return 0;
     int8_t *xq = (int8_t *)tmp;
     float *xscale = (float *)((char *)tmp + scale_offset);
-    const int use_dp4a = cuda_runtime_config()->q8_use_dp4a;
+    const ds4_rocm_runtime_config *cfg = cuda_runtime_config();
+    const int use_dp4a = cfg->q8_use_dp4a;
+    const int profile_decode = (n_tok == 1u && cfg->q8_decode_profile);
+    cudaEvent_t prof0 = NULL, prof1 = NULL, prof2 = NULL;
+    if (profile_decode) {
+        if (cudaEventCreate(&prof0) != cudaSuccess ||
+            cudaEventCreate(&prof1) != cudaSuccess ||
+            cudaEventCreate(&prof2) != cudaSuccess) {
+            if (prof0) (void)cudaEventDestroy(prof0);
+            if (prof1) (void)cudaEventDestroy(prof1);
+            if (prof2) (void)cudaEventDestroy(prof2);
+            prof0 = prof1 = prof2 = NULL;
+        } else {
+            (void)cudaEventRecord(prof0, 0);
+        }
+    }
     dim3 qgrid((unsigned)blocks, (unsigned)n_tok, 1);
     quantize_q8_0_f32_kernel<<<qgrid, 32>>>(xq, xscale, (const float *)x->ptr, in_dim, blocks);
-    if (!cuda_ok(cudaGetLastError(), "matmul_q8_0 quantize launch")) return 0;
+    if (!cuda_ok(cudaGetLastError(), "matmul_q8_0 quantize launch")) {
+        if (prof0) (void)cudaEventDestroy(prof0);
+        if (prof1) (void)cudaEventDestroy(prof1);
+        if (prof2) (void)cudaEventDestroy(prof2);
+        return 0;
+    }
+    if (prof1) (void)cudaEventRecord(prof1, 0);
     if (n_tok == 1) {
-        uint32_t rows_per_block = cuda_runtime_config()->q8_decode_rpb;
+        uint32_t rows_per_block = cfg->q8_decode_rpb;
         matmul_q8_0_preq_rows_w32_kernel<<<((unsigned)out_dim + rows_per_block - 1u) / rows_per_block,
                                             rows_per_block * 32u>>>(
                 (float *)out->ptr,
@@ -465,7 +486,30 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
                 blocks,
                 rows_per_block,
                 use_dp4a);
-        return cuda_ok(cudaGetLastError(), "matmul_q8_0 rows launch");
+        const int ok_rows = cuda_ok(cudaGetLastError(), "matmul_q8_0 rows launch");
+        if (prof2) {
+            (void)cudaEventRecord(prof2, 0);
+            if (cudaEventSynchronize(prof2) == cudaSuccess) {
+                float ms_q = 0.0f, ms_mm = 0.0f, ms_total = 0.0f;
+                (void)cudaEventElapsedTime(&ms_q, prof0, prof1);
+                (void)cudaEventElapsedTime(&ms_mm, prof1, prof2);
+                (void)cudaEventElapsedTime(&ms_total, prof0, prof2);
+                fprintf(stderr,
+                        DS4_GPU_LOG_PREFIX "q8 decode profile label=%s in=%llu out=%llu blocks=%llu rpb=%u quant=%.3f matmul=%.3f total=%.3f ms\n",
+                        label ? label : "q8_0",
+                        (unsigned long long)in_dim,
+                        (unsigned long long)out_dim,
+                        (unsigned long long)blocks,
+                        rows_per_block,
+                        ms_q,
+                        ms_mm,
+                        ms_total);
+            }
+        }
+        if (prof0) (void)cudaEventDestroy(prof0);
+        if (prof1) (void)cudaEventDestroy(prof1);
+        if (prof2) (void)cudaEventDestroy(prof2);
+        return ok_rows;
     }
     if (!cuda_env_present("DS4_CUDA_NO_Q8_BATCH_WARP") && blocks <= 32u) {
         dim3 bgrid(((unsigned)out_dim + 7u) / 8u, (unsigned)n_tok, 1);
@@ -802,10 +846,31 @@ static int cuda_matmul_q8_0_hc_expand_tensor_labeled(
     if (!tmp) return 0;
     int8_t *xq = (int8_t *)tmp;
     float *xscale = (float *)((char *)tmp + scale_offset);
-    const int use_dp4a = cuda_runtime_config()->q8_use_dp4a;
+    const ds4_rocm_runtime_config *cfg = cuda_runtime_config();
+    const int use_dp4a = cfg->q8_use_dp4a;
+    const int profile_decode = cfg->q8_decode_profile;
+    cudaEvent_t prof0 = NULL, prof1 = NULL, prof2 = NULL;
+    if (profile_decode) {
+        if (cudaEventCreate(&prof0) != cudaSuccess ||
+            cudaEventCreate(&prof1) != cudaSuccess ||
+            cudaEventCreate(&prof2) != cudaSuccess) {
+            if (prof0) (void)cudaEventDestroy(prof0);
+            if (prof1) (void)cudaEventDestroy(prof1);
+            if (prof2) (void)cudaEventDestroy(prof2);
+            prof0 = prof1 = prof2 = NULL;
+        } else {
+            (void)cudaEventRecord(prof0, 0);
+        }
+    }
     quantize_q8_0_f32_kernel<<<(unsigned)blocks, 32>>>(xq, xscale, (const float *)x->ptr, in_dim, blocks);
-    if (!cuda_ok(cudaGetLastError(), "matmul_q8_0_hc_expand quantize launch")) return 0;
-    uint32_t rows_per_block = cuda_runtime_config()->q8_hc_decode_rpb;
+    if (!cuda_ok(cudaGetLastError(), "matmul_q8_0_hc_expand quantize launch")) {
+        if (prof0) (void)cudaEventDestroy(prof0);
+        if (prof1) (void)cudaEventDestroy(prof1);
+        if (prof2) (void)cudaEventDestroy(prof2);
+        return 0;
+    }
+    if (prof1) (void)cudaEventRecord(prof1, 0);
+    uint32_t rows_per_block = cfg->q8_hc_decode_rpb;
     matmul_q8_0_hc_expand_preq_rows_w32_kernel<<<((unsigned)out_dim + rows_per_block - 1u) / rows_per_block,
                                                   rows_per_block * 32u>>>(
             (float *)out_hc->ptr,
@@ -824,7 +889,31 @@ static int cuda_matmul_q8_0_hc_expand_tensor_labeled(
             rows_per_block,
             block_add ? 1 : 0,
             use_dp4a);
-    return cuda_ok(cudaGetLastError(), "matmul_q8_0_hc_expand rows launch");
+    const int ok_rows = cuda_ok(cudaGetLastError(), "matmul_q8_0_hc_expand rows launch");
+    if (prof2) {
+        (void)cudaEventRecord(prof2, 0);
+        if (cudaEventSynchronize(prof2) == cudaSuccess) {
+            float ms_q = 0.0f, ms_mm = 0.0f, ms_total = 0.0f;
+            (void)cudaEventElapsedTime(&ms_q, prof0, prof1);
+            (void)cudaEventElapsedTime(&ms_mm, prof1, prof2);
+            (void)cudaEventElapsedTime(&ms_total, prof0, prof2);
+            fprintf(stderr,
+                    DS4_GPU_LOG_PREFIX "q8 hc decode profile label=%s in=%llu out=%llu blocks=%llu rpb=%u add=%u quant=%.3f matmul_hc=%.3f total=%.3f ms\n",
+                    label ? label : "q8_0_hc_expand",
+                    (unsigned long long)in_dim,
+                    (unsigned long long)out_dim,
+                    (unsigned long long)blocks,
+                    rows_per_block,
+                    block_add ? 1u : 0u,
+                    ms_q,
+                    ms_mm,
+                    ms_total);
+        }
+    }
+    if (prof0) (void)cudaEventDestroy(prof0);
+    if (prof1) (void)cudaEventDestroy(prof1);
+    if (prof2) (void)cudaEventDestroy(prof2);
+    return ok_rows;
 }
 
 extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {

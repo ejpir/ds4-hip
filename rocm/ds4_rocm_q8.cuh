@@ -1683,7 +1683,8 @@ __global__ static void grouped_q8_0_a_preq_warp8_kernel(
         uint32_t n_tokens,
         uint64_t blocks,
         int use_dp4a) {
-    const uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
+    const uint32_t rows_per_block = blockDim.x >> 5u;
+    const uint64_t row = (uint64_t)blockIdx.x * rows_per_block + (threadIdx.x >> 5u);
     const uint64_t tok = (uint64_t)blockIdx.y;
     const uint32_t lane = threadIdx.x & 31u;
     const uint64_t low_dim = (uint64_t)n_groups * rank;

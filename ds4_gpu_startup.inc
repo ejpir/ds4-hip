@@ -184,6 +184,9 @@ static void gpu_fast_path_summary(bool quality) {
     const char *q8_decode_rpb = env_first_nonempty("DS4_CUDA_Q8_DECODE_RPB",
                                                    "DS4_HIP_Q8_DECODE_RPB",
                                                    "default");
+    const char *attn_out_low_rpb = env_first_nonempty("DS4_CUDA_ATTN_OUT_LOW_DECODE_RPB",
+                                                      "DS4_HIP_ATTN_OUT_LOW_DECODE_RPB",
+                                                      "default");
     const bool oldhip_attention_decode = env_truthy2("DS4_CUDA_OLDHIP_ATTENTION_DECODE",
                                                      "DS4_HIP_OLDHIP_ATTENTION_DECODE");
     const bool oldhip_attention_vec4 = oldhip_attention_decode &&
@@ -207,7 +210,7 @@ static void gpu_fast_path_summary(bool quality) {
             "ds4: ROCm fast paths: quality=%s copy_model=%s q8_prequant_decode=%s "
             "q8_decode_rpb=%s q_head_rope_fused=%s qkv_pair_decode=%s "
             "oldhip_attention_decode=%s oldhip_attention_vec4=%s "
-            "attn_out_low_splitk=%s attn_out_low_prequant=%s "
+            "attn_out_low_splitk=%s attn_out_low_prequant=%s attn_out_low_rpb=%s "
             "shared_gate_up_fused_w32=%s shared_gate_up_prequant_pair=%s "
             "shared_gate_up_pair_swiglu=%s moe_decode_rpb=%s "
             "q8_fp16_preload(attn_out=%s,attn_q_b=%s,shared_down=%s)\n",
@@ -221,6 +224,7 @@ static void gpu_fast_path_summary(bool quality) {
             onoff(oldhip_attention_vec4),
             onoff(splitk_attn_out_low),
             onoff(q8_prequant && !splitk_attn_out_low),
+            attn_out_low_rpb,
             onoff(shared_gate_fused),
             onoff(q8_prequant && !shared_gate_fused),
             onoff(shared_gate_pair_swiglu),

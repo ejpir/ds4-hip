@@ -1308,16 +1308,38 @@ extern "C" int ds4_gpu_attention_output_low_q8_tensor(
     if (!tmp) return 0;
     int8_t *xq = (int8_t *)tmp;
     float *xscale = (float *)((char *)tmp + scale_offset);
-    const int use_dp4a = cuda_runtime_config()->q8_use_dp4a;
+    const ds4_rocm_runtime_config *cfg = cuda_runtime_config();
+    const int use_dp4a = cfg->q8_use_dp4a;
+    const int profile_decode = cfg->q8_decode_profile;
+    cudaEvent_t prof0 = NULL, prof1 = NULL, prof2 = NULL;
+    if (profile_decode) {
+        if (cudaEventCreate(&prof0) != cudaSuccess ||
+            cudaEventCreate(&prof1) != cudaSuccess ||
+            cudaEventCreate(&prof2) != cudaSuccess) {
+            if (prof0) (void)cudaEventDestroy(prof0);
+            if (prof1) (void)cudaEventDestroy(prof1);
+            if (prof2) (void)cudaEventDestroy(prof2);
+            prof0 = prof1 = prof2 = NULL;
+        } else {
+            (void)cudaEventRecord(prof0, 0);
+        }
+    }
     dim3 qgrid((unsigned)blocks_a, (unsigned)x_rows, 1);
     quantize_q8_0_f32_kernel<<<qgrid, 32>>>(xq,
                                             xscale,
                                             (const float *)heads->ptr,
                                             group_dim,
                                             blocks_a);
-    if (!cuda_ok(cudaGetLastError(), "attention_output_low_q8 prequant launch")) return 0;
-    dim3 grid_a(((unsigned)low_dim + 7u) / 8u, 1, 1);
-    grouped_q8_0_a_preq_warp8_kernel<<<grid_a, 256>>>((float *)low->ptr,
+    if (!cuda_ok(cudaGetLastError(), "attention_output_low_q8 prequant launch")) {
+        if (prof0) (void)cudaEventDestroy(prof0);
+        if (prof1) (void)cudaEventDestroy(prof1);
+        if (prof2) (void)cudaEventDestroy(prof2);
+        return 0;
+    }
+    if (prof1) (void)cudaEventRecord(prof1, 0);
+    const uint32_t rows_per_block = cfg->attn_out_low_decode_rpb;
+    dim3 grid_a(((unsigned)low_dim + rows_per_block - 1u) / rows_per_block, 1, 1);
+    grouped_q8_0_a_preq_warp8_kernel<<<grid_a, rows_per_block * 32u>>>((float *)low->ptr,
                                                       out_a,
                                                       xq,
                                                       xscale,
@@ -1327,5 +1349,28 @@ extern "C" int ds4_gpu_attention_output_low_q8_tensor(
                                                       1,
                                                       blocks_a,
                                                       use_dp4a);
-    return cuda_ok(cudaGetLastError(), "attention_output_low_q8 launch");
+    const int ok_low = cuda_ok(cudaGetLastError(), "attention_output_low_q8 launch");
+    if (prof2) {
+        (void)cudaEventRecord(prof2, 0);
+        if (cudaEventSynchronize(prof2) == cudaSuccess) {
+            float ms_q = 0.0f, ms_a = 0.0f, ms_total = 0.0f;
+            (void)cudaEventElapsedTime(&ms_q, prof0, prof1);
+            (void)cudaEventElapsedTime(&ms_a, prof1, prof2);
+            (void)cudaEventElapsedTime(&ms_total, prof0, prof2);
+            fprintf(stderr,
+                    DS4_GPU_LOG_PREFIX "attn_out_low decode profile groups=%u group_dim=%llu rank=%llu blocks=%llu rpb=%u quant=%.3f A=%.3f total=%.3f ms\n",
+                    n_groups,
+                    (unsigned long long)group_dim,
+                    (unsigned long long)rank,
+                    (unsigned long long)blocks_a,
+                    rows_per_block,
+                    ms_q,
+                    ms_a,
+                    ms_total);
+        }
+    }
+    if (prof0) (void)cudaEventDestroy(prof0);
+    if (prof1) (void)cudaEventDestroy(prof1);
+    if (prof2) (void)cudaEventDestroy(prof2);
+    return ok_low;
 }

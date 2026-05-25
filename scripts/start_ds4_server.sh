@@ -58,6 +58,7 @@ Environment:
   DS4_SERVER_Q8_PREQUANT_DECODE=0 Disable FAST_FULL q-side prequantized Q8 decode matvecs in upstream-shaped ROCm
   DS4_SERVER_Q8_DECODE_RPB=1|2|4|8|16|32 Rows/block for single-token Q8 decode matvecs
   DS4_SERVER_Q8_HC_DECODE_RPB=1|2|4|8|16|32 Rows/block for fused Q8 HC-expand decode matvecs
+  DS4_SERVER_ATTN_OUT_LOW_DECODE_RPB=1|2|4|8|16|32 Rows/block for decode attn_output_a low projection
   DS4_SERVER_OLDHIP_ATTENTION_DECODE=1 Use the old-HIP decode attention kernel
   DS4_SERVER_QKV_PAIR_DECODE=1      Opt in shared-quant Q/KV decode projection pair
   DS4_SERVER_ATTN_OUT_LOW_SPLITK=1 Restore old split-K decode attn_output_a path; FAST_FULL defaults to prequant
@@ -316,6 +317,7 @@ export_pair_flag Q8_REPACK_SPLIT16 "${DS4_SERVER_Q8_REPACK_SPLIT16:-0}"
 export_pair_flag Q8_WMMA_FAST "${DS4_SERVER_Q8_WMMA_FAST:-0}"
 export_pair_value Q8_DECODE_RPB "${DS4_SERVER_Q8_DECODE_RPB:-}"
 export_pair_value Q8_HC_DECODE_RPB "${DS4_SERVER_Q8_HC_DECODE_RPB:-}"
+export_pair_value ATTN_OUT_LOW_DECODE_RPB "${DS4_SERVER_ATTN_OUT_LOW_DECODE_RPB:-}"
 export_pair_flag OLDHIP_ATTENTION_DECODE "${DS4_SERVER_OLDHIP_ATTENTION_DECODE:-0}"
 export_pair_flag QKV_PAIR_DECODE "${DS4_SERVER_QKV_PAIR_DECODE:-0}"
 export_pair_flag MOE_EXPERT_BATCH "${DS4_SERVER_MOE_EXPERT_BATCH:-0}"

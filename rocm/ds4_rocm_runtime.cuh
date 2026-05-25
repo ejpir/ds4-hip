@@ -387,8 +387,10 @@ struct ds4_rocm_runtime_config {
     int shared_down_cublas;
     int graph_dump;
     int q8_use_dp4a;
+    int q8_decode_profile;
     uint32_t q8_decode_rpb;
     uint32_t q8_hc_decode_rpb;
+    uint32_t attn_out_low_decode_rpb;
     uint32_t moe_decode_rpb;
     int moe_profile;
     int oldhip_moe_q2_rows;
@@ -413,11 +415,14 @@ static const ds4_rocm_runtime_config *cuda_runtime_config(void) {
         g_rocm_cfg.shared_down_cublas = cuda_env_flag("DS4_CUDA_SHARED_DOWN_CUBLAS");
         g_rocm_cfg.graph_dump = cuda_env_present("DS4_METAL_GRAPH_DUMP_PREFIX");
         g_rocm_cfg.q8_use_dp4a = !cuda_env_flag_any3("DS4_CUDA_NO_Q8_DP4A", "DS4_HIP_NO_Q8_DP4A", NULL);
+        g_rocm_cfg.q8_decode_profile = cuda_env_flag_any3("DS4_CUDA_Q8_DECODE_PROFILE", "DS4_HIP_Q8_DECODE_PROFILE", NULL);
         g_rocm_cfg.q8_decode_rpb = cuda_rows_per_block_or_default(
                 cuda_parse_u32_env_alias("DS4_CUDA_Q8_DECODE_RPB", "DS4_HIP_Q8_DECODE_RPB", 8u, 1u, 32u), 8u);
         g_rocm_cfg.q8_hc_decode_rpb = cuda_rows_per_block_or_default(
                 cuda_parse_u32_env_alias("DS4_CUDA_Q8_HC_DECODE_RPB", "DS4_HIP_Q8_HC_DECODE_RPB", g_rocm_cfg.q8_decode_rpb, 1u, 32u),
                 g_rocm_cfg.q8_decode_rpb);
+        g_rocm_cfg.attn_out_low_decode_rpb = cuda_rows_per_block_or_default(
+                cuda_parse_u32_env_alias("DS4_CUDA_ATTN_OUT_LOW_DECODE_RPB", "DS4_HIP_ATTN_OUT_LOW_DECODE_RPB", 8u, 1u, 32u), 8u);
         g_rocm_cfg.moe_decode_rpb = cuda_rows_per_block_or_default(
                 cuda_parse_u32_env_alias("DS4_CUDA_MOE_DECODE_RPB", "DS4_HIP_MOE_DECODE_RPB", 8u, 1u, 32u), 8u);
         g_rocm_cfg.moe_profile = cuda_env_flag_any3("DS4_CUDA_MOE_PROFILE", "DS4_HIP_MOE_PROFILE", NULL);
