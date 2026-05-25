@@ -36,6 +36,7 @@ struct ds4_hip_model_range {
     uint64_t map_offset;
     uint64_t map_size;
     bool copied;
+    bool lazy;
 };
 
 struct ds4_hip_cached_model_tensor {
@@ -98,6 +99,14 @@ static uint64_t g_tensor_peak_bytes;
 static uint64_t g_model_registered_bytes;
 static uint64_t g_model_copied_bytes;
 static uint64_t g_model_cached_bytes;
+static uint64_t g_lazy_hits = 0;
+static uint64_t g_lazy_misses = 0;
+static uint64_t g_lazy_evictions = 0;
+static uint64_t g_lazy_bytes_staged = 0;
+static uint64_t g_lazy_peak_bytes = 0;
+static uint64_t g_lazy_largest_tensor = 0;
+static uint64_t g_lazy_hip_memcpy_calls = 0;
+static uint64_t g_lazy_hip_memcpy_bytes = 0;
 static uint64_t g_q8_repacked_bytes;
 static uint64_t g_q8_split16_repacked_bytes;
 static uint64_t g_q8_wmma_repacked_bytes;
@@ -310,6 +319,25 @@ extern "C" void ds4_metal_cleanup(void) {
         if (c.device_ptr) (void)hipFree(c.device_ptr);
     }
     g_model_cache.clear();
+    if (g_lazy_hits || g_lazy_misses || g_lazy_bytes_staged || g_lazy_evictions) {
+        std::fprintf(stderr,
+            "HIP lazy cache: hits=%" PRIu64
+            " misses=%" PRIu64
+            " evictions=%" PRIu64
+            " staged_gb=%.3f"
+            " peak_mb=%.1f"
+            " largest_mb=%.1f"
+            " memcpy_calls=%" PRIu64
+            " memcpy_gb=%.3f\n",
+            g_lazy_hits,
+            g_lazy_misses,
+            g_lazy_evictions,
+            (double) g_lazy_bytes_staged / (1024.0 * 1024.0 * 1024.0),
+            (double) g_lazy_peak_bytes / (1024.0 * 1024.0),
+            (double) g_lazy_largest_tensor / (1024.0 * 1024.0),
+            g_lazy_hip_memcpy_calls,
+            (double) g_lazy_hip_memcpy_bytes / (1024.0 * 1024.0 * 1024.0));
+    }
     for (auto &r : g_model_ranges) {
         if (r.copied) {
             if (r.device_base) (void)hipFree(r.device_base);
@@ -697,7 +725,8 @@ extern "C" int ds4_metal_set_model_map_range_fd(const void *model_map,
     if (!model_map || map_offset > model_size || map_size > model_size - map_offset) return 0;
     if (map_size == 0) return 1;
 
-    const bool copy_model = std::getenv("DS4_HIP_COPY_MODEL") != nullptr;
+    const bool copy_model = ds4_hip_env_bool("DS4_HIP_COPY_MODEL", false);
+    const bool lazy_model = ds4_hip_env_bool("DS4_HIP_LAZY_MODEL_MAP", false);
     const unsigned char *host_start = static_cast<const unsigned char *>(model_map) + map_offset;
     unsigned char *device_start = nullptr;
 
@@ -705,6 +734,25 @@ extern "C" int ds4_metal_set_model_map_range_fd(const void *model_map,
     range.map_offset = map_offset;
     range.map_size = map_size;
     range.copied = copy_model;
+    range.lazy = lazy_model;
+
+    if (lazy_model) {
+        range.host_base = host_start;
+        range.host_size = map_size;
+        range.device_base = nullptr;
+        range.device_size = 0;
+        range.copied = false;
+        range.lazy = true;
+
+        g_model_ranges.push_back(range);
+
+        std::fprintf(stderr,
+                     "ds4: HIP lazy model map: %.2f GiB at GGUF offset %" PRIu64
+                     " (no whole-model hipHostRegister)\n",
+                     (double)map_size / 1073741824.0,
+                     map_offset);
+        return 1;
+    }
 
     if (copy_model) {
         const bool copy_quiet = std::getenv("DS4_HIP_COPY_MODEL_QUIET") != nullptr;
@@ -909,7 +957,7 @@ extern "C" int ds4_metal_set_model_map_range_fd(const void *model_map,
     g_model_ranges.push_back(range);
     std::fprintf(stderr,
                  "ds4: HIP model range %s and GPU-probed: %.2f GiB at GGUF offset %" PRIu64 "\n",
-                 copy_model ? "copied to device memory" : "host-registered for zero-copy GPU access",
+                  copy_model ? "copied to device memory" : "host-registered for zero-copy GPU access",
                  (double)map_size / 1073741824.0,
                  map_offset);
     if (std::getenv("DS4_HIP_Q8_REPACK") != nullptr ||
@@ -1122,13 +1170,60 @@ static const unsigned char *ds4_hip_model_ptr(const void *model_map,
     }
     const unsigned char *host = static_cast<const unsigned char *>(model_map) + offset;
     for (const auto &c : g_model_cache) {
-        if (c.host_ptr == host && c.bytes == bytes) return c.device_ptr;
+        if (c.host_ptr == host && c.bytes == bytes) { g_lazy_hits++; return c.device_ptr; }
     }
     const unsigned char *mapped = nullptr;
     for (const auto &r : g_model_ranges) {
         if (host < r.host_base) continue;
         const uint64_t delta = (uint64_t)(host - r.host_base);
         if (delta <= r.host_size && bytes <= r.host_size - delta) {
+            if (r.lazy) {
+                g_lazy_misses++;
+                /* Lazy staging: hipMalloc+hipMemcpy requested tensor on demand */
+                uint64_t max_mb = ds4_hip_env_mb("DS4_HIP_LAZY_CACHE_MB", 8192u, 512u, 22000u);
+                uint64_t max_bytes = max_mb * 1048576ull;
+                if (bytes > max_bytes) {
+                    std::fprintf(stderr,
+                                 "ds4: HIP lazy %s too large to stage: %.2f MiB > cache %.2f MiB\n",
+                                 what ? what : "weight",
+                                 (double)bytes / 1048576.0,
+                                 (double)max_bytes / 1048576.0);
+                    return nullptr;
+                }
+                while (g_model_cached_bytes + bytes > max_bytes && !g_model_cache.empty()) {
+                    ds4_hip_cached_model_tensor old = g_model_cache.front();
+                    g_model_cache.erase(g_model_cache.begin());
+                    if (old.device_ptr) hipFree(old.device_ptr);
+                    g_model_cached_bytes -= old.bytes;
+                    g_lazy_evictions++;
+                }
+                unsigned char *cached = nullptr;
+                hipError_t e = hipMalloc(reinterpret_cast<void **>(&cached), (size_t)bytes);
+                if (e != hipSuccess) {
+                    std::fprintf(stderr,
+                                 "ds4: HIP lazy malloc failed for %s %.2f MiB\n",
+                                 what ? what : "weight",
+                                 (double)bytes / 1048576.0);
+                    return nullptr;
+                }
+                e = hipMemcpyAsync(cached, host, (size_t)bytes, hipMemcpyHostToDevice, g_stream);
+                if (e != hipSuccess || hipStreamSynchronize(g_stream) != hipSuccess) {
+                    std::fprintf(stderr,
+                                 "ds4: HIP lazy copy failed for %s %.2f MiB\n",
+                                 what ? what : "weight",
+                                 (double)bytes / 1048576.0);
+                    hipFree(cached);
+                    return nullptr;
+                }
+                g_lazy_hip_memcpy_calls++;
+                g_lazy_hip_memcpy_bytes += bytes;
+                g_model_cache.push_back({host, bytes, cached});
+                g_model_cached_bytes += bytes;
+                g_lazy_bytes_staged += bytes;
+                if (g_model_cached_bytes > g_lazy_peak_bytes) g_lazy_peak_bytes = g_model_cached_bytes;
+                if (bytes > g_lazy_largest_tensor) g_lazy_largest_tensor = bytes;
+                return cached;
+            }
             mapped = r.device_base + delta;
             break;
         }

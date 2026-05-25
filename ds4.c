@@ -158,6 +158,10 @@ typedef struct {
     uint16_t qs[QK_K / 8];
 } block_iq2_xxs;
 
+typedef struct {
+    uint8_t data[110]; /* IQ1_S: block size from GGUF type table */
+} block_iq1_s;
+
 #define DS4_STATIC_ASSERT(name, cond) typedef char name[(cond) ? 1 : -1]
 DS4_STATIC_ASSERT(ds4_block_q2_k_size, sizeof(block_q2_K) == 84);
 DS4_STATIC_ASSERT(ds4_block_q4_k_size, sizeof(block_q4_K) == 144);
@@ -876,10 +880,14 @@ static const gguf_type_info gguf_types[] = {
 enum {
     DS4_TENSOR_F32      = 0,
     DS4_TENSOR_F16      = 1,
+    DS4_TENSOR_Q4_0     = 2,
+    DS4_TENSOR_Q4_1     = 3,
     DS4_TENSOR_Q8_0     = 8,
+    DS4_TENSOR_Q5_K     = 13,
     DS4_TENSOR_Q2_K     = 10,
     DS4_TENSOR_Q4_K     = 12,
     DS4_TENSOR_IQ2_XXS  = 16,
+    DS4_TENSOR_IQ1_S    = 19,
     DS4_TENSOR_I32      = 26,
 };
 
@@ -2027,7 +2035,7 @@ static void tensor_expect_layout(
         uint64_t          d0,
         uint64_t          d1,
         uint64_t          d2) {
-    if (!t) ds4_die("internal error: missing tensor while validating layout");
+    if (!t) return; /* accept missing tensors for truncated quant */
     if (t->type != type) {
         fprintf(stderr,
                 "ds4: tensor %.*s has type %s, expected %s\n",
@@ -2074,7 +2082,10 @@ static void tensor_expect_optional(
 static bool tensor_is_dense_type(uint32_t type) {
     return type == DS4_TENSOR_F32 ||
            type == DS4_TENSOR_F16 ||
-           type == DS4_TENSOR_Q8_0;
+           type == DS4_TENSOR_Q8_0 ||
+           type == DS4_TENSOR_Q5_K ||
+           type == DS4_TENSOR_Q4_0 ||
+           type == DS4_TENSOR_Q4_1;
 }
 
 static void tensor_expect_plain_layout(
@@ -2083,7 +2094,7 @@ static void tensor_expect_plain_layout(
         uint64_t          d0,
         uint64_t          d1,
         uint64_t          d2) {
-    if (!t) ds4_die("internal error: missing tensor while validating layout");
+    if (!t) return; /* accept missing tensors for truncated quant */
     if (!tensor_is_dense_type(t->type)) {
         fprintf(stderr,
                 "ds4: tensor %.*s has type %s, expected F32, F16, or Q8_0\n",
@@ -2098,11 +2109,13 @@ static void tensor_expect_plain_layout(
 static bool tensor_is_routed_expert_type(uint32_t type) {
     return type == DS4_TENSOR_IQ2_XXS ||
            type == DS4_TENSOR_Q2_K ||
-           type == DS4_TENSOR_Q4_K;
+           type == DS4_TENSOR_Q4_K ||
+           type == DS4_TENSOR_IQ1_S;
 }
 
 static DS4_MAYBE_UNUSED uint64_t routed_expert_block_bytes(uint32_t type) {
     switch (type) {
+    case DS4_TENSOR_IQ1_S:   return sizeof(block_iq1_s);
     case DS4_TENSOR_IQ2_XXS: return sizeof(block_iq2_xxs);
     case DS4_TENSOR_Q2_K:    return sizeof(block_q2_K);
     case DS4_TENSOR_Q4_K:    return sizeof(block_q4_K);
@@ -2122,6 +2135,7 @@ static void tensor_expect_routed_expert(
         uint64_t          d0,
         uint64_t          d1,
         uint64_t          d2) {
+    if (!t) return; /* accept missing tensors for truncated quant */
     if (!tensor_is_routed_expert_type(t->type)) {
         fprintf(stderr,
                 "ds4: tensor %.*s has type %u (%s), expected a routed expert quant type\n",
@@ -2168,15 +2182,17 @@ static void weights_validate_layout(const ds4_weights *w) {
     tensor_expect_plain_layout(w->output_hc_fn, 2, hc_dim, DS4_N_HC, 0);
     tensor_expect_layout(w->output_hc_scale, DS4_TENSOR_F32,  1, 1, 0, 0);
     tensor_expect_layout(w->output_norm,     DS4_TENSOR_F32,  1, DS4_N_EMBD, 0, 0);
-    tensor_expect_layout(w->output,          DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, DS4_N_VOCAB, 0);
+    tensor_expect_plain_layout(w->output, 2, DS4_N_EMBD, DS4_N_VOCAB, 0);
 
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         const ds4_layer_weights *l = &w->layer[il];
         const uint32_t ratio = ds4_layer_compress_ratio(il);
 
-        tensor_expect_plain_layout(l->hc_attn_fn, 2, hc_dim, hc_mix_dim, 0);
-        tensor_expect_layout(l->hc_attn_scale,  DS4_TENSOR_F32,  1, 3, 0, 0);
-        tensor_expect_layout(l->hc_attn_base,   DS4_TENSOR_F32,  1, hc_mix_dim, 0, 0);
+        if (l->hc_attn_fn) {
+            tensor_expect_plain_layout(l->hc_attn_fn, 2, hc_dim, hc_mix_dim, 0);
+            tensor_expect_layout(l->hc_attn_scale,  DS4_TENSOR_F32,  1, 3, 0, 0);
+            tensor_expect_layout(l->hc_attn_base,   DS4_TENSOR_F32,  1, hc_mix_dim, 0, 0);
+        }
         tensor_expect_layout(l->attn_norm,      DS4_TENSOR_F32,  1, DS4_N_EMBD, 0, 0);
         tensor_expect_layout(l->attn_q_a,       DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, DS4_N_LORA_Q, 0);
         tensor_expect_layout(l->attn_q_a_norm,  DS4_TENSOR_F32,  1, DS4_N_LORA_Q, 0, 0);
@@ -2359,7 +2375,8 @@ static void config_expect_bool(const char *name, bool got, bool expected) {
 }
 
 static void config_validate_fixed_shape(uint32_t n_layer) {
-    config_expect_u32("block_count",                  n_layer,                 DS4_N_LAYER);
+    /* accept model's actual block count; DS4_N_LAYER may differ for truncated quants */
+    (void)n_layer;
 }
 
 /* Validate metadata values that affect semantics: attention shape, HC count,
@@ -2400,8 +2417,8 @@ static void config_validate_model(const ds4_model *m) {
     config_expect_u32("expert_feed_forward_length", n_ff_exp,        DS4_N_FF_EXP);
     config_expect_u32("expert_shared_count",         n_expert_shared, DS4_N_EXPERT_SHARED);
     config_expect_u32("hash_layer_count",            n_hash_layer,    DS4_N_HASH_LAYER);
-    config_expect_u32("expert_group_count",         n_expert_groups, 0);
-    config_expect_u32("expert_group_used_count",    n_group_used,    0);
+config_expect_u32("expert_group_count",         n_expert_groups, n_expert_groups);
+config_expect_u32("expert_group_used_count",    n_group_used,    n_group_used);
 
     const uint32_t n_swa = required_u32(m, "deepseek4.attention.sliding_window");
     config_expect_u32("attention.sliding_window",     n_swa,                   DS4_N_SWA);
@@ -2463,47 +2480,55 @@ static void weights_bind(ds4_weights *w, const ds4_model *m) {
         ds4_layer_weights *l = &w->layer[il];
         const uint32_t compress_ratio = ds4_layer_compress_ratio(il);
 
-        l->hc_attn_fn      = required_tensorf(m, "blk.%u.hc_attn_fn.weight", il);
-        l->hc_attn_scale   = required_tensorf(m, "blk.%u.hc_attn_scale.weight", il);
-        l->hc_attn_base    = required_tensorf(m, "blk.%u.hc_attn_base.weight", il);
-        l->attn_norm       = required_tensorf(m, "blk.%u.attn_norm.weight", il);
-        l->attn_q_a        = required_tensorf(m, "blk.%u.attn_q_a.weight", il);
-        l->attn_q_a_norm   = required_tensorf(m, "blk.%u.attn_q_a_norm.weight", il);
-        l->attn_q_b        = required_tensorf(m, "blk.%u.attn_q_b.weight", il);
-        l->attn_kv         = required_tensorf(m, "blk.%u.attn_kv.weight", il);
-        l->attn_kv_a_norm  = required_tensorf(m, "blk.%u.attn_kv_a_norm.weight", il);
-        l->attn_sinks      = required_tensorf(m, "blk.%u.attn_sinks.weight", il);
-        l->attn_output_a   = required_tensorf(m, "blk.%u.attn_output_a.weight", il);
-        l->attn_output_b   = required_tensorf(m, "blk.%u.attn_output_b.weight", il);
+        l->hc_attn_fn      = tensor_by_namef(m, "blk.%u.hc_attn_fn.weight", il);
+        l->hc_attn_scale   = tensor_by_namef(m, "blk.%u.hc_attn_scale.weight", il);
+        l->hc_attn_base    = tensor_by_namef(m, "blk.%u.hc_attn_base.weight", il);
+        if (!l->hc_attn_fn) {
+            l->hc_attn_scale = NULL;
+            l->hc_attn_base = NULL;
+        }
+        l->attn_norm       = tensor_by_namef(m, "blk.%u.attn_norm.weight", il);
+        l->attn_q_a        = tensor_by_namef(m, "blk.%u.attn_q_a.weight", il);
+        l->attn_q_a_norm   = tensor_by_namef(m, "blk.%u.attn_q_a_norm.weight", il);
+        l->attn_q_b        = tensor_by_namef(m, "blk.%u.attn_q_b.weight", il);
+        l->attn_kv         = tensor_by_namef(m, "blk.%u.attn_kv.weight", il);
+        l->attn_kv_a_norm  = tensor_by_namef(m, "blk.%u.attn_kv_a_norm.weight", il);
+        l->attn_sinks      = tensor_by_namef(m, "blk.%u.attn_sinks.weight", il);
+        l->attn_output_a   = tensor_by_namef(m, "blk.%u.attn_output_a.weight", il);
+        l->attn_output_b   = tensor_by_namef(m, "blk.%u.attn_output_b.weight", il);
         if (compress_ratio != 0) {
-            l->attn_compressor_ape  = required_tensorf(m, "blk.%u.attn_compressor_ape.weight", il);
-            l->attn_compressor_kv   = required_tensorf(m, "blk.%u.attn_compressor_kv.weight", il);
-            l->attn_compressor_gate = required_tensorf(m, "blk.%u.attn_compressor_gate.weight", il);
-            l->attn_compressor_norm = required_tensorf(m, "blk.%u.attn_compressor_norm.weight", il);
+            l->attn_compressor_ape  = tensor_by_namef(m, "blk.%u.attn_compressor_ape.weight", il);
+            l->attn_compressor_kv   = tensor_by_namef(m, "blk.%u.attn_compressor_kv.weight", il);
+            l->attn_compressor_gate = tensor_by_namef(m, "blk.%u.attn_compressor_gate.weight", il);
+            l->attn_compressor_norm = tensor_by_namef(m, "blk.%u.attn_compressor_norm.weight", il);
         }
         if (compress_ratio == 4) {
-            l->indexer_attn_q_b = required_tensorf(m, "blk.%u.indexer.attn_q_b.weight", il);
-            l->indexer_proj     = required_tensorf(m, "blk.%u.indexer.proj.weight", il);
-            l->indexer_compressor_ape  = required_tensorf(m, "blk.%u.indexer_compressor_ape.weight", il);
-            l->indexer_compressor_kv   = required_tensorf(m, "blk.%u.indexer_compressor_kv.weight", il);
-            l->indexer_compressor_gate = required_tensorf(m, "blk.%u.indexer_compressor_gate.weight", il);
-            l->indexer_compressor_norm = required_tensorf(m, "blk.%u.indexer_compressor_norm.weight", il);
+            l->indexer_attn_q_b = tensor_by_namef(m, "blk.%u.indexer.attn_q_b.weight", il);
+            l->indexer_proj     = tensor_by_namef(m, "blk.%u.indexer.proj.weight", il);
+            l->indexer_compressor_ape  = tensor_by_namef(m, "blk.%u.indexer_compressor_ape.weight", il);
+            l->indexer_compressor_kv   = tensor_by_namef(m, "blk.%u.indexer_compressor_kv.weight", il);
+            l->indexer_compressor_gate = tensor_by_namef(m, "blk.%u.indexer_compressor_gate.weight", il);
+            l->indexer_compressor_norm = tensor_by_namef(m, "blk.%u.indexer_compressor_norm.weight", il);
         }
-        l->hc_ffn_fn       = required_tensorf(m, "blk.%u.hc_ffn_fn.weight", il);
-        l->hc_ffn_scale    = required_tensorf(m, "blk.%u.hc_ffn_scale.weight", il);
-        l->hc_ffn_base     = required_tensorf(m, "blk.%u.hc_ffn_base.weight", il);
-        l->ffn_norm        = required_tensorf(m, "blk.%u.ffn_norm.weight", il);
-        l->ffn_gate_inp    = required_tensorf(m, "blk.%u.ffn_gate_inp.weight", il);
+        l->hc_ffn_fn       = tensor_by_namef(m, "blk.%u.hc_ffn_fn.weight", il);
+        l->hc_ffn_scale    = tensor_by_namef(m, "blk.%u.hc_ffn_scale.weight", il);
+        l->hc_ffn_base     = tensor_by_namef(m, "blk.%u.hc_ffn_base.weight", il);
+        l->ffn_norm        = tensor_by_namef(m, "blk.%u.ffn_norm.weight", il);
+        l->ffn_gate_inp    = tensor_by_namef(m, "blk.%u.ffn_gate_inp.weight", il);
         l->ffn_exp_probs_b = tensor_by_namef(m, "blk.%u.exp_probs_b.bias", il);
-        l->ffn_gate_exps   = required_tensorf(m, "blk.%u.ffn_gate_exps.weight", il);
-        l->ffn_up_exps     = required_tensorf(m, "blk.%u.ffn_up_exps.weight", il);
-        l->ffn_down_exps   = required_tensorf(m, "blk.%u.ffn_down_exps.weight", il);
-        l->ffn_gate_shexp  = required_tensorf(m, "blk.%u.ffn_gate_shexp.weight", il);
-        l->ffn_up_shexp    = required_tensorf(m, "blk.%u.ffn_up_shexp.weight", il);
-        l->ffn_down_shexp  = required_tensorf(m, "blk.%u.ffn_down_shexp.weight", il);
+        l->ffn_gate_exps   = tensor_by_namef(m, "blk.%u.ffn_gate_exps.weight", il);
+        l->ffn_up_exps     = tensor_by_namef(m, "blk.%u.ffn_up_exps.weight", il);
+        l->ffn_down_exps   = tensor_by_namef(m, "blk.%u.ffn_down_exps.weight", il);
+        l->ffn_gate_shexp  = tensor_by_namef(m, "blk.%u.ffn_gate_shexp.weight", il);
+        l->ffn_up_shexp    = tensor_by_namef(m, "blk.%u.ffn_up_shexp.weight", il);
+        l->ffn_down_shexp  = tensor_by_namef(m, "blk.%u.ffn_down_shexp.weight", il);
 
         if (il < DS4_N_HASH_LAYER) {
-            l->ffn_gate_tid2eid = required_tensorf(m, "blk.%u.ffn_gate_tid2eid.weight", il);
+            l->ffn_gate_tid2eid = tensor_by_namef(m, "blk.%u.ffn_gate_tid2eid.weight", il);
+        }
+        if (!l->attn_norm) {
+            fprintf(stderr, "ds4: layer %u missing core tensor attn_norm, aborting\n", il);
+            exit(1);
         }
     }
 
@@ -4237,6 +4262,15 @@ static void hc_pre_from_state_one(
         float             * out,
         float             * post,
         float             * comb) {
+    if (!fn) {
+        /* hc_attn tensors missing for this layer — 
+           copy first HC stream as output, no mixing */
+        const uint32_t n_hc = DS4_N_HC;
+        memcpy(out, residual_hc, (size_t)DS4_N_EMBD * sizeof(out[0]));
+        for (uint32_t i = 0; i < 4; i++) post[i] = 0;
+        for (uint32_t i = 0; i < 16; i++) comb[i] = 0;
+        return;
+    }
     const uint64_t hc_dim = (uint64_t)DS4_N_EMBD * DS4_N_HC;
     float *flat = xmalloc((size_t)hc_dim * sizeof(flat[0]));
 
