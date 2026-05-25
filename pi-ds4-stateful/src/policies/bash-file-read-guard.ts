@@ -9,6 +9,7 @@ export interface BashFileReadGuardDecision {
 
 const FILE_DUMP_COMMANDS = new Set(["cat", "head", "tail", "sed", "awk"]);
 const SCRIPT_READ_COMMANDS = new Set(["python", "python3", "perl", "node"]);
+const EXEC_WRAPPERS = new Set(["command", "builtin", "sudo", "env"]);
 
 function asBashArgs(input: unknown): BashArgs | undefined {
 	return input && typeof input === "object" && !Array.isArray(input) ? (input as BashArgs) : undefined;
@@ -71,6 +72,11 @@ function stripWrappers(words: string[]): string[] {
 	while (out[0] === "command" || out[0] === "builtin" || out[0] === "sudo") out = out.slice(1);
 	if (out[0] === "env") out = stripAssignments(out.slice(1));
 	return out;
+}
+
+function baseCommand(word: string | undefined): string | undefined {
+	if (!word) return undefined;
+	return word.split("/").pop() ?? word;
 }
 
 function hasInputRedirection(words: string[]): boolean {
@@ -162,14 +168,54 @@ function looksLikeScriptFileRead(segment: string): boolean {
 	return /\b(readFileSync|readFile|read_text|open\s*\(|Path\s*\([^)]*\)\.read_text)\b/.test(segment);
 }
 
+function findExecDumpReason(command: string): string | undefined {
+	const words = shellWords(command);
+	for (let i = 0; i < words.length; i++) {
+		if (words[i] !== "-exec" && words[i] !== "-execdir") continue;
+		let j = i + 1;
+		while (EXEC_WRAPPERS.has(words[j])) j++;
+		const base = baseCommand(words[j]);
+		if (base && FILE_DUMP_COMMANDS.has(base)) {
+			return `find ${words[i]} '${base}' appears to dump file contents`;
+		}
+	}
+	return undefined;
+}
+
+function xargsDumpReason(command: string): string | undefined {
+	const words = shellWords(command);
+	for (let i = 0; i < words.length; i++) {
+		if (baseCommand(words[i]) !== "xargs") continue;
+		for (let j = i + 1; j < words.length; j++) {
+			const word = words[j];
+			if (word === "--") continue;
+			if (word === "-I" || word === "-n" || word === "-P" || word === "-0") {
+				if (word !== "-0") j++;
+				continue;
+			}
+			if (word.startsWith("-")) continue;
+			let k = j;
+			while (EXEC_WRAPPERS.has(words[k])) k++;
+			const base = baseCommand(words[k]);
+			if (base && FILE_DUMP_COMMANDS.has(base)) return `xargs '${base}' appears to dump file contents`;
+			break;
+		}
+	}
+	return undefined;
+}
+
 export function bashFileReadFallbackReason(input: unknown): string | undefined {
 	const command = asBashArgs(input)?.command;
 	if (typeof command !== "string" || command.trim().length === 0) return undefined;
+	const findReason = findExecDumpReason(command);
+	if (findReason) return findReason;
+	const xargsReason = xargsDumpReason(command);
+	if (xargsReason) return xargsReason;
 	for (const segment of commandSegments(command)) {
 		const words = stripWrappers(shellWords(segment));
 		const cmd = words[0];
 		if (!cmd) continue;
-		const base = cmd.split("/").pop() ?? cmd;
+		const base = baseCommand(cmd) ?? cmd;
 		const args = words.slice(1);
 		if (FILE_DUMP_COMMANDS.has(base)) {
 			const dumpsFile = base === "sed" ? hasSedInputFile(args) :
@@ -185,11 +231,11 @@ export function bashFileReadFallbackReason(input: unknown): string | undefined {
 }
 
 export function checkBashFileReadFallback(input: unknown, afterReadGuardBlock: boolean): BashFileReadGuardDecision | undefined {
-	if (!afterReadGuardBlock) return undefined;
 	const reason = bashFileReadFallbackReason(input);
 	if (!reason) return undefined;
+	const context = afterReadGuardBlock ? " after a read guard block" : "";
 	return {
 		block: true,
-		reason: `${reason} after a read guard block. Do not bypass the read guard with cat/head/tail/sed/awk or scripts; answer from existing context, use rg/grep for a precise search, or request one targeted unread read range.`,
+		reason: `${reason}${context}. Use Pi's read tool for file contents; do not bypass it with cat/head/tail/sed/awk, find -exec cat, xargs cat, or scripts. Use rg/grep only for precise searches.`,
 	};
 }

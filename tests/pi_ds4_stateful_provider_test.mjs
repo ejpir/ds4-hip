@@ -339,6 +339,31 @@ async function testToolResultDelta() {
 	});
 }
 
+async function testBashFileDumpBlockedWithoutReadGuard() {
+	await withMockServer((payload, index, res) => {
+		if (index === 1) {
+			sseToolCall(res, {
+				id: "call_bash_find_cat",
+				name: "bash",
+				arguments: { command: "cd /home/nick/repos/ds4 && find . -maxdepth 1 -name '*STATEFUL*' -exec echo \"---\" \\; -exec cat {} \\;" },
+			});
+			return;
+		}
+		assert.equal(index, 2);
+		assert.deepEqual(payload.messages.map((m) => m.role), ["tool"]);
+		assert.match(payload.messages[0].content, /find -exec 'cat' appears to dump file contents/);
+		sseText(res, "bash-file-dump-blocked-no-read-guard", `chatcmpl_${index}`);
+	}, async (baseUrl, requests) => {
+		const result = await runPi([
+			...commonPiArgs(["--tools", "bash", "-p"]),
+			"Find stateful docs without dumping files through bash.",
+		], { DS4_STATEFUL_BASE_URL: baseUrl }, 120_000);
+		await assertPiOk(result, "bash file dump blocked without read guard");
+		assert.match(result.stdout, /bash-file-dump-blocked-no-read-guard/);
+		assert.equal(requests.length, 2);
+	});
+}
+
 async function testBashFileDumpBlockedAfterReadGuard() {
 	await withMockServer((payload, index, res) => {
 		if (index === 1) {
@@ -426,6 +451,7 @@ const tests = [
 	["user follow-up auto resets", testUserFollowupAutoResets],
 	["delta 409 retries reset", testDelta409RetriesAsReset],
 	["tool result delta", testToolResultDelta],
+	["bash file dump blocked without read guard", testBashFileDumpBlockedWithoutReadGuard],
 	["bash file dump blocked after read guard", testBashFileDumpBlockedAfterReadGuard],
 	["covered read range blocked", testCoveredReadRangeBlocked],
 ];
