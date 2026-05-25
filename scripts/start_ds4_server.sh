@@ -74,8 +74,9 @@ Environment:
   DS4_SERVER_MOE_DECODE_RPB=N    Optional rows/block for exact single-token Q2_K MoE decode
   DS4_SERVER_MOE_EXPERT_SHARED_X=1    Experimental LDS x tile reuse for gate/up; use with GATE_RPB>1
   DS4_SERVER_MOE_EXPERT_SHARED_MID=1  Experimental LDS mid tile reuse for down; use with DOWN_RPB>1
-  DS4_SERVER_MOE_Q8K_DOWN=1      Opt-in Q8_K mid/down MoE path; exact-gated default layers are >=40
-  DS4_SERVER_MOE_Q8K_DOWN_LAYERS=LIST Restrict Q8_K down to layers/ranges; overrides >=43 default
+  DS4_SERVER_MOE_DECODE_Q8K_DOWN=1 Opt-in Q8_K mid/down MoE decode path
+  DS4_SERVER_MOE_Q8K_DOWN=1      Legacy alias for Q8_K mid/down MoE decode path
+  DS4_SERVER_MOE_Q8K_DOWN_LAYERS=LIST Legacy/no-op decode restriction knob
   DS4_SERVER_MOE_Q8K_DOWN_DIRECT=1    Use slower direct sum6 Q8_K-down variant instead of expert-batched
   DS4_SERVER_MOE_Q8K_DOWN_TILE=4|8|16 Expert-batched Q8_K-down pair tile; default 4
   DS4_SERVER_MOE_WMMA_HOT=1      Opt-in hot-bucket Q2_K WMMA MoE path. Enabled by DS4_SERVER_FAST_FULL=1.
@@ -327,6 +328,7 @@ export_pair_value MOE_DOWN_TILE "${DS4_SERVER_MOE_DOWN_TILE:-}"
 export_pair_value MOE_GATE_RPB "${DS4_SERVER_MOE_GATE_RPB:-}"
 export_pair_value MOE_DOWN_RPB "${DS4_SERVER_MOE_DOWN_RPB:-}"
 export_pair_value MOE_DECODE_RPB "${DS4_SERVER_MOE_DECODE_RPB:-}"
+export_pair_flag MOE_DECODE_Q8K_DOWN "${DS4_SERVER_MOE_DECODE_Q8K_DOWN:-0}"
 export_pair_flag MOE_EXPERT_SHARED_X "${DS4_SERVER_MOE_EXPERT_SHARED_X:-0}"
 export_pair_flag MOE_EXPERT_SHARED_MID "${DS4_SERVER_MOE_EXPERT_SHARED_MID:-0}"
 export_pair_flag MOE_Q8K_DOWN "${DS4_SERVER_MOE_Q8K_DOWN:-0}"
@@ -451,6 +453,10 @@ if [[ "${DS4_SERVER_MOE_EXPERT_SHARED_X:-0}" == "1" ]]; then
 fi
 if [[ "${DS4_SERVER_MOE_EXPERT_SHARED_MID:-0}" == "1" ]]; then
   export DS4_HIP_MOE_EXPERT_SHARED_MID=1
+fi
+if [[ "${DS4_SERVER_MOE_DECODE_Q8K_DOWN:-0}" == "1" ]]; then
+  export DS4_CUDA_MOE_DECODE_Q8K_DOWN=1
+  export DS4_HIP_MOE_DECODE_Q8K_DOWN=1
 fi
 if [[ "${DS4_SERVER_MOE_Q8K_DOWN:-0}" == "1" ]]; then
   export DS4_HIP_MOE_Q8K_DOWN=1

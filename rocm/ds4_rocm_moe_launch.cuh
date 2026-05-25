@@ -1749,18 +1749,41 @@ static int routed_moe_launch(
             return 0;
         }
         if (prof1) (void)cudaEventRecord(prof1, 0);
-        dim3 down_grid((out_dim + rows_per_block - 1u) / rows_per_block, n_tokens, 1);
-        moe_down_q2K_sum_rows_w32_kernel<<<down_grid, threads>>>(
-                (float *)out->ptr,
-                down_w,
-                (const float *)mid->ptr,
-                (const int32_t *)selected->ptr,
-                n_tokens,
-                expert_mid_dim,
-                out_dim,
-                down_expert_bytes,
-                down_row_bytes);
-        const int ok_decode_moe = cuda_ok(cudaGetLastError(), "routed_moe q2 oldhip rows down launch");
+        int ok_decode_moe = 1;
+        const uint64_t midq_bytes = (uint64_t)n_tokens * n_expert * midq_blocks * sizeof(cuda_block_q8_K);
+        const int q8k_down = n_tokens == 1u && n_expert == 6u && down->bytes >= midq_bytes &&
+            cuda_env_flag_any3("DS4_CUDA_MOE_DECODE_Q8K_DOWN", "DS4_HIP_MOE_DECODE_Q8K_DOWN", "DS4_HIP_MOE_Q8K_DOWN");
+        if (q8k_down) {
+            cuda_block_q8_K *midq = (cuda_block_q8_K *)down->ptr;
+            dim3 midq_grid(midq_blocks, n_tokens * n_expert, 1);
+            q8_K_quantize_kernel<<<midq_grid, 256>>>(midq, (const float *)mid->ptr, expert_mid_dim, n_tokens * n_expert);
+            ok_decode_moe = cuda_ok(cudaGetLastError(), "routed_moe q2 oldhip q8k mid quantize launch");
+            if (ok_decode_moe) {
+                moe_down_sum6_qwarp32_kernel<<<(out_dim + 31u) / 32u, 256>>>(
+                        (float *)out->ptr,
+                        down_w,
+                        midq,
+                        (const int32_t *)selected->ptr,
+                        down_expert_bytes,
+                        down_row_bytes,
+                        midq_blocks,
+                        out_dim);
+                ok_decode_moe = cuda_ok(cudaGetLastError(), "routed_moe q2 oldhip q8k down launch");
+            }
+        } else {
+            dim3 down_grid((out_dim + rows_per_block - 1u) / rows_per_block, n_tokens, 1);
+            moe_down_q2K_sum_rows_w32_kernel<<<down_grid, threads>>>(
+                    (float *)out->ptr,
+                    down_w,
+                    (const float *)mid->ptr,
+                    (const int32_t *)selected->ptr,
+                    n_tokens,
+                    expert_mid_dim,
+                    out_dim,
+                    down_expert_bytes,
+                    down_row_bytes);
+            ok_decode_moe = cuda_ok(cudaGetLastError(), "routed_moe q2 oldhip rows down launch");
+        }
         if (prof2) {
             (void)cudaEventRecord(prof2, 0);
             if (cudaEventSynchronize(prof2) == cudaSuccess) {
