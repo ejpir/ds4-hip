@@ -448,16 +448,12 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
     if (!tmp) return 0;
     int8_t *xq = (int8_t *)tmp;
     float *xscale = (float *)((char *)tmp + scale_offset);
-    const int use_dp4a = cuda_q8_use_dp4a();
+    const int use_dp4a = cuda_runtime_config()->q8_use_dp4a;
     dim3 qgrid((unsigned)blocks, (unsigned)n_tok, 1);
     quantize_q8_0_f32_kernel<<<qgrid, 32>>>(xq, xscale, (const float *)x->ptr, in_dim, blocks);
     if (!cuda_ok(cudaGetLastError(), "matmul_q8_0 quantize launch")) return 0;
     if (n_tok == 1) {
-        uint32_t rows_per_block = cuda_parse_u32_env_alias("DS4_CUDA_Q8_DECODE_RPB",
-                                                           "DS4_HIP_Q8_DECODE_RPB",
-                                                           8u, 1u, 32u);
-        if (rows_per_block != 1u && rows_per_block != 2u && rows_per_block != 4u &&
-            rows_per_block != 8u && rows_per_block != 16u && rows_per_block != 32u) rows_per_block = 8u;
+        uint32_t rows_per_block = cuda_runtime_config()->q8_decode_rpb;
         matmul_q8_0_preq_rows_w32_kernel<<<((unsigned)out_dim + rows_per_block - 1u) / rows_per_block,
                                             rows_per_block * 32u>>>(
                 (float *)out->ptr,
@@ -581,7 +577,7 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
     if (!tmp) return 0;
     int8_t *xq = (int8_t *)tmp;
     float *xscale = (float *)((char *)tmp + scale_offset);
-    const int use_dp4a = cuda_q8_use_dp4a();
+    const int use_dp4a = cuda_runtime_config()->q8_use_dp4a;
     dim3 qgrid((unsigned)blocks, 1, 1);
     quantize_q8_0_f32_kernel<<<qgrid, 32>>>(xq, xscale, (const float *)x->ptr, in_dim, blocks);
     if (!cuda_ok(cudaGetLastError(), "matmul_q8_0 pair quantize launch")) return 0;
@@ -806,17 +802,10 @@ static int cuda_matmul_q8_0_hc_expand_tensor_labeled(
     if (!tmp) return 0;
     int8_t *xq = (int8_t *)tmp;
     float *xscale = (float *)((char *)tmp + scale_offset);
-    const int use_dp4a = cuda_q8_use_dp4a();
+    const int use_dp4a = cuda_runtime_config()->q8_use_dp4a;
     quantize_q8_0_f32_kernel<<<(unsigned)blocks, 32>>>(xq, xscale, (const float *)x->ptr, in_dim, blocks);
     if (!cuda_ok(cudaGetLastError(), "matmul_q8_0_hc_expand quantize launch")) return 0;
-    uint32_t rows_per_block = cuda_parse_u32_env_alias("DS4_CUDA_Q8_HC_DECODE_RPB",
-                                                       "DS4_HIP_Q8_HC_DECODE_RPB",
-                                                       cuda_parse_u32_env_alias("DS4_CUDA_Q8_DECODE_RPB",
-                                                                                "DS4_HIP_Q8_DECODE_RPB",
-                                                                                8u, 1u, 32u),
-                                                       1u, 32u);
-    if (rows_per_block != 1u && rows_per_block != 2u && rows_per_block != 4u &&
-        rows_per_block != 8u && rows_per_block != 16u && rows_per_block != 32u) rows_per_block = 8u;
+    uint32_t rows_per_block = cuda_runtime_config()->q8_hc_decode_rpb;
     matmul_q8_0_hc_expand_preq_rows_w32_kernel<<<((unsigned)out_dim + rows_per_block - 1u) / rows_per_block,
                                                   rows_per_block * 32u>>>(
             (float *)out_hc->ptr,

@@ -1706,15 +1706,12 @@ static int routed_moe_launch(
         return ok;
     }
 
-    if (q2k_path && n_expert == 6u &&
-        !cuda_env_present("DS4_CUDA_NO_OLDHIP_MOE_Q2_ROWS")) {
-        uint32_t rows_per_block = cuda_parse_u32_env_alias("DS4_CUDA_MOE_DECODE_RPB", "DS4_HIP_MOE_DECODE_RPB", 8u, 1u, 32u);
-        if (rows_per_block != 1u && rows_per_block != 2u && rows_per_block != 4u &&
-            rows_per_block != 8u && rows_per_block != 16u && rows_per_block != 32u) rows_per_block = 8u;
+    const ds4_rocm_runtime_config *cfg = cuda_runtime_config();
+    if (q2k_path && n_expert == 6u && cfg->oldhip_moe_q2_rows) {
+        uint32_t rows_per_block = cfg->moe_decode_rpb;
         const uint32_t threads = rows_per_block * 32u;
-        const int store_gate_up = (g_quality_mode || cuda_runtime_config()->graph_dump) ? 1 : 0;
-        const uint32_t profile_decode_moe = cuda_env_present("DS4_CUDA_MOE_PROFILE") ||
-                                            cuda_env_present("DS4_HIP_MOE_PROFILE");
+        const int store_gate_up = (g_quality_mode || cfg->graph_dump) ? 1 : 0;
+        const uint32_t profile_decode_moe = (uint32_t)cfg->moe_profile;
         cudaEvent_t prof0 = NULL, prof1 = NULL, prof2 = NULL;
         if (profile_decode_moe) {
             if (cudaEventCreate(&prof0) != cudaSuccess ||

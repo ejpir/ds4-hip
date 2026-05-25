@@ -54,16 +54,17 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
     const float *sinks = (const float *)cuda_model_range_ptr(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
     if (!sinks) return 0;
-    if (cuda_env_present("DS4_CUDA_OLDHIP_ATTENTION_DECODE") &&
-        !cuda_env_present("DS4_CUDA_NO_OLDHIP_ATTENTION_DECODE") &&
-        cuda_offset_in_env_range(sinks_offset,
-                                 "DS4_CUDA_OLDHIP_ATTENTION_DECODE_OFFSETS",
-                                 "DS4_CUDA_OLDHIP_ATTENTION_DECODE_MIN_OFFSET",
-                                 "DS4_CUDA_OLDHIP_ATTENTION_DECODE_MAX_OFFSET") &&
-        cuda_offset_in_env_range((uint64_t)n_raw,
-                                 "DS4_CUDA_OLDHIP_ATTENTION_DECODE_N_RAW",
-                                 "DS4_CUDA_OLDHIP_ATTENTION_DECODE_MIN_N_RAW",
-                                 "DS4_CUDA_OLDHIP_ATTENTION_DECODE_MAX_N_RAW")) {
+    const ds4_rocm_runtime_config *cfg = cuda_runtime_config();
+    if (cfg->oldhip_attention_decode &&
+        (cfg->oldhip_attention_decode_unfiltered ||
+         (cuda_offset_in_env_range(sinks_offset,
+                                   "DS4_CUDA_OLDHIP_ATTENTION_DECODE_OFFSETS",
+                                   "DS4_CUDA_OLDHIP_ATTENTION_DECODE_MIN_OFFSET",
+                                   "DS4_CUDA_OLDHIP_ATTENTION_DECODE_MAX_OFFSET") &&
+          cuda_offset_in_env_range((uint64_t)n_raw,
+                                   "DS4_CUDA_OLDHIP_ATTENTION_DECODE_N_RAW",
+                                   "DS4_CUDA_OLDHIP_ATTENTION_DECODE_MIN_N_RAW",
+                                   "DS4_CUDA_OLDHIP_ATTENTION_DECODE_MAX_N_RAW")))) {
         const uint32_t rows = n_raw + n_comp;
         const size_t shmem = (size_t)(rows ? rows : 1u) * sizeof(float);
         attention_decode_mixed_one_fast_oldhip_kernel<<<(unsigned)n_head, 256, shmem>>>(
@@ -79,7 +80,8 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
                 n_comp,
                 use_mask,
                 n_head,
-                head_dim);
+                head_dim,
+                (uint32_t)(cfg->oldhip_attention_vec4 && ((head_dim & 3u) == 0u)));
         return cuda_ok(cudaGetLastError(), "attention decode oldhip fast launch");
     }
     if (!cuda_attention_score_buffer_fits(n_comp)) {
@@ -1152,7 +1154,7 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
         if (!tmp) return 0;
         int8_t *xq = (int8_t *)tmp;
         float *xscale = (float *)((char *)tmp + scale_offset);
-        const int use_dp4a = cuda_q8_use_dp4a();
+        const int use_dp4a = cuda_runtime_config()->q8_use_dp4a;
         dim3 qgrid((unsigned)blocks_a, (unsigned)x_rows, 1);
         quantize_q8_0_f32_kernel<<<qgrid, 32>>>(xq,
                                                 xscale,
@@ -1306,7 +1308,7 @@ extern "C" int ds4_gpu_attention_output_low_q8_tensor(
     if (!tmp) return 0;
     int8_t *xq = (int8_t *)tmp;
     float *xscale = (float *)((char *)tmp + scale_offset);
-    const int use_dp4a = cuda_q8_use_dp4a();
+    const int use_dp4a = cuda_runtime_config()->q8_use_dp4a;
     dim3 qgrid((unsigned)blocks_a, (unsigned)x_rows, 1);
     quantize_q8_0_f32_kernel<<<qgrid, 32>>>(xq,
                                             xscale,

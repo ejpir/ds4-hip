@@ -366,6 +366,13 @@ static int cuda_env_flag_any3(const char *a, const char *b, const char *c) {
            (c && cuda_env_flag(c));
 }
 
+static uint32_t cuda_parse_u32_env_alias(const char *primary, const char *alias,
+                                         uint32_t def, uint32_t min_v, uint32_t max_v);
+
+static uint32_t cuda_rows_per_block_or_default(uint32_t v, uint32_t def) {
+    return (v == 1u || v == 2u || v == 4u || v == 8u || v == 16u || v == 32u) ? v : def;
+}
+
 struct ds4_rocm_runtime_config {
     int initialized;
     int q8_prequant_decode;
@@ -379,6 +386,15 @@ struct ds4_rocm_runtime_config {
     int shared_expert_cublas;
     int shared_down_cublas;
     int graph_dump;
+    int q8_use_dp4a;
+    uint32_t q8_decode_rpb;
+    uint32_t q8_hc_decode_rpb;
+    uint32_t moe_decode_rpb;
+    int moe_profile;
+    int oldhip_moe_q2_rows;
+    int oldhip_attention_decode;
+    int oldhip_attention_decode_unfiltered;
+    int oldhip_attention_vec4;
 };
 
 static ds4_rocm_runtime_config g_rocm_cfg;
@@ -396,6 +412,28 @@ static const ds4_rocm_runtime_config *cuda_runtime_config(void) {
         g_rocm_cfg.shared_expert_cublas = cuda_env_flag("DS4_CUDA_SHARED_EXPERT_CUBLAS");
         g_rocm_cfg.shared_down_cublas = cuda_env_flag("DS4_CUDA_SHARED_DOWN_CUBLAS");
         g_rocm_cfg.graph_dump = cuda_env_present("DS4_METAL_GRAPH_DUMP_PREFIX");
+        g_rocm_cfg.q8_use_dp4a = !cuda_env_flag_any3("DS4_CUDA_NO_Q8_DP4A", "DS4_HIP_NO_Q8_DP4A", NULL);
+        g_rocm_cfg.q8_decode_rpb = cuda_rows_per_block_or_default(
+                cuda_parse_u32_env_alias("DS4_CUDA_Q8_DECODE_RPB", "DS4_HIP_Q8_DECODE_RPB", 8u, 1u, 32u), 8u);
+        g_rocm_cfg.q8_hc_decode_rpb = cuda_rows_per_block_or_default(
+                cuda_parse_u32_env_alias("DS4_CUDA_Q8_HC_DECODE_RPB", "DS4_HIP_Q8_HC_DECODE_RPB", g_rocm_cfg.q8_decode_rpb, 1u, 32u),
+                g_rocm_cfg.q8_decode_rpb);
+        g_rocm_cfg.moe_decode_rpb = cuda_rows_per_block_or_default(
+                cuda_parse_u32_env_alias("DS4_CUDA_MOE_DECODE_RPB", "DS4_HIP_MOE_DECODE_RPB", 8u, 1u, 32u), 8u);
+        g_rocm_cfg.moe_profile = cuda_env_flag_any3("DS4_CUDA_MOE_PROFILE", "DS4_HIP_MOE_PROFILE", NULL);
+        g_rocm_cfg.oldhip_moe_q2_rows = !cuda_env_flag_any3("DS4_CUDA_NO_OLDHIP_MOE_Q2_ROWS", "DS4_HIP_NO_OLDHIP_MOE_Q2_ROWS", NULL);
+        g_rocm_cfg.oldhip_attention_decode =
+                cuda_env_flag_any3("DS4_CUDA_OLDHIP_ATTENTION_DECODE", "DS4_HIP_OLDHIP_ATTENTION_DECODE", NULL) &&
+                !cuda_env_flag_any3("DS4_CUDA_NO_OLDHIP_ATTENTION_DECODE", "DS4_HIP_NO_OLDHIP_ATTENTION_DECODE", NULL);
+        g_rocm_cfg.oldhip_attention_decode_unfiltered =
+                !cuda_env_present("DS4_CUDA_OLDHIP_ATTENTION_DECODE_OFFSETS") &&
+                !cuda_env_present("DS4_CUDA_OLDHIP_ATTENTION_DECODE_MIN_OFFSET") &&
+                !cuda_env_present("DS4_CUDA_OLDHIP_ATTENTION_DECODE_MAX_OFFSET") &&
+                !cuda_env_present("DS4_CUDA_OLDHIP_ATTENTION_DECODE_N_RAW") &&
+                !cuda_env_present("DS4_CUDA_OLDHIP_ATTENTION_DECODE_MIN_N_RAW") &&
+                !cuda_env_present("DS4_CUDA_OLDHIP_ATTENTION_DECODE_MAX_N_RAW");
+        g_rocm_cfg.oldhip_attention_vec4 =
+                !cuda_env_flag_any3("DS4_CUDA_NO_OLDHIP_ATTENTION_VEC4", "DS4_HIP_NO_OLDHIP_ATTENTION_VEC4", NULL);
         g_rocm_cfg.initialized = 1;
     }
     return &g_rocm_cfg;
@@ -570,7 +608,7 @@ static int cuda_q8_label_is_attention_output(const char *label) {
 }
 
 static int cuda_q8_use_dp4a(void) {
-    return getenv("DS4_CUDA_NO_Q8_DP4A") == NULL;
+    return cuda_runtime_config()->q8_use_dp4a;
 }
 
 static int cuda_q8_f16_preload_allowed(const char *label, uint64_t in_dim, uint64_t out_dim) {

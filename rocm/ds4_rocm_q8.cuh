@@ -93,14 +93,12 @@ __global__ static void quantize_q8_0_f32_kernel(
 
     float a = 0.0f;
     if (threadIdx.x < bn) a = fabsf(xr[threadIdx.x]);
-    __shared__ float vals[32];
-    vals[threadIdx.x] = a;
-    __syncthreads();
-    for (uint32_t stride = 16; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) vals[threadIdx.x] = fmaxf(vals[threadIdx.x], vals[threadIdx.x + stride]);
-        __syncthreads();
-    }
-    const float d = vals[0] / 127.0f;
+    a = warp_max_f32(a);
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+    const float d = __shfl(a, 0, 32) / 127.0f;
+#else
+    const float d = __shfl_sync(FULL_WARP_MASK, a, 0, 32) / 127.0f;
+#endif
     const float id = d != 0.0f ? 1.0f / d : 0.0f;
     if (threadIdx.x == 0) xscale[tok * blocks + b] = d;
     int8_t *dst = xq + (tok * blocks + b) * 32;

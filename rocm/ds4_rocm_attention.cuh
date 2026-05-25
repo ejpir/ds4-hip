@@ -360,6 +360,24 @@ __device__ static float attention_block_max_oldhip_w32(float v) {
     return sh[0];
 }
 
+__device__ __forceinline__ static float attention_dot_f32_vec4_oldhip(const float *a, const float *b, uint32_t n) {
+    float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+    const uint32_t n4 = n >> 2u;
+    const float4 *a4 = (const float4 *)a;
+    const float4 *b4 = (const float4 *)b;
+    for (uint32_t i = 0; i < n4; i++) {
+        const float4 av = a4[i];
+        const float4 bv = b4[i];
+        s0 += av.x * bv.x;
+        s1 += av.y * bv.y;
+        s2 += av.z * bv.z;
+        s3 += av.w * bv.w;
+    }
+    float s = (s0 + s1) + (s2 + s3);
+    for (uint32_t i = n4 << 2u; i < n; i++) s += a[i] * b[i];
+    return s;
+}
+
 __global__ static void attention_decode_mixed_one_fast_oldhip_kernel(
         float *heads,
         const float *q,
@@ -373,7 +391,8 @@ __global__ static void attention_decode_mixed_one_fast_oldhip_kernel(
         uint32_t n_comp,
         uint32_t use_mask,
         uint32_t n_head,
-        uint32_t head_dim) {
+        uint32_t head_dim,
+        uint32_t use_vec4) {
     const uint32_t h = (uint32_t)blockIdx.x;
     if (h >= n_head) return;
     extern __shared__ float scores[];
@@ -386,8 +405,10 @@ __global__ static void attention_decode_mixed_one_fast_oldhip_kernel(
     for (uint32_t r = tid; r < n_raw; r += blockDim.x) {
         const uint32_t row = raw_cap ? ((raw_start + r) % raw_cap) : r;
         const float *kv = raw_kv + (uint64_t)row * head_dim;
-        float s = 0.0f;
-        for (uint32_t i = 0; i < head_dim; i++) s += qh[i] * kv[i];
+        float s = use_vec4 ? attention_dot_f32_vec4_oldhip(qh, kv, head_dim) : 0.0f;
+        if (!use_vec4) {
+            for (uint32_t i = 0; i < head_dim; i++) s += qh[i] * kv[i];
+        }
         s *= scale;
         scores[r] = s;
         local_max = fmaxf(local_max, s);
@@ -396,8 +417,10 @@ __global__ static void attention_decode_mixed_one_fast_oldhip_kernel(
         float s = -3.4e38f;
         if (!(use_mask && comp_mask && comp_mask[c] <= -5.0e29f)) {
             const float *kv = comp_kv + (uint64_t)c * head_dim;
-            float dot = 0.0f;
-            for (uint32_t i = 0; i < head_dim; i++) dot += qh[i] * kv[i];
+            float dot = use_vec4 ? attention_dot_f32_vec4_oldhip(qh, kv, head_dim) : 0.0f;
+            if (!use_vec4) {
+                for (uint32_t i = 0; i < head_dim; i++) dot += qh[i] * kv[i];
+            }
             s = dot * scale;
             if (use_mask && comp_mask) s += comp_mask[c];
         }

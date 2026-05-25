@@ -39,13 +39,27 @@ static DS4_MAYBE_UNUSED bool ds4_gpu_env_no_q8_token_embed(void) {
 }
 
 static DS4_MAYBE_UNUSED bool ds4_gpu_env_q_head_rope_fused(void) {
-    return !ds4_gpu_env_present("DS4_CUDA_NO_HEAD_RMS_ROPE_FUSED") &&
-           !ds4_gpu_env_present("DS4_METAL_GRAPH_DUMP_PREFIX");
+    static int cache = -1;
+    if (cache < 0) {
+        cache = !ds4_gpu_env_present("DS4_CUDA_NO_HEAD_RMS_ROPE_FUSED") &&
+                !ds4_gpu_env_present("DS4_HIP_NO_HEAD_RMS_ROPE_FUSED") &&
+                !ds4_gpu_env_present("DS4_METAL_GRAPH_DUMP_PREFIX");
+    }
+    return cache != 0;
 }
 
 static DS4_MAYBE_UNUSED bool ds4_gpu_env_attn_q_b_f16_out(void) {
     return ds4_gpu_env_present("DS4_CUDA_ATTN_Q_B_F16_OUT") ||
            ds4_gpu_env_present("DS4_HIP_ATTN_Q_B_F16_OUT");
+}
+
+static DS4_MAYBE_UNUSED bool ds4_gpu_env_qkv_pair_decode(void) {
+    static int cache = -1;
+    if (cache < 0) {
+        cache = (ds4_gpu_env_flag_enabled2("DS4_CUDA_QKV_PAIR_DECODE", "DS4_HIP_QKV_PAIR_DECODE") &&
+                 !ds4_gpu_env_present("DS4_METAL_GRAPH_DUMP_PREFIX"));
+    }
+    return cache != 0;
 }
 
 static DS4_MAYBE_UNUSED bool ds4_gpu_env_attn_output_f16_out(uint32_t n_tokens) {
