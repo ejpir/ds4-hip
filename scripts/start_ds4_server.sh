@@ -56,6 +56,9 @@ Environment:
   DS4_SERVER_Q8_WMMA_FAST=1      Opt-in q-side FP16 Q8 WMMA prefill path; uses ~3.35 GiB VRAM
                                 Enabled by DS4_SERVER_FAST_FULL=1.
   DS4_SERVER_Q8_PREQUANT_DECODE=0 Disable FAST_FULL q-side prequantized Q8 decode matvecs in upstream-shaped ROCm
+  DS4_SERVER_Q8_DECODE_RPB=1|2|4|8|16|32 Rows/block for single-token Q8 decode matvecs
+  DS4_SERVER_Q8_HC_DECODE_RPB=1|2|4|8|16|32 Rows/block for fused Q8 HC-expand decode matvecs
+  DS4_SERVER_OLDHIP_ATTENTION_DECODE=1 Use the old-HIP decode attention kernel
   DS4_SERVER_ATTN_OUT_LOW_SPLITK=1 Restore old split-K decode attn_output_a path; FAST_FULL defaults to prequant
   DS4_SERVER_SHARED_GATE_UP_FUSED_W32=1 Restore old fused shared gate/up float-row decode path; FAST_FULL defaults to prequant pair
   DS4_SERVER_Q8_HIPBLASLT=1      Opt-in q-side hipBLASLt xsplit path for small prefill batches
@@ -310,6 +313,9 @@ export_pair_value Q8_GROUPED_BATCH_TILE "${DS4_SERVER_Q8_GROUPED_BATCH_TILE:-}"
 export_pair_flag Q8_REPACK "${DS4_SERVER_Q8_REPACK:-0}"
 export_pair_flag Q8_REPACK_SPLIT16 "${DS4_SERVER_Q8_REPACK_SPLIT16:-0}"
 export_pair_flag Q8_WMMA_FAST "${DS4_SERVER_Q8_WMMA_FAST:-0}"
+export_pair_value Q8_DECODE_RPB "${DS4_SERVER_Q8_DECODE_RPB:-}"
+export_pair_value Q8_HC_DECODE_RPB "${DS4_SERVER_Q8_HC_DECODE_RPB:-}"
+export_pair_flag OLDHIP_ATTENTION_DECODE "${DS4_SERVER_OLDHIP_ATTENTION_DECODE:-0}"
 export_pair_flag MOE_EXPERT_BATCH "${DS4_SERVER_MOE_EXPERT_BATCH:-0}"
 export_pair_value MOE_EXPERT_TILE "${DS4_SERVER_MOE_EXPERT_TILE:-}"
 export_pair_value MOE_GATE_TILE "${DS4_SERVER_MOE_GATE_TILE:-}"

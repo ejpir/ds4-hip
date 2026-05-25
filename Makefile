@@ -16,6 +16,7 @@ HIPCXXFLAGS ?= -O3 --offload-arch=native -std=c++17 -Wno-unused-parameter -Wno-u
 LDLIBS ?= -lm -pthread
 NATIVE_LDLIBS := $(LDLIBS)
 METAL_SRCS := $(wildcard metal/*.metal)
+DS4_C_INCS := ds4_gpu_env.inc ds4_gpu_startup.inc ds4_token_embedding.inc ds4_ngram_spec.inc
 
 ROCM_PATH ?= /opt/rocm
 ROCM_ARCH ?= gfx1151
@@ -137,7 +138,7 @@ ds4-eval-rocm-upstream: ds4_eval_gpuapi.o ds4_gpuapi.o ds4_rocm.o
 ds4-agent-rocm-upstream: ds4_agent_gpuapi.o ds4_kvstore.o linenoise.o ds4_gpuapi.o ds4_rocm.o
 	$(ROCM_HIPCC) -o $@ $^ $(ROCM_LDLIBS)
 
-ds4.o: ds4.c ds4.h ds4_metal.h ds4_gpu.h
+ds4.o: ds4.c ds4.h ds4_metal.h ds4_gpu.h $(DS4_C_INCS)
 	$(CC) $(CFLAGS) -c -o $@ ds4.c
 
 ds4_cli.o: ds4_cli.c ds4.h linenoise.h
@@ -170,10 +171,10 @@ rax.o: rax.c rax.h rax_malloc.h
 linenoise.o: linenoise.c linenoise.h
 	$(CC) $(CFLAGS) -c -o $@ linenoise.c
 
-ds4_native.o: ds4.c ds4.h ds4_metal.h ds4_gpu.h
+ds4_native.o: ds4.c ds4.h ds4_metal.h ds4_gpu.h $(DS4_C_INCS)
 	$(CC) $(CFLAGS) -UDS4_USE_HIP -DDS4_NO_METAL -DDS4_NO_GPU -c -o $@ ds4.c
 
-ds4_cpu.o: ds4.c ds4.h ds4_metal.h ds4_gpu.h
+ds4_cpu.o: ds4.c ds4.h ds4_metal.h ds4_gpu.h $(DS4_C_INCS)
 	$(CC) $(CFLAGS) -UDS4_USE_HIP -DDS4_NO_METAL -DDS4_NO_GPU -c -o $@ ds4.c
 
 ds4_cli_native.o: ds4_cli.c ds4.h linenoise.h
@@ -200,7 +201,7 @@ ds4_metal.o: ds4_metal.m ds4_metal.h ds4_gpu.h $(METAL_SRCS)
 ds4_hip.o: ds4_hip.cpp ds4_metal.h
 	$(HIPCC) $(HIPCXXFLAGS) -c -o $@ ds4_hip.cpp
 
-ds4_gpuapi.o: ds4.c ds4.h ds4_metal.h ds4_gpu.h
+ds4_gpuapi.o: ds4.c ds4.h ds4_metal.h ds4_gpu.h $(DS4_C_INCS)
 	$(CC) $(CFLAGS) -DDS4_USE_GPU_API -DDS4_USE_HIP -c -o $@ ds4.c
 
 ds4_cli_gpuapi.o: ds4_cli.c ds4.h linenoise.h

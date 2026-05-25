@@ -453,7 +453,13 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
     quantize_q8_0_f32_kernel<<<qgrid, 32>>>(xq, xscale, (const float *)x->ptr, in_dim, blocks);
     if (!cuda_ok(cudaGetLastError(), "matmul_q8_0 quantize launch")) return 0;
     if (n_tok == 1) {
-        matmul_q8_0_preq_warp8_kernel<<<((unsigned)out_dim + 7u) / 8u, 256>>>(
+        uint32_t rows_per_block = cuda_parse_u32_env_alias("DS4_CUDA_Q8_DECODE_RPB",
+                                                           "DS4_HIP_Q8_DECODE_RPB",
+                                                           8u, 1u, 32u);
+        if (rows_per_block != 1u && rows_per_block != 2u && rows_per_block != 4u &&
+            rows_per_block != 8u && rows_per_block != 16u && rows_per_block != 32u) rows_per_block = 8u;
+        matmul_q8_0_preq_rows_w32_kernel<<<((unsigned)out_dim + rows_per_block - 1u) / rows_per_block,
+                                            rows_per_block * 32u>>>(
                 (float *)out->ptr,
                 reinterpret_cast<const unsigned char *>(wptr),
                 xq,
@@ -461,8 +467,9 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
                 in_dim,
                 out_dim,
                 blocks,
+                rows_per_block,
                 use_dp4a);
-        return cuda_ok(cudaGetLastError(), "matmul_q8_0 warp launch");
+        return cuda_ok(cudaGetLastError(), "matmul_q8_0 rows launch");
     }
     if (!cuda_env_present("DS4_CUDA_NO_Q8_BATCH_WARP") && blocks <= 32u) {
         dim3 bgrid(((unsigned)out_dim + 7u) / 8u, (unsigned)n_tok, 1);
@@ -802,7 +809,16 @@ static int cuda_matmul_q8_0_hc_expand_tensor_labeled(
     const int use_dp4a = cuda_q8_use_dp4a();
     quantize_q8_0_f32_kernel<<<(unsigned)blocks, 32>>>(xq, xscale, (const float *)x->ptr, in_dim, blocks);
     if (!cuda_ok(cudaGetLastError(), "matmul_q8_0_hc_expand quantize launch")) return 0;
-    matmul_q8_0_hc_expand_preq_warp8_kernel<<<((unsigned)out_dim + 7u) / 8u, 256>>>(
+    uint32_t rows_per_block = cuda_parse_u32_env_alias("DS4_CUDA_Q8_HC_DECODE_RPB",
+                                                       "DS4_HIP_Q8_HC_DECODE_RPB",
+                                                       cuda_parse_u32_env_alias("DS4_CUDA_Q8_DECODE_RPB",
+                                                                                "DS4_HIP_Q8_DECODE_RPB",
+                                                                                8u, 1u, 32u),
+                                                       1u, 32u);
+    if (rows_per_block != 1u && rows_per_block != 2u && rows_per_block != 4u &&
+        rows_per_block != 8u && rows_per_block != 16u && rows_per_block != 32u) rows_per_block = 8u;
+    matmul_q8_0_hc_expand_preq_rows_w32_kernel<<<((unsigned)out_dim + rows_per_block - 1u) / rows_per_block,
+                                                  rows_per_block * 32u>>>(
             (float *)out_hc->ptr,
             (float *)block_out->ptr,
             block_add ? (const float *)block_add->ptr : (const float *)block_out->ptr,
@@ -816,9 +832,10 @@ static int cuda_matmul_q8_0_hc_expand_tensor_labeled(
             n_embd,
             n_hc,
             blocks,
+            rows_per_block,
             block_add ? 1 : 0,
             use_dp4a);
-    return cuda_ok(cudaGetLastError(), "matmul_q8_0_hc_expand launch");
+    return cuda_ok(cudaGetLastError(), "matmul_q8_0_hc_expand rows launch");
 }
 
 extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {

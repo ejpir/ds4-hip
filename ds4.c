@@ -8217,9 +8217,36 @@ static bool metal_graph_debug_filter_wants(
     return true;
 }
 
+static bool metal_graph_env_present_cached(const char *name, int *cache) {
+    if (*cache < 0) {
+        const char *v = getenv(name);
+        *cache = (v && v[0]) ? 1 : 0;
+    }
+    return *cache != 0;
+}
+
+static bool metal_graph_debug_dump_active(void) {
+    static int cache = -1;
+    return metal_graph_env_present_cached("DS4_METAL_GRAPH_DUMP_PREFIX", &cache);
+}
+
+static bool metal_graph_debug_trace_active(void) {
+    static int cache = -1;
+    return metal_graph_env_present_cached("DS4_METAL_GRAPH_TRACE_FILE", &cache);
+}
+
+static bool metal_graph_debug_inject_active(void) {
+    static int cache = -1;
+    return metal_graph_env_present_cached("DS4_METAL_GRAPH_INJECT_PREFIX", &cache);
+}
+
+static bool metal_graph_debug_force_router_active(void) {
+    static int cache = -1;
+    return metal_graph_env_present_cached("DS4_METAL_GRAPH_FORCE_ROUTER_TOPK_PREFIX", &cache);
+}
+
 static bool metal_graph_debug_wants(const char *name, uint32_t il, uint32_t pos) {
-    const char *prefix = getenv("DS4_METAL_GRAPH_DUMP_PREFIX");
-    if (!prefix || !prefix[0]) return false;
+    if (!metal_graph_debug_dump_active()) return false;
 
     return metal_graph_debug_filter_wants(name, il, pos,
                                           getenv("DS4_METAL_GRAPH_DUMP_NAME"),
@@ -8228,8 +8255,7 @@ static bool metal_graph_debug_wants(const char *name, uint32_t il, uint32_t pos)
 }
 
 static bool metal_graph_debug_trace_wants(const char *name, uint32_t il, uint32_t pos) {
-    const char *path = getenv("DS4_METAL_GRAPH_TRACE_FILE");
-    if (!path || !path[0]) return false;
+    if (!metal_graph_debug_trace_active()) return false;
 
     const char *name_env = getenv("DS4_METAL_GRAPH_TRACE_NAME");
     const char *layer_env = getenv("DS4_METAL_GRAPH_TRACE_LAYER");
@@ -8253,8 +8279,8 @@ static void metal_graph_debug_trace_f32(
         uint64_t    n_f32,
         uint32_t    il,
         uint32_t    pos) {
+    if (!metal_graph_debug_trace_active() || !buf || n_f32 == 0) return;
     const char *path = getenv("DS4_METAL_GRAPH_TRACE_FILE");
-    if (!path || !path[0] || !buf || n_f32 == 0) return;
 
     double sum = 0.0;
     double sum_abs = 0.0;
@@ -8334,8 +8360,8 @@ static void metal_graph_debug_trace_i32(
         uint64_t       n_i32,
         uint32_t       il,
         uint32_t       pos) {
+    if (!metal_graph_debug_trace_active() || !buf || n_i32 == 0) return;
     const char *path = getenv("DS4_METAL_GRAPH_TRACE_FILE");
-    if (!path || !path[0] || !buf || n_i32 == 0) return;
 
     int32_t min_v = buf[0];
     int32_t max_v = buf[0];
@@ -8378,10 +8404,10 @@ static void metal_graph_debug_dump_tensor(
         uint64_t          n_f32,
         uint32_t          il,
         uint32_t          pos) {
-    const char *prefix = getenv("DS4_METAL_GRAPH_DUMP_PREFIX");
     const bool want_dump = metal_graph_debug_wants(name, il, pos);
     const bool want_trace = metal_graph_debug_trace_wants(name, il, pos);
     if (!t || n_f32 == 0 || (!want_dump && !want_trace)) return;
+    const char *prefix = want_dump ? getenv("DS4_METAL_GRAPH_DUMP_PREFIX") : NULL;
 
     if (ds4_metal_synchronize() == 0) {
         fprintf(stderr, "ds4: failed to synchronize before dumping %s layer %u pos %u\n", name, il, pos);
@@ -8412,10 +8438,10 @@ static void metal_graph_debug_dump_i32_tensor(
         uint64_t          n_i32,
         uint32_t          il,
         uint32_t          pos) {
-    const char *prefix = getenv("DS4_METAL_GRAPH_DUMP_PREFIX");
     const bool want_dump = metal_graph_debug_wants(name, il, pos);
     const bool want_trace = metal_graph_debug_trace_wants(name, il, pos);
     if (!t || n_i32 == 0 || (!want_dump && !want_trace)) return;
+    const char *prefix = want_dump ? getenv("DS4_METAL_GRAPH_DUMP_PREFIX") : NULL;
 
     if (ds4_metal_synchronize() == 0) {
         fprintf(stderr, "ds4: failed to synchronize before dumping %s layer %u pos %u\n", name, il, pos);
@@ -8450,10 +8476,10 @@ static void metal_graph_debug_dump_f32_buffer(
         uint64_t    n_f32,
         uint32_t    il,
         uint32_t    pos) {
-    const char *prefix = getenv("DS4_METAL_GRAPH_DUMP_PREFIX");
     const bool want_dump = metal_graph_debug_wants(name, il, pos);
     const bool want_trace = metal_graph_debug_trace_wants(name, il, pos);
     if (!buf || n_f32 == 0 || (!want_dump && !want_trace)) return;
+    const char *prefix = want_dump ? getenv("DS4_METAL_GRAPH_DUMP_PREFIX") : NULL;
 
     if (want_trace) metal_graph_debug_trace_f32(name, buf, n_f32, il, pos);
     if (want_dump) {
@@ -8518,8 +8544,8 @@ static bool metal_graph_debug_inject_raw_cache(
         uint32_t          head_dim,
         uint32_t          il,
         uint32_t          pos) {
+    if (!metal_graph_debug_inject_active() || !name || !raw_cache || raw_cap == 0 || n_raw == 0 || head_dim == 0) return false;
     const char *prefix = getenv("DS4_METAL_GRAPH_INJECT_PREFIX");
-    if (!prefix || !prefix[0] || !name || !raw_cache || raw_cap == 0 || n_raw == 0 || head_dim == 0) return false;
     if (!metal_graph_debug_inject_wants(name, il, pos)) return false;
     if (raw_start >= raw_cap || n_raw > raw_cap) return false;
     if (ds4_metal_tensor_bytes(raw_cache) < (uint64_t)raw_cap * head_dim * sizeof(float)) return false;
@@ -8976,8 +9002,7 @@ static bool metal_graph_debug_read_exact_if_exists(const char *path, void *buf, 
 }
 
 static bool metal_graph_debug_inject_wants(const char *name, uint32_t il, uint32_t pos) {
-    const char *prefix = getenv("DS4_METAL_GRAPH_INJECT_PREFIX");
-    if (!prefix || !prefix[0]) return false;
+    if (!metal_graph_debug_inject_active()) return false;
 
     return metal_graph_debug_filter_wants(name, il, pos,
                                           getenv("DS4_METAL_GRAPH_INJECT_NAME"),
@@ -8991,8 +9016,8 @@ static bool metal_graph_debug_inject_tensor(
         uint64_t          n_f32,
         uint32_t          il,
         uint32_t          pos) {
+    if (!metal_graph_debug_inject_active() || !name || !t || n_f32 == 0) return false;
     const char *prefix = getenv("DS4_METAL_GRAPH_INJECT_PREFIX");
-    if (!prefix || !prefix[0] || !name || !t || n_f32 == 0) return false;
     if (!metal_graph_debug_inject_wants(name, il, pos)) return false;
     if (ds4_metal_tensor_bytes(t) < n_f32 * sizeof(float)) return false;
 
@@ -9031,8 +9056,8 @@ static void metal_graph_debug_force_router_topk(
         ds4_metal_tensor *probs,
         uint32_t          il,
         uint32_t          pos) {
+    if (!metal_graph_debug_force_router_active() || !selected || !weights || !probs) return;
     const char *prefix = getenv("DS4_METAL_GRAPH_FORCE_ROUTER_TOPK_PREFIX");
-    if (!prefix || !prefix[0] || !selected || !weights || !probs) return;
     if (ds4_metal_tensor_bytes(selected) < DS4_N_EXPERT_USED * sizeof(int32_t) ||
         ds4_metal_tensor_bytes(weights) < DS4_N_EXPERT_USED * sizeof(float) ||
         ds4_metal_tensor_bytes(probs) < DS4_N_EXPERT * sizeof(float)) return;

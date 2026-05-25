@@ -1713,6 +1713,21 @@ static int routed_moe_launch(
             rows_per_block != 8u && rows_per_block != 16u && rows_per_block != 32u) rows_per_block = 8u;
         const uint32_t threads = rows_per_block * 32u;
         const int store_gate_up = (g_quality_mode || cuda_runtime_config()->graph_dump) ? 1 : 0;
+        const uint32_t profile_decode_moe = cuda_env_present("DS4_CUDA_MOE_PROFILE") ||
+                                            cuda_env_present("DS4_HIP_MOE_PROFILE");
+        cudaEvent_t prof0 = NULL, prof1 = NULL, prof2 = NULL;
+        if (profile_decode_moe) {
+            if (cudaEventCreate(&prof0) != cudaSuccess ||
+                cudaEventCreate(&prof1) != cudaSuccess ||
+                cudaEventCreate(&prof2) != cudaSuccess) {
+                if (prof0) (void)cudaEventDestroy(prof0);
+                if (prof1) (void)cudaEventDestroy(prof1);
+                if (prof2) (void)cudaEventDestroy(prof2);
+                prof0 = prof1 = prof2 = NULL;
+            } else {
+                (void)cudaEventRecord(prof0, 0);
+            }
+        }
         dim3 gate_grid((expert_mid_dim + rows_per_block - 1u) / rows_per_block, n_tokens * n_expert, 1);
         moe_gate_up_mid_q2K_rows_w32_kernel<<<gate_grid, threads>>>(
                 (float *)gate->ptr,
@@ -1730,7 +1745,13 @@ static int routed_moe_launch(
                 n_expert,
                 clamp,
                 store_gate_up);
-        if (!cuda_ok(cudaGetLastError(), "routed_moe q2 oldhip rows gate/up launch")) return 0;
+        if (!cuda_ok(cudaGetLastError(), "routed_moe q2 oldhip rows gate/up launch")) {
+            if (prof0) (void)cudaEventDestroy(prof0);
+            if (prof1) (void)cudaEventDestroy(prof1);
+            if (prof2) (void)cudaEventDestroy(prof2);
+            return 0;
+        }
+        if (prof1) (void)cudaEventRecord(prof1, 0);
         dim3 down_grid((out_dim + rows_per_block - 1u) / rows_per_block, n_tokens, 1);
         moe_down_q2K_sum_rows_w32_kernel<<<down_grid, threads>>>(
                 (float *)out->ptr,
@@ -1742,7 +1763,28 @@ static int routed_moe_launch(
                 out_dim,
                 down_expert_bytes,
                 down_row_bytes);
-        return cuda_ok(cudaGetLastError(), "routed_moe q2 oldhip rows down launch");
+        const int ok_decode_moe = cuda_ok(cudaGetLastError(), "routed_moe q2 oldhip rows down launch");
+        if (prof2) {
+            (void)cudaEventRecord(prof2, 0);
+            if (cudaEventSynchronize(prof2) == cudaSuccess) {
+                float ms_gate = 0.0f, ms_down = 0.0f, ms_total = 0.0f;
+                (void)cudaEventElapsedTime(&ms_gate, prof0, prof1);
+                (void)cudaEventElapsedTime(&ms_down, prof1, prof2);
+                (void)cudaEventElapsedTime(&ms_total, prof0, prof2);
+                fprintf(stderr,
+                        DS4_GPU_LOG_PREFIX "MoE q2 decode profile tokens=%u pairs=%u rpb=%u gateup=%.3f down=%.3f total=%.3f ms\n",
+                        n_tokens,
+                        n_tokens * n_expert,
+                        rows_per_block,
+                        ms_gate,
+                        ms_down,
+                        ms_total);
+            }
+        }
+        if (prof0) (void)cudaEventDestroy(prof0);
+        if (prof1) (void)cudaEventDestroy(prof1);
+        if (prof2) (void)cudaEventDestroy(prof2);
+        return ok_decode_moe;
     }
 
     if (ok) {

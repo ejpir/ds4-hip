@@ -331,6 +331,12 @@ static void bench_snapshot_free(bench_snapshot *snap) {
 }
 
 static int session_argmax_excluding(ds4_session *s, int excluded) {
+    int token = ds4_session_argmax(s);
+    if (token != excluded) return token;
+
+    /* EOS exclusion is only a fixed-length benchmark guard.  The common path
+     * should not pay for top-logprob normalization over the whole vocabulary;
+     * fall back to that slower path only if greedy really chose EOS. */
     ds4_token_score top[16];
     int n = ds4_session_top_logprobs(s, top, (int)(sizeof(top) / sizeof(top[0])));
     if (n > 0) {
@@ -338,8 +344,7 @@ static int session_argmax_excluding(ds4_session *s, int excluded) {
             if (top[i].id != excluded) return top[i].id;
         }
     }
-    int token = ds4_session_argmax(s);
-    return token == excluded ? -1 : token;
+    return -1;
 }
 
 int main(int argc, char **argv) {
