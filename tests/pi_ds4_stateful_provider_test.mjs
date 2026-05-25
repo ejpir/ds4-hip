@@ -339,6 +339,48 @@ async function testToolResultDelta() {
 	});
 }
 
+async function testBashFileDumpBlockedAfterReadGuard() {
+	await withMockServer((payload, index, res) => {
+		if (index === 1) {
+			sseToolCall(res, {
+				id: "call_read_once",
+				name: "read",
+				arguments: { path: "AGENT.md", offset: 1, limit: 5 },
+			});
+			return;
+		}
+		if (index === 2) {
+			sseToolCall(res, {
+				id: "call_read_dupe",
+				name: "read",
+				arguments: { path: "AGENT.md", offset: 1, limit: 5 },
+			});
+			return;
+		}
+		if (index === 3) {
+			assert.match(payload.messages[0].content, /Duplicate read blocked/);
+			sseToolCall(res, {
+				id: "call_bash_head",
+				name: "bash",
+				arguments: { command: "head -5 AGENT.md" },
+			});
+			return;
+		}
+		assert.equal(index, 4);
+		assert.deepEqual(payload.messages.map((m) => m.role), ["tool"]);
+		assert.match(payload.messages[0].content, /appears to dump file contents after a read guard block/);
+		sseText(res, "bash-file-dump-blocked", `chatcmpl_${index}`);
+	}, async (baseUrl, requests) => {
+		const result = await runPi([
+			...commonPiArgs(["--tools", "read,bash", "-p"]),
+			"Do not bypass read guard with bash file dumps.",
+		], { DS4_STATEFUL_BASE_URL: baseUrl }, 120_000);
+		await assertPiOk(result, "bash file dump blocked after read guard");
+		assert.match(result.stdout, /bash-file-dump-blocked/);
+		assert.equal(requests.length, 4);
+	});
+}
+
 async function testCoveredReadRangeBlocked() {
 	await withMockServer((payload, index, res) => {
 		if (index === 1) {
@@ -384,6 +426,7 @@ const tests = [
 	["user follow-up auto resets", testUserFollowupAutoResets],
 	["delta 409 retries reset", testDelta409RetriesAsReset],
 	["tool result delta", testToolResultDelta],
+	["bash file dump blocked after read guard", testBashFileDumpBlockedAfterReadGuard],
 	["covered read range blocked", testCoveredReadRangeBlocked],
 ];
 

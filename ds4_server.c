@@ -2425,7 +2425,6 @@ static char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_sch
                                      ds4_think_mode think_mode) {
     (void)tool_orders;
     const bool think = ds4_think_mode_enabled(think_mode);
-    const bool tool_context = chat_history_uses_tool_context(msgs, tool_schemas);
     int last_user_idx = -1;
     buf system = {0};
     /* Render tool schemas before the client system content so
@@ -2442,7 +2441,7 @@ static char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_sch
     }
     for (int i = 0; i < msgs->len; i++) {
         const chat_msg *m = &msgs->v[i];
-        if (role_is_user_like(m->role)) last_user_idx = i;
+        if (!strcmp(m->role, "user")) last_user_idx = i;
     }
 
     buf out = {0};
@@ -2475,7 +2474,8 @@ static char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_sch
             if (pending_assistant) {
                 buf_puts(&out, "<｜Assistant｜>");
                 if (think) {
-                    if (tool_context || i > last_user_idx) {
+                    const bool preserve_reasoning = i > last_user_idx;
+                    if (preserve_reasoning) {
                         buf_puts(&out, "<think>");
                         buf_puts(&out, m->reasoning ? m->reasoning : "");
                         buf_puts(&out, "</think>");
@@ -9349,7 +9349,7 @@ static void kv_fill_header(uint8_t h[KV_CACHE_FIXED_HEADER], uint8_t quant_bits,
                            uint32_t tokens, uint32_t hits, uint32_t ctx_size,
                            uint64_t created_at, uint64_t last_used,
                            uint64_t payload_bytes) {
-    ds4_kvstore_fill_header(h, quant_bits, reason, ext_flags, tokens, hits,
+    ds4_kvstore_fill_header(h, 0, quant_bits, reason, ext_flags, tokens, hits,
                             ctx_size, created_at, last_used, payload_bytes);
 }
 #endif
@@ -9610,7 +9610,7 @@ static void kv_cache_maybe_store_continued(server *s) {
 #ifdef DS4_SERVER_TEST
 static int kv_cache_find_text_prefix(kv_disk_cache *kc, const char *prompt_text,
                                      int quant_bits, int ctx_size) {
-    return ds4_kvstore_find_text_prefix(kc, prompt_text, quant_bits, ctx_size);
+    return ds4_kvstore_find_text_prefix(kc, prompt_text, 0, quant_bits, ctx_size);
 }
 #endif
 
@@ -13870,6 +13870,32 @@ static void test_render_drops_old_reasoning_without_tools(void) {
     chat_msgs_free(&msgs);
 }
 
+static void test_render_drops_old_toolless_reasoning_even_with_tools_available(void) {
+    chat_msgs msgs = {0};
+    chat_msg user1 = {0};
+    user1.role = xstrdup("user");
+    user1.content = xstrdup("what does this project do");
+    chat_msgs_push(&msgs, user1);
+    chat_msg assistant = {0};
+    assistant.role = xstrdup("assistant");
+    assistant.reasoning = xstrdup("stale task: summarize the project");
+    assistant.content = xstrdup("project summary");
+    chat_msgs_push(&msgs, assistant);
+    chat_msg user2 = {0};
+    user2.role = xstrdup("user");
+    user2.content = xstrdup("does it support HIP?");
+    chat_msgs_push(&msgs, user2);
+
+    char *prompt = render_chat_prompt_text(&msgs, "{}", NULL, DS4_THINK_HIGH);
+    TEST_ASSERT(prompt != NULL);
+    TEST_ASSERT(strstr(prompt, "stale task: summarize the project") == NULL);
+    TEST_ASSERT(strstr(prompt, "<｜Assistant｜></think>project summary") != NULL);
+    TEST_ASSERT(strstr(prompt, "<｜User｜>does it support HIP?<｜Assistant｜><think>") != NULL);
+
+    free(prompt);
+    chat_msgs_free(&msgs);
+}
+
 static void test_render_preserves_reasoning_with_tools(void) {
     chat_msgs msgs = {0};
     chat_msg user1 = {0};
@@ -14216,6 +14242,143 @@ static void test_tool_checkpoint_suffix_is_future_prompt_canonical(void) {
     chat_msgs_free(&prefix_msgs);
     tool_calls_free(&calls);
     request_free(&r);
+    tool_schema_orders_free(&orders);
+}
+
+static tool_calls make_single_bash_call(const char *command) {
+    tool_calls calls = {0};
+    tool_call tc = {0};
+    tc.name = xstrdup("bash");
+    buf args = {0};
+    buf_puts(&args, "{\"command\":");
+    json_escape(&args, command ? command : "");
+    buf_puts(&args, ",\"timeout\":10}");
+    tc.arguments = buf_take(&args);
+    tool_calls_push(&calls, tc);
+    return calls;
+}
+
+static void append_assistant_generation_body(buf *out, ds4_think_mode think_mode,
+                                             const char *reasoning,
+                                             const char *content,
+                                             const tool_calls *calls) {
+    if (ds4_think_mode_enabled(think_mode)) {
+        buf_puts(out, reasoning ? reasoning : "");
+        buf_puts(out, "</think>");
+    }
+    buf_puts(out, content ? content : "");
+    append_dsml_tool_calls_text(out, calls);
+}
+
+static void test_stateful_tool_delta_tail_matches_full_replay_two_tool_rounds(void) {
+    tool_schema_orders orders = make_bash_order();
+    const char *tool_schemas =
+        "{\"name\":\"bash\",\"parameters\":{\"type\":\"object\",\"properties\":{"
+        "\"command\":{},\"timeout\":{}}}}";
+    const ds4_think_mode think_mode = DS4_THINK_HIGH;
+
+    chat_msgs prefix = {0};
+    chat_msg u1 = {0};
+    u1.role = xstrdup("user");
+    u1.content = xstrdup("what does this project do");
+    chat_msgs_push(&prefix, u1);
+    chat_msg a1 = {0};
+    a1.role = xstrdup("assistant");
+    a1.reasoning = xstrdup("summarize");
+    a1.content = xstrdup("DS4 is a local DeepSeek inference engine.");
+    chat_msgs_push(&prefix, a1);
+    chat_msg u2 = {0};
+    u2.role = xstrdup("user");
+    u2.content = xstrdup("does it support HIP?");
+    chat_msgs_push(&prefix, u2);
+
+    char *stateful_text = render_chat_prompt_text(&prefix, tool_schemas,
+                                                  &orders, think_mode);
+    TEST_ASSERT(stateful_text != NULL);
+    buf stateful = {0};
+    buf_puts(&stateful, stateful_text ? stateful_text : "");
+    free(stateful_text);
+
+    tool_calls calls1 = make_single_bash_call("rg -i hip -g '*.c' -g '*.h'");
+    append_assistant_generation_body(&stateful, think_mode,
+                                     "Need to inspect HIP references.", "",
+                                     &calls1);
+
+    chat_msgs delta1 = {0};
+    chat_msg t1 = {0};
+    t1.role = xstrdup("tool");
+    t1.content = xstrdup("ds4_rocm.cu\nds4_rocm.h\n");
+    chat_msgs_push(&delta1, t1);
+    char *tail1 = render_live_tool_tail(&delta1, 0, think_mode);
+    TEST_ASSERT(tail1 != NULL);
+    buf_puts(&stateful, tail1 ? tail1 : "");
+    free(tail1);
+
+    tool_calls calls2 = make_single_bash_call("rg -n DS4_USE_HIP Makefile ds4_rocm.h");
+    append_assistant_generation_body(&stateful, think_mode,
+                                     "Need build-system evidence too.", "",
+                                     &calls2);
+
+    chat_msgs delta2 = {0};
+    chat_msg t2 = {0};
+    t2.role = xstrdup("tool");
+    t2.content = xstrdup("Makefile: CFLAGS += -D_GNU_SOURCE -DDS4_USE_HIP\n");
+    chat_msgs_push(&delta2, t2);
+    char *tail2 = render_live_tool_tail(&delta2, 0, think_mode);
+    TEST_ASSERT(tail2 != NULL);
+    buf_puts(&stateful, tail2 ? tail2 : "");
+    free(tail2);
+
+    chat_msgs full = {0};
+    chat_msg fu1 = {0};
+    fu1.role = xstrdup("user");
+    fu1.content = xstrdup("what does this project do");
+    chat_msgs_push(&full, fu1);
+    chat_msg fa1 = {0};
+    fa1.role = xstrdup("assistant");
+    fa1.reasoning = xstrdup("summarize");
+    fa1.content = xstrdup("DS4 is a local DeepSeek inference engine.");
+    chat_msgs_push(&full, fa1);
+    chat_msg fu2 = {0};
+    fu2.role = xstrdup("user");
+    fu2.content = xstrdup("does it support HIP?");
+    chat_msgs_push(&full, fu2);
+    chat_msg fa2 = {0};
+    fa2.role = xstrdup("assistant");
+    fa2.reasoning = xstrdup("Need to inspect HIP references.");
+    fa2.content = xstrdup("");
+    fa2.calls = calls1;
+    memset(&calls1, 0, sizeof(calls1));
+    chat_msgs_push(&full, fa2);
+    chat_msg ft1 = {0};
+    ft1.role = xstrdup("tool");
+    ft1.content = xstrdup("ds4_rocm.cu\nds4_rocm.h\n");
+    chat_msgs_push(&full, ft1);
+    chat_msg fa3 = {0};
+    fa3.role = xstrdup("assistant");
+    fa3.reasoning = xstrdup("Need build-system evidence too.");
+    fa3.content = xstrdup("");
+    fa3.calls = calls2;
+    memset(&calls2, 0, sizeof(calls2));
+    chat_msgs_push(&full, fa3);
+    chat_msg ft2 = {0};
+    ft2.role = xstrdup("tool");
+    ft2.content = xstrdup("Makefile: CFLAGS += -D_GNU_SOURCE -DDS4_USE_HIP\n");
+    chat_msgs_push(&full, ft2);
+
+    char *full_prompt = render_chat_prompt_text(&full, tool_schemas,
+                                                &orders, think_mode);
+    TEST_ASSERT(full_prompt != NULL);
+    TEST_ASSERT(stateful.ptr && full_prompt && !strcmp(stateful.ptr, full_prompt));
+
+    free(full_prompt);
+    buf_free(&stateful);
+    chat_msgs_free(&full);
+    chat_msgs_free(&delta2);
+    chat_msgs_free(&delta1);
+    chat_msgs_free(&prefix);
+    tool_calls_free(&calls2);
+    tool_calls_free(&calls1);
     tool_schema_orders_free(&orders);
 }
 
@@ -15901,11 +16064,10 @@ static void test_thinking_canonical_multi_turn(void) {
     chat_msgs_free(&future_msgs);
 }
 
-static void test_thinking_canonical_with_tools_preserves_reasoning(void) {
-    /* When tools ARE present, reasoning is preserved in re-render.
-     * The toolless thinking live binding should NOT fire (has_tools gate),
-     * and the tool-call replay path handles it.  Verify the template
-     * preserves reasoning when tool_context is true. */
+static void test_thinking_canonical_with_tools_drops_toolless_reasoning(void) {
+    /* Tool availability alone must not replay old toolless hidden reasoning.
+     * Tool-call assistant turns still preserve reasoning via m->calls; final
+     * answers without tool calls are rendered like normal old assistant text. */
     const char *tool_schemas = "{\"name\":\"bash\"}";
 
     chat_msgs msgs = {0};
@@ -15918,7 +16080,7 @@ static void test_thinking_canonical_with_tools_preserves_reasoning(void) {
     size_t pt_len = strlen(prompt_text);
     TEST_ASSERT(!memcmp(prompt_text + pt_len - 7, "<think>", 7));
 
-    /* With tools, next render KEEPS reasoning */
+    /* With tools available but no tool call, next render drops reasoning. */
     chat_msgs history = {0};
     chat_msg hu = {0}; hu.role = xstrdup("user"); hu.content = xstrdup("run ls");
     chat_msgs_push(&history, hu);
@@ -15930,9 +16092,8 @@ static void test_thinking_canonical_with_tools_preserves_reasoning(void) {
     chat_msgs_push(&history, hu2);
 
     char *future = render_chat_prompt_text(&history, tool_schemas, NULL, DS4_THINK_HIGH);
-    /* Reasoning IS preserved when tools present */
-    TEST_ASSERT(strstr(future, "I should run bash") != NULL);
-    TEST_ASSERT(strstr(future, "<think>I should run bash</think>") != NULL);
+    TEST_ASSERT(strstr(future, "I should run bash") == NULL);
+    TEST_ASSERT(strstr(future, "<｜Assistant｜></think>Here you go") != NULL);
 
     free(future);
     free(prompt_text);
@@ -15973,6 +16134,7 @@ static void ds4_server_unit_tests_run(void) {
     test_render_think_max_prompt_prefix();
     test_render_non_thinking_prompt_closes_think();
     test_render_drops_old_reasoning_without_tools();
+    test_render_drops_old_toolless_reasoning_even_with_tools_available();
     test_render_preserves_reasoning_with_tools();
     test_render_chat_prompt_text_renders_tools_before_system();
     test_tool_schema_order_from_anthropic_schema();
@@ -16013,6 +16175,7 @@ static void ds4_server_unit_tests_run(void) {
     test_thinking_dsml_is_not_executable_before_think_close();
     test_thinking_dsml_after_think_close_is_executable();
     test_tool_checkpoint_suffix_is_future_prompt_canonical();
+    test_stateful_tool_delta_tail_matches_full_replay_two_tool_rounds();
     test_tool_checkpoint_minifies_json_parameters();
     test_tool_memory_replays_sampled_dsml();
     test_anthropic_tool_memory_replays_sampled_dsml();
@@ -16033,7 +16196,7 @@ static void ds4_server_unit_tests_run(void) {
     test_thinking_checkpoint_canonical_matches_future_prompt();
     test_thinking_canonical_empty_content();
     test_thinking_canonical_multi_turn();
-    test_thinking_canonical_with_tools_preserves_reasoning();
+    test_thinking_canonical_with_tools_drops_toolless_reasoning();
     test_thinking_canonical_non_thinking_mode_noop();
     test_tool_separator_whitespace_is_not_content();
     test_dsml_prompt_escapes_tool_supplied_text();

@@ -22,7 +22,7 @@ function sessionKey(options?: SimpleStreamOptions): string {
 }
 
 function turnFocusText(): string {
-	return "[DS4 turn focus: Answer the latest user message directly. Do not restate earlier project summaries unless the latest user asks for a summary. For a short follow-up, answer that follow-up first.]";
+	return "[DS4 turn focus: The next user text is the active task. Answer the latest user message directly, and before final answer verify you are not answering an earlier question. Do not restate earlier project summaries unless the latest user asks for a summary. For a short follow-up, answer that follow-up first.]";
 }
 
 function addFocusToUserContent(content: unknown): unknown {

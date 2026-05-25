@@ -69,6 +69,16 @@ export class ReadGuard {
 		return this.seenReadRanges.size;
 	}
 
+	get blockedThisTurnCount(): number {
+		let total = 0;
+		for (const count of this.blockedReadPathsThisTurn.values()) total += count;
+		return total;
+	}
+
+	hasBlockedReadsThisTurn(): boolean {
+		return this.blockedThisTurnCount > 0;
+	}
+
 	clearAll(summary = "no read guard blocks yet"): void {
 		this.seenReadRanges.clear();
 		this.blockedReadPathsThisTurn.clear();

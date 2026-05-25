@@ -3,6 +3,7 @@ import { loadRuntimeConfig, PROVIDER_ID } from "./config.ts";
 import { registerDs4StatefulCommand } from "./commands.ts";
 import { ds4StatefulProviderConfig } from "./provider.ts";
 import { isDs4StatefulContext } from "./protocol.ts";
+import { checkBashFileReadFallback } from "./policies/bash-file-read-guard.ts";
 import { appendToolUseGuidance } from "./policies/prompt-guidance.ts";
 import { ReadGuard } from "./policies/read-guard.ts";
 import { StatefulSessionStore } from "./session-state.ts";
@@ -65,6 +66,10 @@ export default function registerDs4StatefulExtension(pi: ExtensionAPI) {
 	pi.on("tool_call", (event, ctx) => {
 		if (!isActiveDs4StatefulContext(ctx)) return;
 		const input = (event as any).input;
+		if (event.toolName === "bash" && config.readGuardEnabled) {
+			const bashBlock = checkBashFileReadFallback(input, readGuard.hasBlockedReadsThisTurn());
+			if (bashBlock) return bashBlock;
+		}
 		if (event.toolName === "edit" || event.toolName === "write") {
 			readGuard.clearReadsForPath(input);
 			return;
