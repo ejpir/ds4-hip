@@ -154,21 +154,25 @@ export class ReadGuard {
 		return count;
 	}
 
+	private guardControlPrefix(): string {
+		return "Pi read-guard control message (authoritative, not file content):";
+	}
+
 	private duplicateReadReason(range: SeenReadRange): string {
 		const count = this.bumpBlocked(range.path);
 		this.lastSummary = `blocked duplicate read ${range.label} (turn blocks for path=${count})`;
-		return `Duplicate read blocked: ${range.label} was already read and is still in model context. Stop reading this range and answer from the existing context unless one very specific missing fact is required. If needed, use grep/rg or an explicitly targeted unread range instead of rereading. Seen ranges for this file: ${this.seenReadRangesSummary(range.path)}.`;
+		return `${this.guardControlPrefix()} Duplicate read blocked: ${range.label} was already read and is still in model context. Do not retry this read, do not bypass it with bash file-dump commands, and do not claim this range is unavailable or not in context. Stop reading this range and answer from the existing context unless one very specific missing fact is required. If needed, use grep/rg or an explicitly targeted unread range instead of rereading. Seen ranges for this file: ${this.seenReadRangesSummary(range.path)}.`;
 	}
 
 	private coveredReadReason(range: SeenReadRange, coveredBy: SeenReadRange): string {
 		const count = this.bumpBlocked(range.path);
 		this.lastSummary = `blocked covered read ${range.label} covered by ${coveredBy.label} (turn blocks for path=${count})`;
-		return `Covered read blocked: ${range.label} is already covered by earlier read ${coveredBy.label}, which is still in model context. Stop reading this file range and answer from existing context unless a different precise fact is needed. If needed, use grep/rg or an unread targeted range instead of splitting/rereading already-seen ranges. Seen ranges for this file: ${this.seenReadRangesSummary(range.path)}.`;
+		return `${this.guardControlPrefix()} Covered read blocked: ${range.label} is already covered by earlier read ${coveredBy.label}, which is still in model context. Do not retry this read, do not bypass it with bash file-dump commands, and do not claim this range is unavailable or not in context. Stop reading this file range and answer from existing context unless a different precise fact is needed. If needed, use grep/rg or an unread targeted range instead of splitting/rereading already-seen ranges. Seen ranges for this file: ${this.seenReadRangesSummary(range.path)}.`;
 	}
 
 	private followupReadBlockedReason(range: SeenReadRange): string {
 		const count = this.bumpBlocked(range.path);
 		this.lastSummary = `strict-blocked follow-up read ${range.label} after duplicate/read-loop signal (turn blocks for path=${count})`;
-		return `Further read blocked by strict read guard for ${range.label}: an earlier duplicate-read attempt on this file indicates a read loop. Stop reading this file for the current turn and answer the latest user message from existing context. If the needed fact is not in context, use grep/rg for that exact fact instead of sequential README paging. Seen ranges for this file: ${this.seenReadRangesSummary(range.path)}.`;
+		return `${this.guardControlPrefix()} Further read blocked by strict read guard for ${range.label}: an earlier duplicate-read attempt on this file indicates a read loop. Do not retry this read, do not bypass it with bash file-dump commands, and do not claim this range is unavailable or not in context. Stop reading this file for the current turn and answer the latest user message from existing context. If the needed fact is not in context, use grep/rg for that exact fact instead of sequential README paging. Seen ranges for this file: ${this.seenReadRangesSummary(range.path)}.`;
 	}
 }

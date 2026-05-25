@@ -236,6 +236,6 @@ export function checkBashFileReadFallback(input: unknown, afterReadGuardBlock: b
 	const context = afterReadGuardBlock ? " after a read guard block" : "";
 	return {
 		block: true,
-		reason: `${reason}${context}. Use Pi's read tool for file contents; do not bypass it with cat/head/tail/sed/awk, find -exec cat, xargs cat, or scripts. Use rg/grep only for precise searches.`,
+		reason: `Pi bash guard control message (authoritative, not command output): ${reason}${context}. Use Pi's read tool for file contents; do not bypass it with cat/head/tail/sed/awk, find -exec cat, xargs cat, or scripts. Use rg/grep only for precise searches.`,
 	};
 }

@@ -351,6 +351,7 @@ async function testBashFileDumpBlockedWithoutReadGuard() {
 		}
 		assert.equal(index, 2);
 		assert.deepEqual(payload.messages.map((m) => m.role), ["tool"]);
+		assert.match(payload.messages[0].content, /Pi bash guard control message \(authoritative, not command output\)/);
 		assert.match(payload.messages[0].content, /find -exec 'cat' appears to dump file contents/);
 		sseText(res, "bash-file-dump-blocked-no-read-guard", `chatcmpl_${index}`);
 	}, async (baseUrl, requests) => {
@@ -383,7 +384,9 @@ async function testBashFileDumpBlockedAfterReadGuard() {
 			return;
 		}
 		if (index === 3) {
+			assert.match(payload.messages[0].content, /Pi read-guard control message \(authoritative, not file content\)/);
 			assert.match(payload.messages[0].content, /Duplicate read blocked/);
+			assert.match(payload.messages[0].content, /do not claim this range is unavailable or not in context/);
 			sseToolCall(res, {
 				id: "call_bash_head",
 				name: "bash",
@@ -393,6 +396,7 @@ async function testBashFileDumpBlockedAfterReadGuard() {
 		}
 		assert.equal(index, 4);
 		assert.deepEqual(payload.messages.map((m) => m.role), ["tool"]);
+		assert.match(payload.messages[0].content, /Pi bash guard control message \(authoritative, not command output\)/);
 		assert.match(payload.messages[0].content, /appears to dump file contents after a read guard block/);
 		sseText(res, "bash-file-dump-blocked", `chatcmpl_${index}`);
 	}, async (baseUrl, requests) => {
@@ -427,7 +431,9 @@ async function testCoveredReadRangeBlocked() {
 		}
 		assert.equal(index, 3);
 		assert.deepEqual(payload.messages.map((m) => m.role), ["tool"]);
+		assert.match(payload.messages[0].content, /Pi read-guard control message \(authoritative, not file content\)/);
 		assert.match(payload.messages[0].content, /Covered read blocked/);
+		assert.match(payload.messages[0].content, /do not claim this range is unavailable or not in context/);
 		assert.match(payload.messages[0].content, /AGENT\.md:1-end/);
 		assert.doesNotMatch(payload.messages[0].content, /Latest user message this turn/);
 		sseText(res, "covered-blocked", `chatcmpl_${index}`);
