@@ -23,7 +23,7 @@
 #define ds4_metal_set_model_map_range ds4_gpu_set_model_map_range
 #define ds4_metal_set_model_map_range_fd(model_map, model_size, model_fd, map_offset, map_size) \
     (ds4_gpu_set_model_fd((model_fd)) && \
-     ds4_gpu_set_model_map_range((model_map), (model_size), (map_offset), (map_size)))
+     ds4_gpu_set_model_map_range((model_map), (model_size), (map_offset), (map_size), (map_size)))
 #define ds4_metal_set_quality ds4_gpu_set_quality
 #define ds4_metal_print_memory_report ds4_gpu_print_memory_report
 #define ds4_metal_embed_token_hc_tensor ds4_gpu_embed_token_hc_tensor
@@ -74,12 +74,14 @@
 #define ds4_metal_attention_output_low_q8_tensor ds4_gpu_attention_output_low_q8_tensor
 #define ds4_metal_swiglu_tensor ds4_gpu_swiglu_tensor
 #define ds4_metal_add_tensor ds4_gpu_add_tensor
-#define ds4_metal_router_select_tensor ds4_gpu_router_select_tensor
-#define ds4_metal_router_select_batch_tensor ds4_gpu_router_select_batch_tensor
+#define ds4_metal_router_select_tensor(selected, weights, probs, model_map, model_size, bias_offset, hash_offset, hash_rows, token, n_expert_groups, n_group_used, has_bias, hash_mode, logits) \
+    ds4_gpu_router_select_tensor((selected), (weights), (probs), (model_map), (model_size), (bias_offset), (hash_offset), (hash_rows), (token), 0, 0, 0.0f, (n_expert_groups), (n_group_used), (has_bias), (hash_mode), (logits))
+#define ds4_metal_router_select_batch_tensor(selected, weights, probs, model_map, model_size, bias_offset, hash_offset, hash_rows, n_expert_groups, n_group_used, has_bias, hash_mode, logits, tokens, n_tokens) \
+    ds4_gpu_router_select_batch_tensor((selected), (weights), (probs), (model_map), (model_size), (bias_offset), (hash_offset), (hash_rows), (n_expert_groups), (n_group_used), (has_bias), (hash_mode), (logits), (tokens), 0, 0, 0.0f, (n_tokens))
 #define ds4_metal_routed_moe_one_tensor(out, gate, up, mid, experts, model_map, model_size, gate_offset, up_offset, down_offset, gate_type, down_type, gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes, expert_in_dim, expert_mid_dim, out_dim, selected, weights, n_expert, clamp, x, layer_index) \
-    ds4_gpu_routed_moe_one_tensor((out), (gate), (up), (mid), (experts), (model_map), (model_size), (gate_offset), (up_offset), (down_offset), (gate_type), (down_type), (gate_expert_bytes), (gate_row_bytes), (down_expert_bytes), (down_row_bytes), (expert_in_dim), (expert_mid_dim), (out_dim), (selected), (weights), (n_expert), (clamp), (x))
+    ds4_gpu_routed_moe_one_tensor((out), (gate), (up), (mid), (experts), (model_map), (model_size), (gate_offset), (up_offset), (down_offset), (gate_type), (down_type), (gate_expert_bytes), (gate_row_bytes), (down_expert_bytes), (down_row_bytes), (expert_in_dim), (expert_mid_dim), (out_dim), (selected), (weights), 0, (n_expert), (clamp), (x))
 #define ds4_metal_routed_moe_batch_tensor(out, gate, up, mid, experts, model_map, model_size, gate_offset, up_offset, down_offset, gate_type, down_type, gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes, expert_in_dim, expert_mid_dim, out_dim, selected, weights, n_expert, clamp, x, n_tokens, layer_index) \
-    ds4_gpu_routed_moe_batch_tensor((out), (gate), (up), (mid), (experts), (model_map), (model_size), (gate_offset), (up_offset), (down_offset), (gate_type), (down_type), (gate_expert_bytes), (gate_row_bytes), (down_expert_bytes), (down_row_bytes), (expert_in_dim), (expert_mid_dim), (out_dim), (selected), (weights), (n_expert), (clamp), (x), (n_tokens), NULL)
+    ds4_gpu_routed_moe_batch_tensor((out), (gate), (up), (mid), (experts), (model_map), (model_size), (gate_offset), (up_offset), (down_offset), (gate_type), (down_type), (gate_expert_bytes), (gate_row_bytes), (down_expert_bytes), (down_row_bytes), (expert_in_dim), (expert_mid_dim), (out_dim), (selected), (weights), 0, (n_expert), (clamp), (x), (layer_index), (n_tokens), NULL)
 #define ds4_metal_hc_split_sinkhorn_tensor ds4_gpu_hc_split_sinkhorn_tensor
 #define ds4_metal_hc_weighted_sum_tensor ds4_gpu_hc_weighted_sum_tensor
 #define ds4_metal_hc_weighted_sum_split_tensor ds4_gpu_hc_weighted_sum_split_tensor
