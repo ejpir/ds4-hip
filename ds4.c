@@ -16265,6 +16265,11 @@ ds4_context_memory ds4_context_memory_estimate(ds4_backend backend, int ctx_size
  * to the CLI and server.
  */
 
+int ds4_engine_model_id(ds4_engine *e) {
+    (void)e;
+    return 0;
+}
+
 const char *ds4_backend_name(ds4_backend backend) {
     return backend == DS4_BACKEND_GPU ? DS4_GPU_BACKEND_NAME : "cpu";
 }

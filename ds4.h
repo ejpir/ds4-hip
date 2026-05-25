@@ -96,6 +96,7 @@ typedef struct {
     const char *directional_steering_file;
     float directional_steering_ffn;
     float directional_steering_attn;
+    int power_percent;
 } ds4_engine_options;
 
 typedef void (*ds4_token_emit_fn)(void *ud, int token);
@@ -114,6 +115,7 @@ typedef struct {
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt);
 void ds4_engine_close(ds4_engine *e);
 void ds4_engine_summary(ds4_engine *e);
+int ds4_engine_model_id(ds4_engine *e);
 const char *ds4_backend_name(ds4_backend backend);
 bool ds4_think_mode_enabled(ds4_think_mode mode);
 const char *ds4_think_mode_name(ds4_think_mode mode);

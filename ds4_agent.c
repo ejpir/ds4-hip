@@ -3189,7 +3189,7 @@ static bool agent_kv_save_path(agent_worker *w, const char *path,
 
     const uint64_t now = (uint64_t)time(NULL);
     uint8_t h[DS4_KVSTORE_FIXED_HEADER];
-    ds4_kvstore_fill_header(h, (uint8_t)quant_bits,
+    ds4_kvstore_fill_header(h, 0, (uint8_t)quant_bits,
                             ds4_kvstore_reason_code(reason),
                             0, (uint32_t)tokens->len, 0,
                             (uint32_t)ds4_session_ctx(w->session),
