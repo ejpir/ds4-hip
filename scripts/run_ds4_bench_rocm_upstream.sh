@@ -40,6 +40,7 @@ Environment:
   DS4_SERVER_ATTENTION_OUTPUT_F16_OUT_MIN_TOKENS=N Optional attention f16-output minimum; default 0
   DS4_SERVER_SHARED_DOWN_F16_OUT=0       Disable default FAST_FULL shared-down f16 projection
   DS4_SERVER_SHARED_DOWN_F16_OUT_MIN_TOKENS=N Optional shared-down f16-output minimum; default 0
+  DS4_SERVER_MOE_DECODE_RPB=N            Optional rows/block for exact single-token Q2_K MoE decode
   DS4_CUDA_MOE_WMMA_MTILES=4|8|16        Hot MoE WMMA token tiles/block
   DS4_CUDA_MOE_WMMA_F16_MID=1            Hot MoE WMMA stores/reads routed mid as f16
   DS4_CUDA_MOE_WMMA_F16_MID_ALL=1        Store scalar/cold routed mid scratch as f16 too
@@ -195,6 +196,7 @@ export_pair_value MOE_GATE_TILE "${DS4_SERVER_MOE_GATE_TILE:-}"
 export_pair_value MOE_DOWN_TILE "${DS4_SERVER_MOE_DOWN_TILE:-}"
 export_pair_value MOE_GATE_RPB "${DS4_SERVER_MOE_GATE_RPB:-}"
 export_pair_value MOE_DOWN_RPB "${DS4_SERVER_MOE_DOWN_RPB:-}"
+export_pair_value MOE_DECODE_RPB "${DS4_SERVER_MOE_DECODE_RPB:-}"
 export_pair_flag MOE_EXPERT_SHARED_X "${DS4_SERVER_MOE_EXPERT_SHARED_X:-0}"
 export_pair_flag MOE_EXPERT_SHARED_MID "${DS4_SERVER_MOE_EXPERT_SHARED_MID:-0}"
 export_pair_flag MOE_Q8K_DOWN "${DS4_SERVER_MOE_Q8K_DOWN:-0}"

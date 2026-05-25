@@ -66,6 +66,7 @@ Environment:
   DS4_SERVER_MOE_DOWN_TILE=4|8|16  Down pair tile; FAST_FULL default 4 in the scalar/shared-mid path
   DS4_SERVER_MOE_GATE_RPB=N      Rows/block for expert-bucketed gate/up; e.g. 16 with shared-x experiment
   DS4_SERVER_MOE_DOWN_RPB=N      Rows/block for expert-bucketed down; e.g. 16 with shared-mid experiment
+  DS4_SERVER_MOE_DECODE_RPB=N    Optional rows/block for exact single-token Q2_K MoE decode
   DS4_SERVER_MOE_EXPERT_SHARED_X=1    Experimental LDS x tile reuse for gate/up; use with GATE_RPB>1
   DS4_SERVER_MOE_EXPERT_SHARED_MID=1  Experimental LDS mid tile reuse for down; use with DOWN_RPB>1
   DS4_SERVER_MOE_Q8K_DOWN=1      Opt-in Q8_K mid/down MoE path; exact-gated default layers are >=40
@@ -315,6 +316,7 @@ export_pair_value MOE_GATE_TILE "${DS4_SERVER_MOE_GATE_TILE:-}"
 export_pair_value MOE_DOWN_TILE "${DS4_SERVER_MOE_DOWN_TILE:-}"
 export_pair_value MOE_GATE_RPB "${DS4_SERVER_MOE_GATE_RPB:-}"
 export_pair_value MOE_DOWN_RPB "${DS4_SERVER_MOE_DOWN_RPB:-}"
+export_pair_value MOE_DECODE_RPB "${DS4_SERVER_MOE_DECODE_RPB:-}"
 export_pair_flag MOE_EXPERT_SHARED_X "${DS4_SERVER_MOE_EXPERT_SHARED_X:-0}"
 export_pair_flag MOE_EXPERT_SHARED_MID "${DS4_SERVER_MOE_EXPERT_SHARED_MID:-0}"
 export_pair_flag MOE_Q8K_DOWN "${DS4_SERVER_MOE_Q8K_DOWN:-0}"

@@ -9769,15 +9769,37 @@ static bool metal_graph_encode_decode_layer(
         metal_graph_debug_dump_dense_ref("Qraw_ref", g->qr_norm, model, layer->attn_q_b,
                                          q_rank, q_dim, il, pos);
     }
-    if (ok) ok = ds4_metal_head_rms_norm_tensor(g->q, 1, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_RMS_EPS) != 0;
-    if (ok) {
-        metal_graph_debug_dump_tensor("Qnorm", g->q, q_dim, il, pos);
+#if defined(DS4_USE_GPU_API)
+    const bool q_head_rope_fused = ds4_gpu_env_q_head_rope_fused();
+    if (q_head_rope_fused) {
+        if (ok) ok = ds4_metal_head_rms_norm_rope_tail_tensor(g->q,
+                                                              1,
+                                                              DS4_N_HEAD,
+                                                              DS4_N_HEAD_DIM,
+                                                              DS4_N_ROT,
+                                                              pos,
+                                                              compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
+                                                              false,
+                                                              freq_base,
+                                                              freq_scale,
+                                                              ext_factor,
+                                                              attn_factor,
+                                                              DS4_ROPE_YARN_BETA_FAST,
+                                                              DS4_ROPE_YARN_BETA_SLOW,
+                                                              DS4_RMS_EPS) != 0;
+    } else
+#endif
+    {
+        if (ok) ok = ds4_metal_head_rms_norm_tensor(g->q, 1, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_RMS_EPS) != 0;
+        if (ok) {
+            metal_graph_debug_dump_tensor("Qnorm", g->q, q_dim, il, pos);
+        }
+        if (ok) ok = ds4_metal_rope_tail_tensor(g->q, 1, DS4_N_HEAD, DS4_N_HEAD_DIM,
+                                                DS4_N_ROT, pos,
+                                                compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
+                                                false, freq_base, freq_scale, ext_factor, attn_factor,
+                                                DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW) != 0;
     }
-    if (ok) ok = ds4_metal_rope_tail_tensor(g->q, 1, DS4_N_HEAD, DS4_N_HEAD_DIM,
-                                            DS4_N_ROT, pos,
-                                            compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
-                                            false, freq_base, freq_scale, ext_factor, attn_factor,
-                                            DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW) != 0;
     DS4_METAL_PROFILE_DECODE_STAGE("q_path");
     if (ok) {
         metal_graph_debug_dump_tensor("Qcur", g->q, q_dim, il, pos);
