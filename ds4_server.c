@@ -11399,6 +11399,8 @@ static void generate_job(server *s, job *j) {
                             &last_decode_log_t,
                             &last_decode_log_completion);
     }
+    const double decode_sec = now_sec() - decode_t0;
+    const double decode_tps = decode_sec > 0.0 ? (double)completion / decode_sec : 0.0;
 
     if (j->req.stream && !structured_stream && text.len > plain_stream_pos) {
         char *tail = xstrndup(text.ptr + plain_stream_pos, text.len - plain_stream_pos);
@@ -11589,6 +11591,8 @@ static void generate_job(server *s, job *j) {
                        &parsed_calls, final_finish,
                        prompt_tokens, completion);
     }
+    const double total_sec = now_sec() - t0;
+    const double total_tps = total_sec > 0.0 ? (double)completion / total_sec : 0.0;
     if (j->req.kind == REQ_CHAT && j->req.has_tools) {
         char flags[80];
         log_flags(flags, sizeof(flags),
@@ -11599,23 +11603,29 @@ static void generate_job(server *s, job *j) {
                   saw_tool_end);
         if (!strcmp(final_finish, "error") && err[0]) {
             server_log(DS4_LOG_GENERATION,
-                       "ds4-server: chat ctx=%s gen=%d%s%s finish=%s error=\"%s\" %.3fs",
+                       "ds4-server: chat ctx=%s gen=%d%s%s finish=%s error=\"%s\" decode=%.2f t/s decode_sec=%.3f total=%.3fs total_tps=%.2f t/s",
                        ctx_span,
                        completion,
                        flags[0] ? " " : "",
                        flags,
                        final_finish,
                        err,
-                       now_sec() - t0);
+                       decode_tps,
+                       decode_sec,
+                       total_sec,
+                       total_tps);
         } else {
             server_log(DS4_LOG_GENERATION,
-                       "ds4-server: chat ctx=%s gen=%d%s%s finish=%s %.3fs",
+                       "ds4-server: chat ctx=%s gen=%d%s%s finish=%s decode=%.2f t/s decode_sec=%.3f total=%.3fs total_tps=%.2f t/s",
                        ctx_span,
                        completion,
                        flags[0] ? " " : "",
                        flags,
                        final_finish,
-                       now_sec() - t0);
+                       decode_tps,
+                       decode_sec,
+                       total_sec,
+                       total_tps);
         }
     } else {
         char flags[80];
@@ -11627,7 +11637,7 @@ static void generate_job(server *s, job *j) {
                   false);
         if (!strcmp(final_finish, "error") && err[0]) {
             server_log(DS4_LOG_GENERATION,
-                       "ds4-server: %s ctx=%s gen=%d%s%s finish=%s error=\"%s\" %.3fs",
+                       "ds4-server: %s ctx=%s gen=%d%s%s finish=%s error=\"%s\" decode=%.2f t/s decode_sec=%.3f total=%.3fs total_tps=%.2f t/s",
                        j->req.kind == REQ_CHAT ? "chat" : "completion",
                        ctx_span,
                        completion,
@@ -11635,17 +11645,23 @@ static void generate_job(server *s, job *j) {
                        flags,
                        final_finish,
                        err,
-                       now_sec() - t0);
+                       decode_tps,
+                       decode_sec,
+                       total_sec,
+                       total_tps);
         } else {
             server_log(DS4_LOG_GENERATION,
-                       "ds4-server: %s ctx=%s gen=%d%s%s finish=%s %.3fs",
+                       "ds4-server: %s ctx=%s gen=%d%s%s finish=%s decode=%.2f t/s decode_sec=%.3f total=%.3fs total_tps=%.2f t/s",
                        j->req.kind == REQ_CHAT ? "chat" : "completion",
                        ctx_span,
                        completion,
                        flags[0] ? " " : "",
                        flags,
                        final_finish,
-                       now_sec() - t0);
+                       decode_tps,
+                       decode_sec,
+                       total_sec,
+                       total_tps);
         }
     }
     free(parsed_content);
