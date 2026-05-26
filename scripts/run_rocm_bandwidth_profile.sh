@@ -18,8 +18,11 @@ Defaults are chosen for a short decode profile:
 
 Environment:
   DS4_ROCPROF_OUT_DIR=DIR       Output dir. Default /tmp/ds4_rocprof_bw_TIMESTAMP
-  DS4_ROCPROF_METRICS="..."     rocprof metrics. Default: FETCH_SIZE WRITE_SIZE
-                                Useful optional additions if they fit one pass:
+  DS4_ROCPROF_METRICS="..."     rocprof metrics. Default: FETCH_SIZE
+                                On gfx1151, FETCH_SIZE+WRITE_SIZE may exceed
+                                the one-pass counter set; run WRITE_SIZE as a
+                                separate pass if needed. Useful optional
+                                additions if they fit one pass:
                                 L2CacheHit MemUnitBusy OccupancyPercent Wavefronts VALUInsts
   DS4_ROCPROF_KERNEL_REGEX=RE   Optional rocprof --kernel-include-regex filter
   DS4_ROCPROF_TOP=N             Summary rows. Default 30
@@ -60,7 +63,7 @@ out_dir="${DS4_ROCPROF_OUT_DIR:-/tmp/ds4_rocprof_bw_${stamp}}"
 prof_dir="$out_dir/rocprof"
 mkdir -p "$prof_dir"
 
-metrics_s="${DS4_ROCPROF_METRICS:-FETCH_SIZE WRITE_SIZE}"
+metrics_s="${DS4_ROCPROF_METRICS:-FETCH_SIZE}"
 # shellcheck disable=SC2206
 metrics=( $metrics_s )
 

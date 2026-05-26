@@ -96,12 +96,13 @@ def duration_sec(row: dict[str, str]) -> float | None:
 
 def find_header(lines: list[str]) -> int | None:
     for i, line in enumerate(lines):
-        cells = [c.strip() for c in next(csv.reader([line]))]
+        cells = [c.strip().strip('"') for c in next(csv.reader([line]))]
         if not cells:
             continue
-        has_counter = any(c in FETCH_KEYS + WRITE_KEYS for c in cells)
+        has_wide_counter = any(c in FETCH_KEYS + WRITE_KEYS for c in cells)
+        has_long_counter = "Counter_Name" in cells and "Counter_Value" in cells
         has_kernel = any(c in KERNEL_KEYS for c in cells) or any("kernel" in c.lower() for c in cells)
-        if has_counter and has_kernel:
+        if (has_wide_counter or has_long_counter) and has_kernel:
             return i
     return None
 
@@ -129,27 +130,69 @@ def main() -> int:
     by_kernel: dict[str, dict[str, float]] = {}
     files = list(iter_csv_files(args.paths))
     parsed_rows = 0
+    dispatches: dict[tuple[str, str, str], dict[str, float | str]] = {}
+    wide_rows: list[dict[str, str]] = []
     for path in files:
         for row in rows_from_csv(path) or ():
-            kernel = pick(row, KERNEL_KEYS)
-            if not kernel:
-                continue
-            sec = duration_sec(row)
-            fetch_kib = pick_float(row, FETCH_KEYS) or 0.0
-            write_kib = pick_float(row, WRITE_KEYS) or 0.0
-            if sec is None or sec <= 0.0:
-                continue
             parsed_rows += 1
-            d = by_kernel.setdefault(kernel, {"calls": 0.0, "sec": 0.0, "fetch": 0.0, "write": 0.0})
-            d["calls"] += 1.0
-            d["sec"] += sec
-            d["fetch"] += fetch_kib * 1024.0
-            d["write"] += write_kib * 1024.0
-            for k in AUX_KEYS:
-                v = pick_float(row, (k,))
-                if v is not None:
-                    d[k] = d.get(k, 0.0) + v
-                    d[k + "_n"] = d.get(k + "_n", 0.0) + 1.0
+            if "Counter_Name" in row and "Counter_Value" in row:
+                kernel = pick(row, KERNEL_KEYS)
+                dispatch = pick(row, ("Dispatch_Id", "Dispatch ID", "DispatchId")) or str(parsed_rows)
+                process = pick(row, ("Process_Id", "Process ID", "ProcessId")) or ""
+                if not kernel:
+                    continue
+                key = (process, dispatch, kernel)
+                d = dispatches.setdefault(key, {"kernel": kernel, "sec": duration_sec(row) or 0.0,
+                                                "fetch": 0.0, "write": 0.0})
+                if not d.get("sec"):
+                    d["sec"] = duration_sec(row) or 0.0
+                cname = str(row.get("Counter_Name", "")).strip()
+                cval = norm_float(row.get("Counter_Value")) or 0.0
+                if cname in FETCH_KEYS:
+                    d["fetch"] = float(d.get("fetch", 0.0)) + cval * 1024.0
+                elif cname in WRITE_KEYS:
+                    d["write"] = float(d.get("write", 0.0)) + cval * 1024.0
+                elif cname in AUX_KEYS:
+                    d[cname] = float(d.get(cname, 0.0)) + cval
+                    d[cname + "_n"] = float(d.get(cname + "_n", 0.0)) + 1.0
+            else:
+                wide_rows.append(row)
+
+    for row in wide_rows:
+        kernel = pick(row, KERNEL_KEYS)
+        if not kernel:
+            continue
+        sec = duration_sec(row)
+        fetch_kib = pick_float(row, FETCH_KEYS) or 0.0
+        write_kib = pick_float(row, WRITE_KEYS) or 0.0
+        if sec is None or sec <= 0.0:
+            continue
+        d = by_kernel.setdefault(kernel, {"calls": 0.0, "sec": 0.0, "fetch": 0.0, "write": 0.0})
+        d["calls"] += 1.0
+        d["sec"] += sec
+        d["fetch"] += fetch_kib * 1024.0
+        d["write"] += write_kib * 1024.0
+        for k in AUX_KEYS:
+            v = pick_float(row, (k,))
+            if v is not None:
+                d[k] = d.get(k, 0.0) + v
+                d[k + "_n"] = d.get(k + "_n", 0.0) + 1.0
+
+    for disp in dispatches.values():
+        kernel = str(disp.get("kernel", ""))
+        sec = float(disp.get("sec", 0.0))
+        if not kernel or sec <= 0.0:
+            continue
+        d = by_kernel.setdefault(kernel, {"calls": 0.0, "sec": 0.0, "fetch": 0.0, "write": 0.0})
+        d["calls"] += 1.0
+        d["sec"] += sec
+        d["fetch"] += float(disp.get("fetch", 0.0))
+        d["write"] += float(disp.get("write", 0.0))
+        for k in AUX_KEYS:
+            n = float(disp.get(k + "_n", 0.0))
+            if n:
+                d[k] = d.get(k, 0.0) + float(disp.get(k, 0.0)) / n
+                d[k + "_n"] = d.get(k + "_n", 0.0) + 1.0
 
     if not by_kernel:
         print(f"no rocprof bandwidth rows found in {len(files)} csv file(s)")
