@@ -22,7 +22,7 @@ function sessionKey(options?: SimpleStreamOptions): string {
 }
 
 function turnFocusText(): string {
-	return "[DS4 turn focus: The next user text is the active task. Answer the latest user message directly, and before final answer verify you are not answering an earlier question. Do not restate earlier project summaries unless the latest user asks for a summary. For a short follow-up, answer that follow-up first.]";
+	return "[DS4 turn focus: The next user text is the active task. Before any tool call or final answer, verify the topic/search terms come from the latest user message, not an earlier question. If your hidden plan mentions an older task, discard that plan and answer the latest user message directly. Do not restate earlier project summaries unless the latest user asks for a summary. For a short follow-up, answer that follow-up first.]";
 }
 
 function addFocusToUserContent(content: unknown): unknown {
@@ -138,17 +138,18 @@ export class StatefulSessionStore {
 		p.stateful_debug_sent_messages = requestMessages.length;
 		p.stateful_debug_previous_messages = state.messageHashes.length;
 		p.stateful_debug_stored_revision = state.revision;
-		const resetFocus = config.turnFocusEnabled && mode === "reset" && state.revision > 0 && hasUserMessage(requestMessages);
-		if (resetFocus) {
+		const focusLatestUser = config.turnFocusEnabled && state.revision > 0 && hasUserMessage(requestMessages);
+		if (focusLatestUser) {
 			(p.stateful_debug as JsonObject).focus = "latest_user";
 			p.stateful_debug_focus = "latest_user";
 		}
-		p.messages = resetFocus ? addTurnFocusToLatestUser(requestMessages) : requestMessages;
+		const outgoingMessages = focusLatestUser ? addTurnFocusToLatestUser(requestMessages) : requestMessages;
+		p.messages = outgoingMessages;
 		const debugInfo = requestInfoFromPayload(p);
 		if (debugInfo) this.lastDecisionSummary = decisionSummary(debugInfo);
 		if (debugInfo) this.lastRequestSummary = this.lastDecisionSummary;
 		if (mode === "delta") {
-			p.delta = { messages: requestMessages };
+			p.delta = { messages: outgoingMessages };
 		} else {
 			delete p.delta;
 		}

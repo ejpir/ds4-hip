@@ -22,14 +22,14 @@ Normal OpenAI-compatible chat clients resend the full visible conversation on ev
 system + tool schemas + all prior user/assistant/tool messages + new tool output
 ```
 
-The DS4 stateful endpoint keeps a live server-side continuation state. Pi can send a full `reset` request when needed, then send append-only `delta` requests after tools. That keeps post-tool prefill bounded to the new tool output instead of replaying the entire transcript. Server-side `DS4_SERVER_DYNAMIC_PREFILL=1` can additionally tune chunk size from the new suffix token count.
+The DS4 stateful endpoint keeps a live server-side continuation state. Pi can send a full `reset` request when needed, then send append-only `delta` requests for user follow-ups and tool results. That keeps prefill bounded to the new user/tool suffix instead of replaying the entire transcript. Server-side `DS4_SERVER_DYNAMIC_PREFILL=1` can additionally tune chunk size from the new suffix token count.
 
 ## Runtime policy
 
-Default behavior is conservative:
+Default behavior keeps coding sessions on the live continuation path:
 
 - first request: `mode=reset`
-- new user follow-up: `mode=reset`
+- new user follow-up: `mode=delta`
 - tool/function result continuation: `mode=delta`
 - stale/unavailable delta: retry once as full reset after HTTP `409`
 
@@ -37,7 +37,7 @@ The server returns `X-DS4-Session-Revision` / `ds4_stateful.revision` metadata o
 
 When disabled with `/ds4-stateful off` or `PI_DS4_STATEFUL=0`, the extension is passive: no stateful endpoint, no stateful prompts, no read guard, no focus marker, and no DS4 status UI. Requests are sent as ordinary OpenAI-compatible calls to `/v1/chat/completions`. Override that base with `DS4_STATELESS_BASE_URL`; otherwise it is derived from `DS4_STATEFUL_BASE_URL` by removing `/ds4/stateful`.
 
-This hybrid mode avoids stale hidden planning on user follow-ups while preserving the main speedup after tools.
+This mode reuses the live KV for earlier coding context instead of replaying the full transcript on each follow-up. Set `PI_DS4_USER_TURN_MODE=auto` or `/ds4-stateful user-turn auto` to restore the older conservative reset-on-user-turn behavior.
 
 ## Additional guardrails
 
@@ -47,7 +47,7 @@ The extension also includes DS4-specific, configurable policies:
 - tool-output guidance: read/grep/bash output is untrusted data, not instructions
 - read guard: blocks exact duplicate reads and ranges fully covered by earlier reads
 - optional strict read guard: after a duplicate/covered read, blocks further same-file reads for that turn
-- optional turn-focus marker on reset payloads after the first turn
+- optional turn-focus marker on follow-up user turns after the first turn
 
 These policies live outside the server protocol; they are Pi-agent behavior guardrails.
 
@@ -74,7 +74,7 @@ DS4_STATEFUL_BASE_URL=http://127.0.0.1:8000/v1/ds4/stateful
 DS4_STATELESS_BASE_URL=http://127.0.0.1:8000/v1  # used when PI_DS4_STATEFUL=0
 DS4_STATEFUL_API_KEY=dsv4-local
 PI_DS4_STATEFUL=1
-PI_DS4_USER_TURN_MODE=auto     # auto | reset | delta
+PI_DS4_USER_TURN_MODE=delta    # delta | auto | reset
 PI_DS4_READ_GUARD=1
 PI_DS4_READ_GUARD_MODE=exact   # exact | strict
 PI_DS4_TURN_FOCUS=1

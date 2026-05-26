@@ -2423,7 +2423,8 @@ static void append_rendered_tool_result_text(buf *out, const chat_msgs *msgs,
 static void append_tool_result_focus_text(buf *out) {
     buf_puts(out,
              "\n[DS4 tool-result focus: Use the tool result(s) above to answer the latest user request. "
-             "Do not restate an earlier plan or continue exploring unless one specific missing fact remains. "
+             "Before any next tool call or final answer, verify the topic/search terms still match that latest request, not an older question from chat history. "
+             "Do not restate an earlier plan, switch topics, or continue exploring unless one specific missing fact remains. "
              "If the result is sufficient, answer now.]\n");
 }
 

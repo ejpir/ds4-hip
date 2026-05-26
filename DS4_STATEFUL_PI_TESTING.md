@@ -56,27 +56,28 @@ system + tools + all previous user/assistant/tool messages + new tool output
 
 In tool-heavy coding-agent sessions this means DS4 repeatedly receives, parses, renders, tokenizes, and validates a large transcript.
 
-The stateful provider avoids that for tool loops:
+The stateful provider avoids that for append-only coding turns:
 
 ```text
-first/new-user request -> reset with full visible context
-after tool results     -> delta with only new tool/function output
+first request       -> reset with full visible context
+new user follow-up  -> delta with only new user text
+after tool results  -> delta with only new tool/function output
 ```
 
-So post-tool prefill should scale with the new tool output, not the entire conversation history.
+So follow-up prefill should scale with the new user/tool suffix, not the entire conversation history.
 
 ## Current default behavior
 
-The provider uses a conservative hybrid policy:
+The provider now keeps append-only coding turns on the live continuation path:
 
 ```text
 first request       -> reset
-new user follow-up  -> reset
+new user follow-up  -> delta
 tool result         -> delta
 stale delta / 409   -> retry once as reset
 ```
 
-This keeps follow-up questions on-topic while preserving the main speed win after tools.
+This keeps earlier coding context in live KV while avoiding full re-prefill on normal follow-ups.
 
 ## Extra guardrails
 
@@ -184,7 +185,8 @@ Useful commands:
 Recommended default:
 
 ```text
-/ds4-stateful user-turn auto
+/ds4-stateful user-turn delta
+/ds4-stateful focus on
 /ds4-stateful read-guard exact
 ```
 
@@ -202,7 +204,7 @@ Good cases to report:
 
 - Does a tool result continuation use `mode=delta`?
 - Do short follow-up questions stay on-topic?
-- Does post-tool latency feel lower?
+- Do post-tool and follow-up latencies feel lower?
 - Are duplicate or covered file reads blocked correctly?
 - Any prompt-injection-looking behavior from tool output?
 - Any unexpected HTTP `409` loops or repeated full resets?

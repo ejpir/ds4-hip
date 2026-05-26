@@ -34,7 +34,7 @@ export function parseUserTurnPolicy(value: unknown): UserTurnPolicy | undefined 
 function envUserTurnPolicy(): UserTurnPolicy {
 	return parseUserTurnPolicy(process.env.PI_DS4_USER_TURN_MODE) ??
 		parseUserTurnPolicy(process.env.DS4_STATEFUL_USER_TURN_MODE) ??
-		"auto";
+		"delta";
 }
 
 export function parseReadGuardMode(value: unknown): ReadGuardMode | undefined {

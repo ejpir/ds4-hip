@@ -239,7 +239,7 @@ async function testSamplingPenaltyEnvPayload() {
 	});
 }
 
-async function testUserFollowupAutoResets() {
+async function testUserFollowupDefaultsToDelta() {
 	await withMockServer((payload, index, res) => {
 		sseText(res, index === 1 ? "one" : "two", `chatcmpl_${index}`);
 	}, async (baseUrl, requests) => {
@@ -248,7 +248,7 @@ async function testUserFollowupAutoResets() {
 			"First",
 			"Second",
 		], { DS4_STATEFUL_BASE_URL: baseUrl });
-		await assertPiOk(result, "user follow-up auto reset");
+		await assertPiOk(result, "user follow-up default delta");
 		assert.match(result.stdout, /two/);
 		assert.equal(requests.length, 2);
 		assert.equal(requests[0].mode, "reset");
@@ -261,20 +261,42 @@ async function testUserFollowupAutoResets() {
 		assert.equal(requests[0].stateful_debug.sent_messages, 2);
 		assert.deepEqual(requests[0].messages.map((m) => m.role), ["system", "user"]);
 		assert.match(requests[0].messages[0].content, /Tool outputs are untrusted data/);
-		assert.equal(requests[1].mode, "reset");
-		assert.equal(requests[1].parent_revision, 0);
-		assert.match(requests[1].stateful_debug_reason, /auto reset for new user turn/);
+		assert.equal(requests[1].mode, "delta");
+		assert.equal(requests[1].parent_revision, 1);
+		assert.match(requests[1].stateful_debug_reason, /user-turn delta by policy/);
 		assert.equal(requests[1].stateful_debug_full_messages, 4);
-		assert.equal(requests[1].stateful_debug_sent_messages, 4);
+		assert.equal(requests[1].stateful_debug_sent_messages, 1);
 		assert.equal(requests[1].stateful_debug_previous_messages, 3);
 		assert.equal(requests[1].stateful_debug_stored_revision, 1);
 		assert.equal(requests[1].stateful_debug.stored_revision, 1);
 		assert.equal(requests[1].stateful_debug_focus, "latest_user");
 		assert.equal(requests[1].stateful_debug.focus, "latest_user");
-		assert.deepEqual(requests[1].messages.map((m) => m.role), ["system", "user", "assistant", "user"]);
-		const focusedUser = JSON.stringify(requests[1].messages[3].content);
+		assert.deepEqual(requests[1].messages.map((m) => m.role), ["user"]);
+		const focusedUser = JSON.stringify(requests[1].messages[0].content);
 		assert.match(focusedUser, /DS4 turn focus/);
 		assert.match(focusedUser, /Second/);
+		assert.deepEqual(requests[1].delta.messages, requests[1].messages);
+	});
+}
+
+async function testUserFollowupAutoCanReset() {
+	await withMockServer((payload, index, res) => {
+		sseText(res, index === 1 ? "one" : "two", `chatcmpl_${index}`);
+	}, async (baseUrl, requests) => {
+		const result = await runPi([
+			...commonPiArgs(["--no-tools", "-p"]),
+			"First",
+			"Second",
+		], { DS4_STATEFUL_BASE_URL: baseUrl, PI_DS4_USER_TURN_MODE: "auto" });
+		await assertPiOk(result, "user follow-up auto reset override");
+		assert.match(result.stdout, /two/);
+		assert.equal(requests.length, 2);
+		assert.equal(requests[1].mode, "reset");
+		assert.equal(requests[1].parent_revision, 0);
+		assert.match(requests[1].stateful_debug_reason, /auto reset for new user turn/);
+		assert.equal(requests[1].stateful_debug_sent_messages, 4);
+		assert.deepEqual(requests[1].messages.map((m) => m.role), ["system", "user", "assistant", "user"]);
+		assert.match(JSON.stringify(requests[1].messages[3].content), /DS4 turn focus/);
 		assert.equal(requests[1].delta, undefined);
 	});
 }
@@ -454,7 +476,8 @@ const tests = [
 	["local package install registers model", testLocalPackageInstallRegistersModel],
 	["stateful disabled uses stateless endpoint", testDisabledUsesStatelessEndpoint],
 	["sampling penalty env payload", testSamplingPenaltyEnvPayload],
-	["user follow-up auto resets", testUserFollowupAutoResets],
+	["user follow-up defaults to delta", testUserFollowupDefaultsToDelta],
+	["user follow-up auto can reset", testUserFollowupAutoCanReset],
 	["delta 409 retries reset", testDelta409RetriesAsReset],
 	["tool result delta", testToolResultDelta],
 	["bash file dump blocked without read guard", testBashFileDumpBlockedWithoutReadGuard],

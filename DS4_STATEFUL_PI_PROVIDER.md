@@ -1,7 +1,7 @@
 # DS4 Stateful Pi Provider
 
 This note documents option 3: a DS4-specific Pi provider that avoids resending
-and re-rendering the whole OpenAI chat transcript after every tool call.
+and re-rendering the whole OpenAI chat transcript after append-only coding turns.
 
 ## Goal
 
@@ -14,20 +14,21 @@ system + tools + prior user/assistant/tool messages + new tool results
 
 The built-in DS4 prefix cache can often reuse the old KV, but the server still
 receives, parses, renders, tokenizes, and validates the full JSON transcript.
-After tool calls this is unnecessary: the tool itself only produced a new
-message, and the live DS4 KV already contains the true prior assistant turn.
+After append-only user/tool turns this is unnecessary: the new turn only
+produced a small suffix, and the live DS4 KV already contains the true prior
+assistant turn and earlier coding context.
 
-The stateful provider changes the wire protocol so the common tool path sends
+The stateful provider changes the wire protocol so the common coding path sends
 only appended messages:
 
 ```text
-reset: full context for the first request and new user follow-ups
+reset: full context for the first request or reset boundary
 then
- delta: only new tool/function result messages inside the same user turn
+ delta: only new user/tool/function messages
 ```
 
 The model still has to prefill the new delta tokens. The expected win is that
-post-tool latency scales with the new tool output, not the whole conversation.
+follow-up latency scales with the new user/tool suffix, not the whole conversation.
 
 ## Protocol Endpoint
 
@@ -99,9 +100,8 @@ The client treats a successful response as committing the next revision.
 ### Delta
 
 A delta request contains only new user/tool/function messages that should be
-appended after the last remembered assistant response. The Pi provider now uses
-this mainly for tool/function result continuations; new user follow-ups reset by
-default:
+appended after the last remembered assistant response. The Pi provider uses this
+for append-only tool continuations and, by default, new user follow-ups:
 
 ```json
 {
@@ -174,13 +174,12 @@ Per request:
 1. Canonicalize and hash the current `systemPrompt`, tool schemas, and messages.
 2. If this is the first request, or if system/tools changed, send `reset`.
 3. If old message hashes are a prefix of the current hashes and the appended
-   messages are only tool/function results, send `delta` with just those
-   messages.
-4. If appended messages include a new user message, default `user-turn=auto`
-   sends `reset` with the full visible context. This drops the prior live KV
-   continuation boundary so stale hidden planning from the previous task is less
-   likely to leak into a short follow-up. `user-turn=delta` is available for the
-   old fastest behavior.
+   messages are user/tool/function messages, send `delta` with just those
+   messages by default.
+4. If appended messages include a new user message, the default `user-turn=delta`
+   keeps the prior live KV so the model can attend to earlier coding context
+   without re-prefilling it. `user-turn=auto` or `user-turn=reset` are available
+   as conservative reset-on-user-turn policies.
 5. If the append-only check fails, send `reset` with the full context.
 6. If a delta returns `409`, retry once as `reset`.
 7. On a completed response, increment the local revision and persist the provider
@@ -265,14 +264,13 @@ Pi package implemented in `pi-ds4-stateful/` with a project-local compatibility 
 - Uses `DS4_STATEFUL_BASE_URL`, defaulting to
   `http://127.0.0.1:8000/v1/ds4/stateful`.
 - Computes message/tool hashes and sends `mode="delta"` for append-only
-  tool/function result continuations after the last committed assistant
-  response.
-- Defaults to `user-turn=auto`: new user follow-ups are sent as `mode="reset"`
-  while post-tool continuations stay as `mode="delta"`. This avoids continuing
-  from stale hidden reasoning/KV when the user asks a short follow-up. Override
-  with `/ds4-stateful user-turn delta` or environment variable
-  `PI_DS4_USER_TURN_MODE=delta` to use deltas for new user messages too.
-- Adds a short per-turn focus note to reset payloads after the first turn,
+  user/tool/function continuations after the last committed assistant response.
+- Defaults to `user-turn=delta`: new user follow-ups and post-tool
+  continuations are sent as `mode="delta"` when the transcript is append-only.
+  This keeps earlier coding context in live KV without re-prefilling it. Override
+  with `/ds4-stateful user-turn auto` or environment variable
+  `PI_DS4_USER_TURN_MODE=auto` to restore reset-on-user-turn behavior.
+- Adds a short per-turn focus note to follow-up user turns after the first turn,
   attached to the latest user message. This reminds DS4 to answer the latest
   follow-up directly instead of restating older project summaries. Disable with
   `/ds4-stateful focus off` or `PI_DS4_TURN_FOCUS=0`.
@@ -381,7 +379,7 @@ Pi extension validation:
 - `make test`: pass.
 - `make ds4-server-rocm-upstream`: pass.
 - The Pi regression test covers provider registration from both the compatibility
-  wrapper and package directory, user follow-up -> auto reset, stale delta HTTP
+  wrapper and package directory, user follow-up -> default delta, stale delta HTTP
   409 -> reset retry, debug reason/count fields, a real Pi `read` tool result
   sent as a one-message stateful delta, and covered-read blocking.
 - A probe against an older already-running DS4 server reached the provider and
