@@ -1725,23 +1725,43 @@ static int routed_moe_launch(
                 (void)cudaEventRecord(prof0, 0);
             }
         }
-        dim3 gate_grid((expert_mid_dim + rows_per_block - 1u) / rows_per_block, n_tokens * n_expert, 1);
-        moe_gate_up_mid_q2K_rows_w32_kernel<<<gate_grid, threads>>>(
-                (float *)gate->ptr,
-                (float *)up->ptr,
-                (float *)mid->ptr,
-                gate_w,
-                up_w,
-                (const float *)x->ptr,
-                (const int32_t *)selected->ptr,
-                (const float *)weights->ptr,
-                gate_expert_bytes,
-                gate_row_bytes,
-                expert_in_dim,
-                expert_mid_dim,
-                n_expert,
-                clamp,
-                store_gate_up);
+        if (rows_per_block == 1u) {
+            dim3 gate_grid(expert_mid_dim, n_tokens * n_expert, 1);
+            moe_gate_up_mid_q2K_rows_rpb1_w32_kernel<<<gate_grid, 32u>>>(
+                    (float *)gate->ptr,
+                    (float *)up->ptr,
+                    (float *)mid->ptr,
+                    gate_w,
+                    up_w,
+                    (const float *)x->ptr,
+                    (const int32_t *)selected->ptr,
+                    (const float *)weights->ptr,
+                    gate_expert_bytes,
+                    gate_row_bytes,
+                    expert_in_dim,
+                    expert_mid_dim,
+                    n_expert,
+                    clamp,
+                    store_gate_up);
+        } else {
+            dim3 gate_grid((expert_mid_dim + rows_per_block - 1u) / rows_per_block, n_tokens * n_expert, 1);
+            moe_gate_up_mid_q2K_rows_w32_kernel<<<gate_grid, threads>>>(
+                    (float *)gate->ptr,
+                    (float *)up->ptr,
+                    (float *)mid->ptr,
+                    gate_w,
+                    up_w,
+                    (const float *)x->ptr,
+                    (const int32_t *)selected->ptr,
+                    (const float *)weights->ptr,
+                    gate_expert_bytes,
+                    gate_row_bytes,
+                    expert_in_dim,
+                    expert_mid_dim,
+                    n_expert,
+                    clamp,
+                    store_gate_up);
+        }
         if (!cuda_ok(cudaGetLastError(), "routed_moe q2 oldhip rows gate/up launch")) {
             if (prof0) (void)cudaEventDestroy(prof0);
             if (prof1) (void)cudaEventDestroy(prof1);

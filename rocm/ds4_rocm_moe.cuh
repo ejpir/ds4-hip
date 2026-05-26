@@ -2447,6 +2447,71 @@ __global__ static void moe_dense_scatter_down_f16_kernel(
     down[(uint64_t)pair * out_dim + row] = __half2float(down_h[idx]);
 }
 
+__global__ __launch_bounds__(32) static void moe_gate_up_mid_q2K_rows_rpb1_w32_kernel(
+        float *gate_out,
+        float *up_out,
+        float *mid_out,
+        const char *gate_base,
+        const char *up_base,
+        const float *x,
+        const int32_t *selected,
+        const float *weights,
+        uint64_t gate_expert_bytes,
+        uint64_t gate_row_bytes,
+        uint32_t expert_in_dim,
+        uint32_t expert_mid_dim,
+        uint32_t n_expert,
+        float clamp,
+        int store_gate_up) {
+    const uint32_t lane = threadIdx.x;
+    const uint32_t row = blockIdx.x;
+    const uint32_t pair = blockIdx.y;
+    if (row >= expert_mid_dim || lane >= 32u) return;
+    const uint32_t tok = pair / n_expert;
+    const uint32_t slot = pair - tok * n_expert;
+    int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
+    if (expert_i < 0) expert_i = 0;
+    const uint32_t expert = (uint32_t)expert_i;
+    const float *xr = x + (uint64_t)tok * expert_in_dim;
+    const unsigned char *gr = (const unsigned char *)gate_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes;
+    const unsigned char *ur = (const unsigned char *)up_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes;
+
+    float gate = 0.0f;
+    float up = 0.0f;
+    const uint32_t nb = expert_in_dim >> 8u;
+    for (uint32_t b = 0; b < nb; b++) {
+        const unsigned char *gb = gr + (uint64_t)b * 84u;
+        const unsigned char *ub = ur + (uint64_t)b * 84u;
+        float gd, gdmin, ud, udmin;
+        q2_K_scale_broadcast_w32(gb, &gd, &gdmin);
+        q2_K_scale_broadcast_w32(ub, &ud, &udmin);
+        const uint64_t xbase = (uint64_t)b * 256u;
+#pragma unroll
+        for (uint32_t kk = 0; kk < 8u; kk++) {
+            const uint32_t i = lane + (kk << 5u);
+            const float xv = xr[xbase + i];
+            gate += q2_K_dequant_256_scaled_w32(gb, lane, kk, gd, gdmin) * xv;
+            up += q2_K_dequant_256_scaled_w32(ub, lane, kk, ud, udmin) * xv;
+        }
+    }
+
+    gate = warp_sum_f32(gate);
+    up = warp_sum_f32(up);
+    if (lane == 0u) {
+        if (clamp > 1.0e-6f) {
+            if (gate > clamp) gate = clamp;
+            if (up > clamp) up = clamp;
+            if (up < -clamp) up = -clamp;
+        }
+        const uint64_t off = (uint64_t)pair * expert_mid_dim + row;
+        if (store_gate_up) {
+            gate_out[off] = gate;
+            up_out[off] = up;
+        }
+        mid_out[off] = moe_silu_oldhip(gate) * up * weights[(uint64_t)tok * n_expert + slot];
+    }
+}
+
 __global__ static void moe_gate_up_mid_q2K_rows_w32_kernel(
         float *gate_out,
         float *up_out,
