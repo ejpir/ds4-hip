@@ -61,6 +61,7 @@ Environment:
   DS4_SERVER_ATTN_OUT_LOW_DECODE_RPB=1|2|4|8|16|32 Rows/block for decode attn_output_a low projection
   DS4_SERVER_OLDHIP_ATTENTION_DECODE=1 Use the old-HIP decode attention kernel
   DS4_SERVER_QKV_PAIR_DECODE=1      Opt in shared-quant Q/KV decode projection pair
+  DS4_SERVER_OVERLAP_SHARED_GATE_UP=0 Disable FAST_FULL async shared-expert gate/up overlap
   DS4_SERVER_ATTN_OUT_LOW_SPLITK=1 Restore old split-K decode attn_output_a path; FAST_FULL defaults to prequant
   DS4_SERVER_SHARED_GATE_UP_FUSED_W32=1 Restore old fused shared gate/up float-row decode path; FAST_FULL defaults to prequant pair
   DS4_SERVER_Q8_HIPBLASLT=1      Opt-in q-side hipBLASLt xsplit path for small prefill batches
@@ -193,6 +194,7 @@ if [[ "${DS4_SERVER_FAST_FULL:-0}" == "1" ]]; then
   export DS4_SERVER_Q8_PREQUANT_DECODE="${DS4_SERVER_Q8_PREQUANT_DECODE:-1}"
   export DS4_SERVER_ATTN_OUT_LOW_SPLITK="${DS4_SERVER_ATTN_OUT_LOW_SPLITK:-0}"
   export DS4_SERVER_SHARED_GATE_UP_FUSED_W32="${DS4_SERVER_SHARED_GATE_UP_FUSED_W32:-0}"
+  export DS4_SERVER_OVERLAP_SHARED_GATE_UP="${DS4_SERVER_OVERLAP_SHARED_GATE_UP:-1}"
   export DS4_SERVER_MOE_WMMA_HOT="${DS4_SERVER_MOE_WMMA_HOT:-1}"
   export DS4_SERVER_MOE_WMMA_GATE_HOT="${DS4_SERVER_MOE_WMMA_GATE_HOT:-8}"
   export DS4_SERVER_MOE_WMMA_DOWN_HOT="${DS4_SERVER_MOE_WMMA_DOWN_HOT:-8}"
@@ -321,6 +323,7 @@ export_pair_value Q8_HC_DECODE_RPB "${DS4_SERVER_Q8_HC_DECODE_RPB:-}"
 export_pair_value ATTN_OUT_LOW_DECODE_RPB "${DS4_SERVER_ATTN_OUT_LOW_DECODE_RPB:-}"
 export_pair_flag OLDHIP_ATTENTION_DECODE "${DS4_SERVER_OLDHIP_ATTENTION_DECODE:-0}"
 export_pair_flag QKV_PAIR_DECODE "${DS4_SERVER_QKV_PAIR_DECODE:-0}"
+export_pair_flag OVERLAP_SHARED_GATE_UP "${DS4_SERVER_OVERLAP_SHARED_GATE_UP:-0}"
 export_pair_flag MOE_EXPERT_BATCH "${DS4_SERVER_MOE_EXPERT_BATCH:-0}"
 export_pair_value MOE_EXPERT_TILE "${DS4_SERVER_MOE_EXPERT_TILE:-}"
 export_pair_value MOE_GATE_TILE "${DS4_SERVER_MOE_GATE_TILE:-}"

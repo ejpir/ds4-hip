@@ -196,6 +196,9 @@ static void gpu_fast_path_summary(bool quality) {
     const bool shared_gate_pair_swiglu = q8_prequant && !shared_gate_fused &&
                                         !env_truthy("DS4_CUDA_DISABLE_SHARED_GATE_UP_PAIR") &&
                                         !env_truthy("DS4_CUDA_DISABLE_SHARED_GATE_UP_PAIR_SWIGLU");
+    const bool overlap_shared_gate_up = env_truthy2("DS4_CUDA_OVERLAP_SHARED_GATE_UP",
+                                                   "DS4_HIP_OVERLAP_SHARED_GATE_UP") ||
+                                        env_truthy("DS4_SERVER_OVERLAP_SHARED_GATE_UP");
     const char *moe_decode_rpb = env_first_nonempty("DS4_CUDA_MOE_DECODE_RPB",
                                                     "DS4_HIP_MOE_DECODE_RPB",
                                                     "default");
@@ -214,7 +217,8 @@ static void gpu_fast_path_summary(bool quality) {
             "oldhip_attention_decode=%s oldhip_attention_vec4=%s "
             "attn_out_low_splitk=%s attn_out_low_prequant=%s attn_out_low_rpb=%s "
             "shared_gate_up_fused_w32=%s shared_gate_up_prequant_pair=%s "
-            "shared_gate_up_pair_swiglu=%s moe_decode_rpb=%s moe_q8k_down=%s "
+            "shared_gate_up_pair_swiglu=%s overlap_shared_gate_up=%s "
+            "moe_decode_rpb=%s moe_q8k_down=%s "
             "q8_fp16_preload(attn_out=%s,attn_q_b=%s,shared_down=%s)\n",
             onoff(quality),
             onoff(copy_model),
@@ -230,6 +234,7 @@ static void gpu_fast_path_summary(bool quality) {
             onoff(shared_gate_fused),
             onoff(q8_prequant && !shared_gate_fused),
             onoff(shared_gate_pair_swiglu),
+            onoff(overlap_shared_gate_up),
             moe_decode_rpb,
             onoff(moe_q8k_down),
             onoff(attn_out_preload),

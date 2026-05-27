@@ -39,6 +39,7 @@ Environment:
   DS4_SERVER_ATTN_OUT_LOW_DECODE_RPB=1|2|4|8|16|32 Rows/block for decode attn_output_a low projection
   DS4_SERVER_OLDHIP_ATTENTION_DECODE=1  Use the old-HIP decode attention kernel
   DS4_SERVER_QKV_PAIR_DECODE=1           Opt in shared-quant Q/KV decode projection pair
+  DS4_SERVER_OVERLAP_SHARED_GATE_UP=0    Disable FAST_FULL async shared-expert gate/up overlap
   DS4_SERVER_MOE_DECODE_Q8K_DOWN=1       Opt in Q8_K mid/down MoE decode path
   DS4_SERVER_ATTN_OUT_LOW_SPLITK=1       Restore old split-K decode attn_output_a path; FAST_FULL defaults to prequant
   DS4_SERVER_SHARED_GATE_UP_FUSED_W32=1  Restore old fused shared gate/up float-row decode path; FAST_FULL defaults to prequant pair
@@ -139,6 +140,7 @@ if [[ "${DS4_SERVER_FAST_FULL:-0}" == "1" ]]; then
   export DS4_SERVER_ATTN_Q_B_PRELOAD="${DS4_SERVER_ATTN_Q_B_PRELOAD:-1}"
   export DS4_SERVER_ATTN_Q_B_F16_OUT="${DS4_SERVER_ATTN_Q_B_F16_OUT:-1}"
   export DS4_SERVER_ATTENTION_OUTPUT_F16_OUT="${DS4_SERVER_ATTENTION_OUTPUT_F16_OUT:-1}"
+  export DS4_SERVER_OVERLAP_SHARED_GATE_UP="${DS4_SERVER_OVERLAP_SHARED_GATE_UP:-1}"
   export DS4_CUDA_ATTENTION_OUTPUT_CUBLAS_ALL="${DS4_CUDA_ATTENTION_OUTPUT_CUBLAS_ALL:-1}"
   export DS4_CUDA_ATTENTION_OUTPUT_PACKED_B_CUBLAS="${DS4_CUDA_ATTENTION_OUTPUT_PACKED_B_CUBLAS:-1}"
   export DS4_CUDA_ATTENTION_OUTPUT_INTERLEAVED_B_CUBLAS="${DS4_CUDA_ATTENTION_OUTPUT_INTERLEAVED_B_CUBLAS:-1}"
@@ -184,6 +186,7 @@ export_pair_value Q8_HC_DECODE_RPB "${DS4_SERVER_Q8_HC_DECODE_RPB:-}"
 export_pair_value ATTN_OUT_LOW_DECODE_RPB "${DS4_SERVER_ATTN_OUT_LOW_DECODE_RPB:-}"
 export_pair_flag OLDHIP_ATTENTION_DECODE "${DS4_SERVER_OLDHIP_ATTENTION_DECODE:-0}"
 export_pair_flag QKV_PAIR_DECODE "${DS4_SERVER_QKV_PAIR_DECODE:-0}"
+export_pair_flag OVERLAP_SHARED_GATE_UP "${DS4_SERVER_OVERLAP_SHARED_GATE_UP:-0}"
 if [[ "${DS4_SERVER_Q8_PREQUANT_DECODE:-0}" == "1" ]]; then
   export DS4_CUDA_Q8_PREQUANT_DECODE=1
 elif [[ -n "${DS4_SERVER_Q8_PREQUANT_DECODE:-}" ]]; then
