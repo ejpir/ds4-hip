@@ -115,6 +115,8 @@ __global__ static void dequant_q8_0_to_f16_transpose_kernel(
         uint64_t out_dim,
         uint64_t blocks);
 
+static void cuda_shared_gate_up_async_cleanup(void);
+
 static void *cuda_tmp_alloc(uint64_t bytes, const char *what) {
     if (bytes == 0) return NULL;
     if (g_cuda_tmp_bytes >= bytes) return g_cuda_tmp;
@@ -1564,6 +1566,7 @@ extern "C" int ds4_gpu_init(void) {
 
 extern "C" void ds4_gpu_cleanup(void) {
     (void)cudaDeviceSynchronize();
+    cuda_shared_gate_up_async_cleanup();
 #ifdef __HIP_PLATFORM_AMD__
     moe_dense_hot_cache_clear();
     hipblaslt_gemm_plan_clear();

@@ -10321,6 +10321,31 @@ static bool metal_graph_encode_decode_layer(
     if (ok) ok = metal_graph_matmul_plain_tensor(g->router_logits, model, layer->ffn_gate_inp,
                                                  DS4_N_EMBD, DS4_N_EXPERT, g->ffn_norm, 1);
     if (ok) metal_graph_debug_inject_tensor("ffn_moe_logits", g->router_logits, DS4_N_EXPERT, il, pos);
+    const bool fuse_shared_gate_up =
+        !g->quality &&
+        getenv("DS4_METAL_DISABLE_SHARED_GATE_UP_SWIGLU_FUSION") == NULL;
+    bool shared_gate_up_async = false;
+#if defined(DS4_USE_GPU_API) && defined(DS4_USE_HIP)
+    const bool overlap_shared_gate_up =
+        fuse_shared_gate_up &&
+        (getenv("DS4_CUDA_OVERLAP_SHARED_GATE_UP") != NULL ||
+         getenv("DS4_HIP_OVERLAP_SHARED_GATE_UP") != NULL ||
+         getenv("DS4_SERVER_OVERLAP_SHARED_GATE_UP") != NULL);
+    if (ok && overlap_shared_gate_up) {
+        shared_gate_up_async = ds4_gpu_shared_gate_up_swiglu_q8_0_async_tensor(
+            g->shared_gate,
+            g->shared_up,
+            g->shared_mid,
+            model->map,
+            model->size,
+            layer->ffn_gate_shexp->abs_offset,
+            layer->ffn_up_shexp->abs_offset,
+            DS4_N_EMBD,
+            shared_dim,
+            g->ffn_norm,
+            DS4_SWIGLU_CLAMP_EXP) != 0;
+    }
+#endif
     if (ok) ok = ds4_metal_router_select_tensor(g->router_selected, g->router_weights, g->router_probs,
                                                 model->map, model->size,
                                                 layer->ffn_exp_probs_b ? layer->ffn_exp_probs_b->abs_offset : 0,
@@ -10386,10 +10411,15 @@ static bool metal_graph_encode_decode_layer(
         metal_graph_debug_dump_tensor("ffn_moe_out", g->routed_out, DS4_N_EMBD, il, pos);
         metal_graph_debug_inject_tensor("ffn_moe_out", g->routed_out, DS4_N_EMBD, il, pos);
     }
-    const bool fuse_shared_gate_up =
-        !g->quality &&
-        getenv("DS4_METAL_DISABLE_SHARED_GATE_UP_SWIGLU_FUSION") == NULL;
-    if (ok && fuse_shared_gate_up) {
+    if (shared_gate_up_async) {
+#if defined(DS4_USE_GPU_API) && defined(DS4_USE_HIP)
+        int async_ok = ds4_gpu_shared_gate_up_async_wait();
+        if (ok) ok = async_ok != 0;
+#endif
+    }
+    if (ok && shared_gate_up_async) {
+        /* Already launched before routed MoE and synchronized above. */
+    } else if (ok && fuse_shared_gate_up) {
 #ifdef DS4_USE_GPU_API
         ok = ds4_metal_shared_gate_up_swiglu_q8_0_tensor(g->shared_gate,
                                                          g->shared_up,

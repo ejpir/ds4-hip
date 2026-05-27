@@ -16,7 +16,9 @@ extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
         uint64_t                up_offset,
         uint64_t                in_dim,
         uint64_t                out_dim,
-        const ds4_gpu_tensor *x) {
+        const ds4_gpu_tensor *x,
+        float                   clamp) {
+    (void)clamp;
     const uint64_t blocks = (in_dim + 31u) / 32u;
     const uint64_t row_bytes = blocks * 34u;
     const uint64_t weight_bytes = out_dim * row_bytes;
@@ -113,6 +115,144 @@ extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
                                         up_offset, in_dim, out_dim, x, 1) &&
            ds4_gpu_swiglu_tensor(mid, gate, up, (uint32_t)out_dim, 0.0f, 1.0f);
 }
+
+static cudaStream_t g_shared_gate_up_stream = NULL;
+static int g_shared_gate_up_pending = 0;
+
+static int cuda_shared_gate_up_async_wait_internal(void) {
+    if (!g_shared_gate_up_pending) return 1;
+    cudaError_t err = cudaStreamSynchronize(g_shared_gate_up_stream);
+    g_shared_gate_up_pending = 0;
+    if (err != cudaSuccess) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "shared gate/up async wait failed: %s\n", cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        return 0;
+    }
+    return 1;
+}
+
+static void cuda_shared_gate_up_async_cleanup(void) {
+    if (g_shared_gate_up_stream) {
+        (void)cuda_shared_gate_up_async_wait_internal();
+        (void)cudaStreamDestroy(g_shared_gate_up_stream);
+        g_shared_gate_up_stream = NULL;
+    }
+}
+
+extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_async_tensor(
+        ds4_gpu_tensor       *gate,
+        ds4_gpu_tensor       *up,
+        ds4_gpu_tensor       *mid,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                gate_offset,
+        uint64_t                up_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        float                   clamp) {
+    (void)clamp;
+    if (g_quality_mode || cuda_runtime_config()->graph_dump) return 0;
+    if (g_shared_gate_up_pending && !cuda_shared_gate_up_async_wait_internal()) return 0;
+    const uint64_t blocks = (in_dim + 31u) / 32u;
+    const uint64_t row_bytes = blocks * 34u;
+    const uint64_t weight_bytes = out_dim * row_bytes;
+    if (!cuda_runtime_config()->q8_prequant_decode ||
+        cuda_runtime_config()->disable_shared_gate_up_pair ||
+        !gate || !up || !mid || !model_map || !x ||
+        in_dim == 0u || out_dim == 0u || in_dim > UINT32_MAX || out_dim > UINT32_MAX ||
+        gate_offset > model_size || up_offset > model_size ||
+        weight_bytes > model_size - gate_offset ||
+        weight_bytes > model_size - up_offset ||
+        x->bytes < in_dim * sizeof(float) ||
+        gate->bytes < out_dim * sizeof(float) ||
+        up->bytes < out_dim * sizeof(float) ||
+        mid->bytes < out_dim * sizeof(float)) {
+        return 0;
+    }
+    const char *wg = cuda_model_range_ptr(model_map, gate_offset, weight_bytes, "shared_gate_q8_pair_async");
+    const char *wu = cuda_model_range_ptr(model_map, up_offset, weight_bytes, "shared_up_q8_pair_async");
+    if (!wg || !wu) return 0;
+    if (!g_shared_gate_up_stream) {
+        int least_priority = 0;
+        int greatest_priority = 0;
+#ifdef __HIP_PLATFORM_AMD__
+        hipError_t err = hipDeviceGetStreamPriorityRange(&least_priority, &greatest_priority);
+        if (err == hipSuccess) {
+            err = hipStreamCreateWithPriority(&g_shared_gate_up_stream, cudaStreamNonBlocking, least_priority);
+        } else {
+            (void)cudaGetLastError();
+            err = hipStreamCreateWithFlags(&g_shared_gate_up_stream, cudaStreamNonBlocking);
+        }
+        if (err != hipSuccess) return 0;
+#else
+        cudaError_t err = cudaDeviceGetStreamPriorityRange(&least_priority, &greatest_priority);
+        if (err == cudaSuccess) {
+            err = cudaStreamCreateWithPriority(&g_shared_gate_up_stream, cudaStreamNonBlocking, least_priority);
+        } else {
+            (void)cudaGetLastError();
+            err = cudaStreamCreateWithFlags(&g_shared_gate_up_stream, cudaStreamNonBlocking);
+        }
+        if (err != cudaSuccess) return 0;
+#endif
+    }
+    const uint64_t xq_bytes = blocks * 32u;
+    const uint64_t scale_offset = (xq_bytes + 15u) & ~15ull;
+    const uint64_t tmp_bytes = scale_offset + blocks * sizeof(float);
+    void *tmp = cuda_tmp_alloc(tmp_bytes, "shared gate/up async prequant swiglu");
+    if (!tmp) return 0;
+    int8_t *xq = (int8_t *)tmp;
+    float *xscale = (float *)((char *)tmp + scale_offset);
+    const int use_dp4a = cuda_q8_use_dp4a();
+    dim3 qgrid((unsigned)blocks, 1, 1);
+    quantize_q8_0_f32_kernel<<<qgrid, 32, 0, g_shared_gate_up_stream>>>(xq, xscale, (const float *)x->ptr, in_dim, blocks);
+    if (!cuda_ok(cudaGetLastError(), "shared gate/up async quantize launch")) return 0;
+    if (!cuda_runtime_config()->disable_shared_gate_up_pair_swiglu) {
+        shared_gate_up_swiglu_q8_0_pair_preq_warp8_kernel<<<((unsigned)out_dim + 7u) / 8u, 256, 0, g_shared_gate_up_stream>>>(
+                (float *)gate->ptr,
+                (float *)up->ptr,
+                (float *)mid->ptr,
+                reinterpret_cast<const unsigned char *>(wg),
+                reinterpret_cast<const unsigned char *>(wu),
+                xq,
+                xscale,
+                in_dim,
+                out_dim,
+                blocks,
+                use_dp4a,
+                0);
+        if (!cuda_ok(cudaGetLastError(), "shared gate/up async prequant swiglu launch")) return 0;
+    } else {
+        matmul_q8_0_pair_preq_warp8_kernel<<<((unsigned)out_dim + 7u) / 8u, 256, 0, g_shared_gate_up_stream>>>(
+                (float *)gate->ptr,
+                (float *)up->ptr,
+                reinterpret_cast<const unsigned char *>(wg),
+                reinterpret_cast<const unsigned char *>(wu),
+                xq,
+                xscale,
+                in_dim,
+                out_dim,
+                out_dim,
+                blocks,
+                use_dp4a);
+        if (!cuda_ok(cudaGetLastError(), "shared gate/up async pair launch")) return 0;
+        swiglu_kernel<<<((unsigned)out_dim + 255u) / 256u, 256, 0, g_shared_gate_up_stream>>>(
+                (float *)mid->ptr,
+                (const float *)gate->ptr,
+                (const float *)up->ptr,
+                (uint32_t)out_dim,
+                0.0f,
+                1.0f);
+        if (!cuda_ok(cudaGetLastError(), "shared gate/up async swiglu launch")) return 0;
+    }
+    g_shared_gate_up_pending = 1;
+    return 1;
+}
+
+extern "C" int ds4_gpu_shared_gate_up_async_wait(void) {
+    return cuda_shared_gate_up_async_wait_internal();
+}
+
 extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_batch_tensor(
         ds4_gpu_tensor       *gate,
         ds4_gpu_tensor       *up,
