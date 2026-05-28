@@ -117,6 +117,9 @@ extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
 }
 
 static cudaStream_t g_shared_gate_up_stream = NULL;
+static cudaEvent_t g_shared_gate_up_ready_event = NULL;
+static void *g_shared_gate_up_tmp = NULL;
+static uint64_t g_shared_gate_up_tmp_bytes = 0;
 static int g_shared_gate_up_pending = 0;
 
 static int cuda_shared_gate_up_async_wait_internal(void) {
@@ -131,9 +134,42 @@ static int cuda_shared_gate_up_async_wait_internal(void) {
     return 1;
 }
 
+static void *cuda_shared_gate_up_async_tmp_alloc(uint64_t bytes) {
+    if (bytes == 0) return NULL;
+    if (g_shared_gate_up_tmp_bytes >= bytes) return g_shared_gate_up_tmp;
+    if (g_shared_gate_up_tmp) {
+        (void)cuda_shared_gate_up_async_wait_internal();
+        (void)cudaFree(g_shared_gate_up_tmp);
+        g_shared_gate_up_tmp = NULL;
+        g_shared_gate_up_tmp_bytes = 0;
+    }
+    void *ptr = NULL;
+    cudaError_t err = cudaMalloc(&ptr, (size_t)bytes);
+    if (err != cudaSuccess) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "shared gate/up async temp alloc failed (%.2f MiB): %s\n",
+                (double)bytes / 1048576.0, cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        return NULL;
+    }
+    g_shared_gate_up_tmp = ptr;
+    g_shared_gate_up_tmp_bytes = bytes;
+    return g_shared_gate_up_tmp;
+}
+
 static void cuda_shared_gate_up_async_cleanup(void) {
     if (g_shared_gate_up_stream) {
         (void)cuda_shared_gate_up_async_wait_internal();
+    }
+    if (g_shared_gate_up_tmp) {
+        (void)cudaFree(g_shared_gate_up_tmp);
+        g_shared_gate_up_tmp = NULL;
+        g_shared_gate_up_tmp_bytes = 0;
+    }
+    if (g_shared_gate_up_ready_event) {
+        (void)cudaEventDestroy(g_shared_gate_up_ready_event);
+        g_shared_gate_up_ready_event = NULL;
+    }
+    if (g_shared_gate_up_stream) {
         (void)cudaStreamDestroy(g_shared_gate_up_stream);
         g_shared_gate_up_stream = NULL;
     }
@@ -196,10 +232,40 @@ extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_async_tensor(
         if (err != cudaSuccess) return 0;
 #endif
     }
+    if (!g_shared_gate_up_ready_event) {
+        cudaError_t err = cudaEventCreateWithFlags(&g_shared_gate_up_ready_event, cudaEventDisableTiming);
+        if (err != cudaSuccess) {
+            fprintf(stderr, DS4_GPU_LOG_PREFIX "shared gate/up async event create failed: %s\n", cudaGetErrorString(err));
+            (void)cudaGetLastError();
+            return 0;
+        }
+    }
+    /*
+     * This stream is intentionally non-blocking so it can overlap routed MoE.
+     * Non-blocking streams do not inherit default-stream ordering, so explicitly
+     * wait until the default-stream producer of x (ffn_norm) has completed before
+     * quantizing it here.
+     */
+    cudaError_t dep_err = cudaEventRecord(g_shared_gate_up_ready_event, 0);
+    if (dep_err != cudaSuccess) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "shared gate/up async dependency record failed: %s\n", cudaGetErrorString(dep_err));
+        (void)cudaGetLastError();
+        return 0;
+    }
+#ifdef __HIP_PLATFORM_AMD__
+    dep_err = hipStreamWaitEvent(g_shared_gate_up_stream, g_shared_gate_up_ready_event, 0);
+#else
+    dep_err = cudaStreamWaitEvent(g_shared_gate_up_stream, g_shared_gate_up_ready_event, 0);
+#endif
+    if (dep_err != cudaSuccess) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "shared gate/up async dependency wait failed: %s\n", cudaGetErrorString(dep_err));
+        (void)cudaGetLastError();
+        return 0;
+    }
     const uint64_t xq_bytes = blocks * 32u;
     const uint64_t scale_offset = (xq_bytes + 15u) & ~15ull;
     const uint64_t tmp_bytes = scale_offset + blocks * sizeof(float);
-    void *tmp = cuda_tmp_alloc(tmp_bytes, "shared gate/up async prequant swiglu");
+    void *tmp = cuda_shared_gate_up_async_tmp_alloc(tmp_bytes);
     if (!tmp) return 0;
     int8_t *xq = (int8_t *)tmp;
     float *xscale = (float *)((char *)tmp + scale_offset);
