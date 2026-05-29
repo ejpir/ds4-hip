@@ -301,6 +301,24 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
     }
     if (n_tok > 1 && !cuda_runtime_config()->q8_prequant_batch) {
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+        if (cuda_env_flag_any3("DS4_CUDA_Q8_WMMA_4W", "DS4_HIP_Q8_WMMA_4W", NULL) &&
+            !g_quality_mode && (in_dim % 32u) == 0u &&
+            out_dim >= cuda_parse_u32_env_alias("DS4_CUDA_Q8_WMMA_4W_MIN_OUT", "DS4_HIP_Q8_WMMA_4W_MIN_OUT", 1024u, 16u, UINT32_MAX) &&
+            n_tok >= cuda_parse_u32_env_alias("DS4_CUDA_Q8_WMMA_4W_MIN_TOKENS", "DS4_HIP_Q8_WMMA_4W_MIN_TOKENS", 256u, 1u, 65535u) &&
+            in_dim <= UINT32_MAX && out_dim <= UINT32_MAX && n_tok <= UINT32_MAX) {
+            const dim3 grid((uint32_t)((out_dim + 63u) / 64u),
+                            (uint32_t)((n_tok + 63u) / 64u),
+                            1u);
+            matmul_q8_0_f32_batch_wmma_4w_kernel<<<grid, 128u>>>(
+                    (float *)out->ptr,
+                    reinterpret_cast<const unsigned char *>(wptr),
+                    (const float *)x->ptr,
+                    (uint32_t)n_tok,
+                    (uint32_t)in_dim,
+                    (uint32_t)out_dim,
+                    blocks * 34u);
+            return cuda_ok(cudaGetLastError(), "matmul_q8_0 f32 batch wmma 4w launch");
+        }
         if ((cuda_env_present("DS4_CUDA_Q8_WMMA_ONFLY") || cuda_env_present("DS4_CUDA_Q8_WMMA_FAST")) &&
             !g_quality_mode && (in_dim % 16u) == 0u && (out_dim % 16u) == 0u &&
             n_tok >= cuda_parse_u32_env_alias("DS4_CUDA_Q8_WMMA_MIN_TOKENS", "DS4_HIP_Q8_WMMA_MIN_TOKENS", 2u, 1u, 65535u) &&

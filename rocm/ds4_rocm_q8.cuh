@@ -663,6 +663,117 @@ __global__ static void matmul_q8_0_f32_batch_sharedx_warp_rows_w32_toktile_kerne
 }
 
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+typedef _Float16 __attribute__((ext_vector_type(16))) ds4_q8_half16_t;
+typedef float    __attribute__((ext_vector_type(8)))  ds4_q8_float8_t;
+
+/* Four-wave, 64x64 output-tile Q8_0 batched GEMM for large prefill chunks.
+ * This is the hipfire/llama.cpp-style MMQ shape adapted to DS4's existing
+ * F32 activation buffers: each block stages a 64-token x 32-K activation tile
+ * into LDS as f16, while each wave owns 16 output rows and computes four
+ * 16-token WMMA columns.  It is opt-in from host code because it only wins once
+ * the token batch is large enough to amortize the bigger tile. */
+__launch_bounds__(128, 2)
+__global__ static void matmul_q8_0_f32_batch_wmma_4w_kernel(
+        float *out,
+        const unsigned char *w,
+        const float *x,
+        uint32_t n_tokens,
+        uint32_t in_dim,
+        uint32_t out_dim,
+        uint64_t row_bytes) {
+    constexpr uint32_t M_TILE = 64u;
+    constexpr uint32_t N_TILE = 64u;
+    constexpr uint32_t K_TILE = 32u;
+    constexpr uint32_t WARPS = 4u;
+    constexpr uint32_t M_PER_WARP = M_TILE / WARPS;
+    constexpr uint32_t N_TILES_PER_WARP = N_TILE / 16u;
+
+    const uint32_t block_m = (uint32_t)blockIdx.x * M_TILE;
+    const uint32_t block_n = (uint32_t)blockIdx.y * N_TILE;
+    if (block_m >= out_dim || block_n >= n_tokens) return;
+
+    const uint32_t tid = threadIdx.x;
+    const uint32_t warp_id = tid >> 5u;
+    const uint32_t lane = tid & 31u;
+    const uint32_t lane16 = lane & 15u;
+    const uint32_t warp_m = block_m + warp_id * M_PER_WARP;
+    const uint32_t my_row = warp_m + lane16;
+    const uint32_t safe_row = my_row < out_dim ? my_row : (out_dim - 1u);
+    const unsigned char *row_base = w + (uint64_t)safe_row * row_bytes;
+    const uint32_t n_blocks = in_dim >> 5u;
+
+    ds4_q8_float8_t acc0 = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    ds4_q8_float8_t acc1 = acc0;
+    ds4_q8_float8_t acc2 = acc0;
+    ds4_q8_float8_t acc3 = acc0;
+
+    __shared__ _Float16 lds_x[N_TILE * K_TILE];
+
+    for (uint32_t bi = 0; bi < n_blocks; bi++) {
+        for (uint32_t j = tid; j < N_TILE * K_TILE; j += blockDim.x) {
+            const uint32_t nt = j >> 5u;
+            const uint32_t kk = j & 31u;
+            const uint32_t tok = block_n + nt;
+            float xv = 0.0f;
+            if (tok < n_tokens) xv = x[(uint64_t)tok * in_dim + bi * 32u + kk];
+            lds_x[j] = (_Float16)xv;
+        }
+        __syncthreads();
+
+        const unsigned char *bp = row_base + (uint64_t)bi * 34u;
+        _Float16 sc;
+        {
+            uint16_t s_bits;
+            __builtin_memcpy(&s_bits, bp, 2);
+            __builtin_memcpy(&sc, &s_bits, 2);
+        }
+
+        const int8_t *w0 = (const int8_t *)(bp + 2u);
+        const int8_t *w1 = (const int8_t *)(bp + 18u);
+        ds4_q8_half16_t a0;
+        ds4_q8_half16_t a1;
+#pragma unroll
+        for (uint32_t i = 0; i < 16u; i++) {
+            a0[i] = sc * (_Float16)(float)(int)w0[i];
+            a1[i] = sc * (_Float16)(float)(int)w1[i];
+        }
+
+#pragma unroll
+        for (uint32_t ntile = 0; ntile < N_TILES_PER_WARP; ntile++) {
+            const uint32_t nt = ntile * 16u + lane16;
+            const _Float16 *xb = lds_x + nt * K_TILE;
+            const ds4_q8_half16_t b0 = *(const ds4_q8_half16_t *)(xb);
+            const ds4_q8_half16_t b1 = *(const ds4_q8_half16_t *)(xb + 16u);
+            if (ntile == 0u) {
+                acc0 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a0, b0, acc0);
+                acc0 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a1, b1, acc0);
+            } else if (ntile == 1u) {
+                acc1 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a0, b0, acc1);
+                acc1 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a1, b1, acc1);
+            } else if (ntile == 2u) {
+                acc2 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a0, b0, acc2);
+                acc2 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a1, b1, acc2);
+            } else {
+                acc3 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a0, b0, acc3);
+                acc3 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a1, b1, acc3);
+            }
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (uint32_t ntile = 0; ntile < N_TILES_PER_WARP; ntile++) {
+        const uint32_t tok = block_n + ntile * 16u + lane16;
+        if (tok >= n_tokens) continue;
+        ds4_q8_float8_t acc = ntile == 0u ? acc0 : (ntile == 1u ? acc1 : (ntile == 2u ? acc2 : acc3));
+#pragma unroll
+        for (uint32_t j = 0; j < 8u; j++) {
+            const uint32_t row = warp_m + 2u * j + (lane >> 4u);
+            if (row < out_dim) out[(uint64_t)tok * out_dim + row] = acc[j];
+        }
+    }
+}
+
 template <int TILES_N=8, int BM=16, int BN=16, int BK=16>
 __global__ static void matmul_q8_0_f32_batch_wmma_onthefly_kernel(
         float *out,

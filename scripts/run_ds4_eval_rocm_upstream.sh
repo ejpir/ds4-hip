@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
+source "$ROOT_DIR/scripts/rocm_settings.sh"
 
 MODEL_DEFAULT="/home/nick/.cache/huggingface/hub/models--cyberneurova--CyberNeurova-DeepSeek-V4-Flash-abliterated-GGUF/snapshots/665c8e035e2602d12d28b84920808b158f337e09/cyberneurova-DeepSeek-V4-Flash-abliterated-Q2_K.gguf"
 STAMP="$(date +%Y%m%d_%H%M%S)"
@@ -80,21 +81,14 @@ fi
 
 make ds4-eval-rocm-upstream -j"$(nproc)"
 
-# Optimized upstream-shaped ROCm settings. Keep these explicit rather than
-# relying on DS4_SERVER_FAST_FULL translations from the server launcher.
+# Optimized upstream-shaped ROCm settings. Keep eval on the shared
+# quality-gated decode profile rather than the experimental FAST_FULL profile;
+# broader WMMA, prefill-fast, and cuBLAS/Q8 batch toggles can change logits
+# enough to alter greedy eval trajectories on aggressive Q2 models.
 export DS4_LOCK_FILE="${DS4_LOCK_FILE:-/tmp/ds4-eval-rocm-${STAMP}.lock}"
-export DS4_CUDA_COPY_MODEL="${DS4_CUDA_COPY_MODEL:-1}"
-export DS4_CUDA_Q8_PREQUANT_DECODE="${DS4_CUDA_Q8_PREQUANT_DECODE:-1}"
-export DS4_CUDA_DISABLE_SPLITK_ATTN_OUT_LOW="${DS4_CUDA_DISABLE_SPLITK_ATTN_OUT_LOW:-1}"
-export DS4_CUDA_DISABLE_SHARED_GATE_UP_FUSED_W32="${DS4_CUDA_DISABLE_SHARED_GATE_UP_FUSED_W32:-1}"
-
-# Do not enable experimental opt-in kernels here.  Earlier eval parity runs
-# used only the quality-gated FAST_FULL decode defaults above; broader WMMA,
-# prefill-fast, and cuBLAS/Q8 batch toggles can change logits enough to alter
-# greedy eval trajectories on aggressive Q2 models.
-
-export DS4_METAL_PREFILL_CHUNK="${DS4_METAL_PREFILL_CHUNK:-2048}"
-export DS4_SESSION_PROGRESS_CHUNK_TOKENS="${DS4_SESSION_PROGRESS_CHUNK_TOKENS:-$DS4_METAL_PREFILL_CHUNK}"
+ds4_rocm_apply_quality_decode_defaults
+export DS4_SERVER_PREFILL_CHUNK="${DS4_SERVER_PREFILL_CHUNK:-${DS4_METAL_PREFILL_CHUNK:-2048}}"
+ds4_rocm_apply_prefill_env 128
 
 args=("$EVAL_BIN" -m "$MODEL" --cuda --trace "$TRACE")
 if [[ "${DS4_EVAL_TUI:-0}" != "1" ]]; then

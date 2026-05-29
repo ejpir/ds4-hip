@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
+source "$ROOT_DIR/scripts/rocm_settings.sh"
 
 MODEL_DEFAULT="/home/nick/.cache/huggingface/hub/models--cyberneurova--CyberNeurova-DeepSeek-V4-Flash-abliterated-GGUF/snapshots/665c8e035e2602d12d28b84920808b158f337e09/cyberneurova-DeepSeek-V4-Flash-abliterated-Q2_K.gguf"
 
@@ -120,13 +121,10 @@ fi
 
 # Quality-gated production decode defaults. Keep experimental opt-in kernels out
 # of the agent launcher unless the caller explicitly exports them.
-export DS4_CUDA_COPY_MODEL="${DS4_CUDA_COPY_MODEL:-1}"
-export DS4_CUDA_Q8_PREQUANT_DECODE="${DS4_CUDA_Q8_PREQUANT_DECODE:-1}"
-export DS4_CUDA_DISABLE_SPLITK_ATTN_OUT_LOW="${DS4_CUDA_DISABLE_SPLITK_ATTN_OUT_LOW:-1}"
-export DS4_CUDA_DISABLE_SHARED_GATE_UP_FUSED_W32="${DS4_CUDA_DISABLE_SHARED_GATE_UP_FUSED_W32:-1}"
+ds4_rocm_apply_quality_decode_defaults
 export DS4_AGENT_PREFILL_CHUNK="${DS4_AGENT_PREFILL_CHUNK:-${DS4_SERVER_PREFILL_CHUNK:-2048}}"
-export DS4_METAL_PREFILL_CHUNK="$DS4_AGENT_PREFILL_CHUNK"
-export DS4_SESSION_PROGRESS_CHUNK_TOKENS="${DS4_SESSION_PROGRESS_CHUNK_TOKENS:-$DS4_AGENT_PREFILL_CHUNK}"
+export DS4_SERVER_PREFILL_CHUNK="$DS4_AGENT_PREFILL_CHUNK"
+ds4_rocm_apply_prefill_env 128
 
 args=("$@")
 if ! arg_present -m --model "${args[@]}"; then

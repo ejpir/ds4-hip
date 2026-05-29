@@ -30,10 +30,10 @@ Environment:
   DS4_SERVER_LOG=/tmp/ds4-server.log
   DS4_SERVER_PID=/tmp/ds4-server.pid
   DS4_SERVER_TRACE=FILE           Optional trace file
-  DS4_SERVER_FAST_FULL=1          Max-performance preset: high perflevel, device tensors, staged full-copy, best prefill+decode flags
+  DS4_SERVER_FAST_FULL=1          Max-performance preset: high perflevel, device tensors, dynamic prefill, staged full-copy, best prefill+decode flags
   DS4_SERVER_PREFILL_HEARTBEAT_SEC=2  Prefill heartbeat interval; 0 disables
   DS4_SERVER_PREFILL_CHUNK=N      Set prefill chunk/allocation cap
-  DS4_SERVER_DYNAMIC_PREFILL=1    Per-request prefill chunk cap from new suffix size
+  DS4_SERVER_DYNAMIC_PREFILL=1    Per-request prefill chunk cap from new suffix size; FAST_FULL default 1
   DS4_SERVER_DYNAMIC_PREFILL_MIN/MAX=N  Clamp dynamic chunk cap; defaults 128/4096
   DS4_SERVER_DECODE_PREFILL=1     Safest prompt path: prefill via decode kernels
   DS4_SERVER_PREFILL_STAGE_PROFILE=1  Log/sync prefill stages to isolate crashes
@@ -59,6 +59,9 @@ Environment:
   DS4_SERVER_Q8_REPACK_SPLIT16=1 Opt-in split-major Q8_0 repack for attn_output/shared-down; uses ~3.2 GiB VRAM
   DS4_SERVER_Q8_WMMA_FAST=1      Opt-in q-side FP16 Q8 WMMA prefill path; uses ~3.35 GiB VRAM
                                 Enabled by DS4_SERVER_FAST_FULL=1.
+  DS4_SERVER_Q8_WMMA_4W=1        Experimental 4-wave 64x64 Q8 WMMA path for large prefill batches; FAST_FULL default 1
+  DS4_SERVER_Q8_WMMA_4W_MIN_TOKENS=N Minimum token batch for 4-wave Q8 WMMA; default 256
+  DS4_SERVER_Q8_WMMA_4W_MIN_OUT=N Minimum output rows for 4-wave Q8 WMMA; default 1024
   DS4_SERVER_Q8_PREQUANT_DECODE=0 Disable FAST_FULL q-side prequantized Q8 decode matvecs in upstream-shaped ROCm
   DS4_SERVER_Q8_DECODE_RPB=1|2|4|8|16|32 Rows/block for single-token Q8 decode matvecs; FAST_FULL default 1
   DS4_SERVER_Q8_HC_DECODE_RPB=1|2|4|8|16|32 Rows/block for fused Q8 HC-expand decode matvecs; FAST_FULL default 16
@@ -170,86 +173,13 @@ export DS4_SERVER_TOOL_CONTEXT_DUP_CHARS="${DS4_SERVER_TOOL_CONTEXT_DUP_CHARS:-2
 SERVER_BIN="./ds4-server-rocm-upstream"
 SERVER_MAKE_TARGET="ds4-server-rocm-upstream"
 
-export_pair_flag() {
-  local suffix="$1"
-  local value="${2:-0}"
-  if [[ "$value" == "1" ]]; then
-    export "DS4_CUDA_${suffix}=1"
-    export "DS4_HIP_${suffix}=1"
-  fi
-}
+source "$ROOT_DIR/scripts/rocm_settings.sh"
 
-export_pair_value() {
-  local suffix="$1"
-  local value="${2:-}"
-  if [[ -n "$value" ]]; then
-    export "DS4_CUDA_${suffix}=$value"
-    export "DS4_HIP_${suffix}=$value"
-  fi
-}
-
-# One-command max-performance profile.  Individual env vars may still be set
-# by the caller before this script to override these defaults.
+# One-command max-performance profile. Individual env vars may still be set
+# by the caller before this script to override these defaults. Shared ROCm
+# defaults live in scripts/rocm_settings.sh.
 if [[ "${DS4_SERVER_FAST_FULL:-0}" == "1" ]]; then
-  export DS4_SERVER_PERFLEVEL="${DS4_SERVER_PERFLEVEL-high}"
-  export DS4_SERVER_PREFILL_CHUNK="${DS4_SERVER_PREFILL_CHUNK:-4096}"
-  export DS4_SERVER_DEVICE_TENSORS="${DS4_SERVER_DEVICE_TENSORS:-1}"
-  export DS4_SERVER_COPY_MODEL="${DS4_SERVER_COPY_MODEL:-1}"
-  export DS4_SERVER_COPY_MODEL_CHUNK_MB="${DS4_SERVER_COPY_MODEL_CHUNK_MB:-}"
-  export DS4_SERVER_PREFILL_RAW_FAST="${DS4_SERVER_PREFILL_RAW_FAST:-1}"
-  export DS4_SERVER_PREFILL_MIXED_FAST="${DS4_SERVER_PREFILL_MIXED_FAST:-1}"
-  export DS4_SERVER_ATTENTION_INDEXED_FUSED_VALUE_GROUP="${DS4_SERVER_ATTENTION_INDEXED_FUSED_VALUE_GROUP:-4}"
-  export DS4_SERVER_INDEXED_HEADS32="${DS4_SERVER_INDEXED_HEADS32:-1}"
-  export DS4_SERVER_ATTN_Q_B_CUBLAS="${DS4_SERVER_ATTN_Q_B_CUBLAS:-1}"
-  export DS4_SERVER_ATTN_Q_B_PRELOAD="${DS4_SERVER_ATTN_Q_B_PRELOAD:-1}"
-  export DS4_SERVER_ATTN_Q_B_F16_OUT="${DS4_SERVER_ATTN_Q_B_F16_OUT:-1}"
-  # The HC split-stride fix makes the f16-output projection shortcuts safe for
-  # the fast preset in short natural probes; keep explicit kill switches.
-  export DS4_SERVER_ATTENTION_OUTPUT_F16_OUT="${DS4_SERVER_ATTENTION_OUTPUT_F16_OUT:-1}"
-  export DS4_SERVER_SHARED_DOWN_F16_OUT="${DS4_SERVER_SHARED_DOWN_F16_OUT:-1}"
-  export DS4_SERVER_Q8_BATCH_FAST="${DS4_SERVER_Q8_BATCH_FAST:-1}"
-  export DS4_SERVER_Q8_BATCH_SHARED_X="${DS4_SERVER_Q8_BATCH_SHARED_X:-1}"
-  export DS4_SERVER_Q8_BATCH_TILE="${DS4_SERVER_Q8_BATCH_TILE:-32}"
-  export DS4_SERVER_Q8_BATCH_RPB="${DS4_SERVER_Q8_BATCH_RPB:-32}"
-  export DS4_SERVER_Q8_BATCH_SHARED_X_BLOCKS="${DS4_SERVER_Q8_BATCH_SHARED_X_BLOCKS:-32}"
-  export DS4_SERVER_Q8_GROUPED_BATCH_TILE="${DS4_SERVER_Q8_GROUPED_BATCH_TILE:-32}"
-  export DS4_SERVER_MOE_EXPERT_BATCH="${DS4_SERVER_MOE_EXPERT_BATCH:-1}"
-  export DS4_SERVER_MOE_GATE_TILE="${DS4_SERVER_MOE_GATE_TILE:-4}"
-  export DS4_SERVER_MOE_DOWN_TILE="${DS4_SERVER_MOE_DOWN_TILE:-4}"
-  export DS4_SERVER_MOE_GATE_RPB="${DS4_SERVER_MOE_GATE_RPB:-16}"
-  export DS4_SERVER_MOE_DOWN_RPB="${DS4_SERVER_MOE_DOWN_RPB:-16}"
-  export DS4_SERVER_MOE_EXPERT_SHARED_X="${DS4_SERVER_MOE_EXPERT_SHARED_X:-1}"
-  export DS4_SERVER_MOE_EXPERT_SHARED_MID="${DS4_SERVER_MOE_EXPERT_SHARED_MID:-1}"
-  export DS4_SERVER_Q8_REPACK="${DS4_SERVER_Q8_REPACK:-0}"
-  export DS4_SERVER_Q8_REPACK_SPLIT16="${DS4_SERVER_Q8_REPACK_SPLIT16:-0}"
-  export DS4_SERVER_Q8_WMMA_FAST="${DS4_SERVER_Q8_WMMA_FAST:-1}"
-  export DS4_SERVER_Q8_PREQUANT_DECODE="${DS4_SERVER_Q8_PREQUANT_DECODE:-1}"
-  export DS4_SERVER_Q8_DECODE_RPB="${DS4_SERVER_Q8_DECODE_RPB:-1}"
-  export DS4_SERVER_Q8_HC_DECODE_RPB="${DS4_SERVER_Q8_HC_DECODE_RPB:-16}"
-  export DS4_SERVER_ATTN_OUT_LOW_DECODE_RPB="${DS4_SERVER_ATTN_OUT_LOW_DECODE_RPB:-32}"
-  export DS4_SERVER_OLDHIP_ATTENTION_DECODE="${DS4_SERVER_OLDHIP_ATTENTION_DECODE:-1}"
-  export DS4_SERVER_QKV_PAIR_DECODE="${DS4_SERVER_QKV_PAIR_DECODE:-1}"
-  export DS4_SERVER_MOE_DECODE_RPB="${DS4_SERVER_MOE_DECODE_RPB:-1}"
-  export DS4_SERVER_MOE_DECODE_Q8K_DOWN="${DS4_SERVER_MOE_DECODE_Q8K_DOWN:-1}"
-  export DS4_SERVER_ATTN_OUT_LOW_SPLITK="${DS4_SERVER_ATTN_OUT_LOW_SPLITK:-0}"
-  export DS4_SERVER_SHARED_GATE_UP_FUSED_W32="${DS4_SERVER_SHARED_GATE_UP_FUSED_W32:-0}"
-  export DS4_CUDA_DISABLE_SHARED_GATE_UP_PAIR_SWIGLU="${DS4_CUDA_DISABLE_SHARED_GATE_UP_PAIR_SWIGLU:-1}"
-  export DS4_SERVER_OVERLAP_SHARED_GATE_UP="${DS4_SERVER_OVERLAP_SHARED_GATE_UP:-1}"
-  export DS4_SERVER_MOE_WMMA_HOT="${DS4_SERVER_MOE_WMMA_HOT:-1}"
-  export DS4_SERVER_MOE_WMMA_GATE_HOT="${DS4_SERVER_MOE_WMMA_GATE_HOT:-8}"
-  export DS4_SERVER_MOE_WMMA_DOWN_HOT="${DS4_SERVER_MOE_WMMA_DOWN_HOT:-8}"
-  export DS4_SERVER_MOE_WMMA_MTILES="${DS4_SERVER_MOE_WMMA_MTILES:-16}"
-  export DS4_SERVER_MOE_WMMA_F16_DOWN_ALL="${DS4_SERVER_MOE_WMMA_F16_DOWN_ALL:-1}"
-  export DS4_SERVER_MOE_WMMA_F16_SPLIT="${DS4_SERVER_MOE_WMMA_F16_SPLIT:-1}"
-  export DS4_SERVER_MOE_WMMA_F16_SPLIT_MIN="${DS4_SERVER_MOE_WMMA_F16_SPLIT_MIN:-64}"
-  export DS4_SERVER_MOE_WMMA_X_F16="${DS4_SERVER_MOE_WMMA_X_F16:-1}"
-
-  # Upstream-shaped ROCm-only extras from the fastest CLI/bench recipe.
-  export DS4_CUDA_SHARED_GATE_UP_BATCH_FUSED="${DS4_CUDA_SHARED_GATE_UP_BATCH_FUSED:-1}"
-  export DS4_CUDA_SHARED_DOWN_CUBLAS="${DS4_CUDA_SHARED_DOWN_CUBLAS:-1}"
-  export DS4_CUDA_ATTENTION_OUTPUT_CUBLAS_ALL="${DS4_CUDA_ATTENTION_OUTPUT_CUBLAS_ALL:-1}"
-  export DS4_CUDA_ATTENTION_OUTPUT_PACKED_B_CUBLAS="${DS4_CUDA_ATTENTION_OUTPUT_PACKED_B_CUBLAS:-1}"
-  export DS4_CUDA_ATTENTION_OUTPUT_INTERLEAVED_B_CUBLAS="${DS4_CUDA_ATTENTION_OUTPUT_INTERLEAVED_B_CUBLAS:-1}"
+  ds4_rocm_apply_fast_full_defaults 4096
 fi
 
 if [[ ! -f "$MODEL" ]]; then
@@ -306,27 +236,9 @@ if [[ -n "${DS4_SERVER_PERFLEVEL:-}" ]]; then
   fi
 fi
 
-# Conservative default: managed tensors. For faster but less battle-tested mode:
-#   DS4_SERVER_DEVICE_TENSORS=1 scripts/start_ds4_server.sh
-if [[ "${DS4_SERVER_DEVICE_TENSORS:-0}" != "1" ]]; then
-  export DS4_HIP_MANAGED_TENSORS=1
-else
-  unset DS4_HIP_MANAGED_TENSORS || true
-fi
-
-# Server progress/cancellation defaults. Long prompts use cancellable
-# layer-by-layer prefill; cap chunks so a client abort is noticed sooner.
-# Device tensors can drive much larger HIP power/driver bursts during batched
-# prefill, so keep that mode on smaller chunks unless explicitly overridden.
-if [[ -n "${DS4_SERVER_PREFILL_CHUNK:-}" ]]; then
-  export DS4_METAL_PREFILL_CHUNK="$DS4_SERVER_PREFILL_CHUNK"
-  export DS4_SESSION_PROGRESS_CHUNK_TOKENS="${DS4_SESSION_PROGRESS_CHUNK_TOKENS:-$DS4_SERVER_PREFILL_CHUNK}"
-elif [[ "${DS4_SERVER_DEVICE_TENSORS:-0}" == "1" ]]; then
-  export DS4_SESSION_PROGRESS_CHUNK_TOKENS="${DS4_SESSION_PROGRESS_CHUNK_TOKENS:-128}"
-  export DS4_METAL_PREFILL_CHUNK="${DS4_METAL_PREFILL_CHUNK:-$DS4_SESSION_PROGRESS_CHUNK_TOKENS}"
-else
-  export DS4_SESSION_PROGRESS_CHUNK_TOKENS="${DS4_SESSION_PROGRESS_CHUNK_TOKENS:-512}"
-fi
+# Tensor placement and prefill chunk env are shared with the other ROCm scripts.
+ds4_rocm_apply_tensor_env
+ds4_rocm_apply_prefill_env 128 512
 
 if [[ "${DS4_SERVER_DECODE_PREFILL:-0}" == "1" ]]; then
   export DS4_SESSION_DECODE_PREFILL=1
@@ -342,219 +254,9 @@ if [[ "${DS4_SERVER_PREFILL_MIXED_FAST:-0}" == "1" ]]; then
   export DS4_HIP_PREFILL_MIXED_FAST=1
 fi
 
-# Upstream-shaped ROCm consumes the historical CUDA env names. Export both CUDA
-# and HIP aliases from the DS4_SERVER_* preset so older alias checks still work.
-export_pair_flag PREFILL_RAW_FAST "${DS4_SERVER_PREFILL_RAW_FAST:-0}"
-export_pair_flag PREFILL_MIXED_FAST "${DS4_SERVER_PREFILL_MIXED_FAST:-0}"
-export_pair_value ATTENTION_INDEXED_FUSED_VALUE_GROUP "${DS4_SERVER_ATTENTION_INDEXED_FUSED_VALUE_GROUP:-}"
-export_pair_value ATTENTION_INDEXED_SPLIT_VALUE_GROUP "${DS4_SERVER_ATTENTION_INDEXED_SPLIT_VALUE_GROUP:-}"
-export_pair_flag INDEXED_HEADS32 "${DS4_SERVER_INDEXED_HEADS32:-0}"
-export_pair_flag Q8_BATCH_FAST "${DS4_SERVER_Q8_BATCH_FAST:-0}"
-export_pair_value Q8_BATCH_TILE "${DS4_SERVER_Q8_BATCH_TILE:-}"
-export_pair_value Q8_BATCH_RPB "${DS4_SERVER_Q8_BATCH_RPB:-}"
-export_pair_flag Q8_BATCH_SHARED_X "${DS4_SERVER_Q8_BATCH_SHARED_X:-0}"
-export_pair_value Q8_BATCH_SHARED_X_BLOCKS "${DS4_SERVER_Q8_BATCH_SHARED_X_BLOCKS:-}"
-export_pair_value Q8_GROUPED_BATCH_TILE "${DS4_SERVER_Q8_GROUPED_BATCH_TILE:-}"
-export_pair_flag Q8_REPACK "${DS4_SERVER_Q8_REPACK:-0}"
-export_pair_flag Q8_REPACK_SPLIT16 "${DS4_SERVER_Q8_REPACK_SPLIT16:-0}"
-export_pair_flag Q8_WMMA_FAST "${DS4_SERVER_Q8_WMMA_FAST:-0}"
-export_pair_value Q8_DECODE_RPB "${DS4_SERVER_Q8_DECODE_RPB:-}"
-export_pair_value Q8_HC_DECODE_RPB "${DS4_SERVER_Q8_HC_DECODE_RPB:-}"
-export_pair_value ATTN_OUT_LOW_DECODE_RPB "${DS4_SERVER_ATTN_OUT_LOW_DECODE_RPB:-}"
-export_pair_flag OLDHIP_ATTENTION_DECODE "${DS4_SERVER_OLDHIP_ATTENTION_DECODE:-0}"
-export_pair_flag QKV_PAIR_DECODE "${DS4_SERVER_QKV_PAIR_DECODE:-0}"
-export_pair_flag OVERLAP_SHARED_GATE_UP "${DS4_SERVER_OVERLAP_SHARED_GATE_UP:-0}"
-export_pair_flag MOE_EXPERT_BATCH "${DS4_SERVER_MOE_EXPERT_BATCH:-0}"
-export_pair_value MOE_EXPERT_TILE "${DS4_SERVER_MOE_EXPERT_TILE:-}"
-export_pair_value MOE_GATE_TILE "${DS4_SERVER_MOE_GATE_TILE:-}"
-export_pair_value MOE_DOWN_TILE "${DS4_SERVER_MOE_DOWN_TILE:-}"
-export_pair_value MOE_GATE_RPB "${DS4_SERVER_MOE_GATE_RPB:-}"
-export_pair_value MOE_DOWN_RPB "${DS4_SERVER_MOE_DOWN_RPB:-}"
-export_pair_value MOE_DECODE_RPB "${DS4_SERVER_MOE_DECODE_RPB:-}"
-export_pair_flag MOE_DECODE_Q8K_DOWN "${DS4_SERVER_MOE_DECODE_Q8K_DOWN:-0}"
-export_pair_flag MOE_EXPERT_SHARED_X "${DS4_SERVER_MOE_EXPERT_SHARED_X:-0}"
-export_pair_flag MOE_EXPERT_SHARED_MID "${DS4_SERVER_MOE_EXPERT_SHARED_MID:-0}"
-export_pair_flag MOE_Q8K_DOWN "${DS4_SERVER_MOE_Q8K_DOWN:-0}"
-export_pair_value MOE_Q8K_DOWN_LAYERS "${DS4_SERVER_MOE_Q8K_DOWN_LAYERS:-}"
-export_pair_flag MOE_Q8K_DOWN_DIRECT "${DS4_SERVER_MOE_Q8K_DOWN_DIRECT:-0}"
-export_pair_value MOE_Q8K_DOWN_TILE "${DS4_SERVER_MOE_Q8K_DOWN_TILE:-}"
-export_pair_flag MOE_WMMA_HOT "${DS4_SERVER_MOE_WMMA_HOT:-0}"
-export_pair_value MOE_WMMA_GATE_HOT "${DS4_SERVER_MOE_WMMA_GATE_HOT:-}"
-export_pair_value MOE_WMMA_DOWN_HOT "${DS4_SERVER_MOE_WMMA_DOWN_HOT:-}"
-export_pair_value MOE_WMMA_MTILES "${DS4_SERVER_MOE_WMMA_MTILES:-}"
-export_pair_flag MOE_WMMA_F16_DOWN_ALL "${DS4_SERVER_MOE_WMMA_F16_DOWN_ALL:-0}"
-export_pair_flag MOE_WMMA_F16_SPLIT "${DS4_SERVER_MOE_WMMA_F16_SPLIT:-0}"
-export_pair_value MOE_WMMA_F16_SPLIT_MIN "${DS4_SERVER_MOE_WMMA_F16_SPLIT_MIN:-}"
-export_pair_flag MOE_WMMA_X_F16 "${DS4_SERVER_MOE_WMMA_X_F16:-0}"
-export_pair_flag MOE_SLOT_PARTIAL "${DS4_SERVER_MOE_SLOT_PARTIAL:-0}"
-export_pair_flag COPY_MODEL "${DS4_SERVER_COPY_MODEL:-0}"
-export_pair_value COPY_MODEL_CHUNK_MB "${DS4_SERVER_COPY_MODEL_CHUNK_MB:-}"
-
-if [[ -n "${DS4_SERVER_ATTENTION_INDEXED_FUSED_VALUE_GROUP:-}" ]]; then
-  export DS4_HIP_ATTENTION_INDEXED_FUSED_VALUE_GROUP="$DS4_SERVER_ATTENTION_INDEXED_FUSED_VALUE_GROUP"
-fi
-if [[ -n "${DS4_SERVER_ATTENTION_INDEXED_SPLIT_VALUE_GROUP:-}" ]]; then
-  export DS4_HIP_ATTENTION_INDEXED_SPLIT_VALUE_GROUP="$DS4_SERVER_ATTENTION_INDEXED_SPLIT_VALUE_GROUP"
-fi
-if [[ "${DS4_SERVER_ATTN_Q_B_CUBLAS:-0}" == "1" ]]; then
-  export DS4_CUDA_ATTN_Q_B_CUBLAS=1
-  export DS4_HIP_ATTN_Q_B_CUBLAS=1
-fi
-if [[ "${DS4_SERVER_ATTN_Q_B_PRELOAD:-0}" == "1" ]]; then
-  export DS4_CUDA_ATTN_Q_B_PRELOAD=1
-  export DS4_HIP_ATTN_Q_B_PRELOAD=1
-fi
-if [[ "${DS4_SERVER_ATTN_Q_B_F16_OUT:-0}" == "1" ]]; then
-  export DS4_CUDA_ATTN_Q_B_F16_OUT=1
-  export DS4_HIP_ATTN_Q_B_F16_OUT=1
-fi
-if [[ "${DS4_SERVER_ATTENTION_OUTPUT_F16_OUT:-0}" == "1" ]]; then
-  export DS4_CUDA_ATTENTION_OUTPUT_F16_OUT=1
-  export DS4_HIP_ATTENTION_OUTPUT_F16_OUT=1
-fi
-if [[ -n "${DS4_SERVER_ATTENTION_OUTPUT_F16_OUT_MIN_TOKENS:-}" ]]; then
-  export DS4_CUDA_ATTENTION_OUTPUT_F16_OUT_MIN_TOKENS="$DS4_SERVER_ATTENTION_OUTPUT_F16_OUT_MIN_TOKENS"
-  export DS4_HIP_ATTENTION_OUTPUT_F16_OUT_MIN_TOKENS="$DS4_SERVER_ATTENTION_OUTPUT_F16_OUT_MIN_TOKENS"
-fi
-if [[ "${DS4_SERVER_SHARED_DOWN_F16_OUT:-0}" == "1" ]]; then
-  export DS4_CUDA_SHARED_DOWN_F16_OUT=1
-  export DS4_HIP_SHARED_DOWN_F16_OUT=1
-fi
-if [[ -n "${DS4_SERVER_SHARED_DOWN_F16_OUT_MIN_TOKENS:-}" ]]; then
-  export DS4_CUDA_SHARED_DOWN_F16_OUT_MIN_TOKENS="$DS4_SERVER_SHARED_DOWN_F16_OUT_MIN_TOKENS"
-  export DS4_HIP_SHARED_DOWN_F16_OUT_MIN_TOKENS="$DS4_SERVER_SHARED_DOWN_F16_OUT_MIN_TOKENS"
-fi
-if [[ "${DS4_SERVER_Q8_BATCH_FAST:-0}" == "1" ]]; then
-  export DS4_HIP_Q8_BATCH_FAST=1
-fi
-if [[ -n "${DS4_SERVER_Q8_BATCH_TILE:-}" ]]; then
-  export DS4_HIP_Q8_BATCH_TILE="$DS4_SERVER_Q8_BATCH_TILE"
-fi
-if [[ -n "${DS4_SERVER_Q8_BATCH_RPB:-}" ]]; then
-  export DS4_HIP_Q8_BATCH_RPB="$DS4_SERVER_Q8_BATCH_RPB"
-fi
-if [[ "${DS4_SERVER_Q8_BATCH_SHARED_X:-0}" == "1" ]]; then
-  export DS4_HIP_Q8_BATCH_FAST=1
-  export DS4_HIP_Q8_BATCH_SHARED_X=1
-fi
-if [[ -n "${DS4_SERVER_Q8_BATCH_SHARED_X_BLOCKS:-}" ]]; then
-  export DS4_HIP_Q8_BATCH_SHARED_X_BLOCKS="$DS4_SERVER_Q8_BATCH_SHARED_X_BLOCKS"
-fi
-if [[ -n "${DS4_SERVER_Q8_GROUPED_BATCH_TILE:-}" ]]; then
-  export DS4_HIP_Q8_GROUPED_BATCH_TILE="$DS4_SERVER_Q8_GROUPED_BATCH_TILE"
-fi
-if [[ "${DS4_SERVER_Q8_REPACK:-0}" == "1" ]]; then
-  export DS4_HIP_Q8_REPACK=1
-fi
-if [[ "${DS4_SERVER_Q8_REPACK_SPLIT16:-0}" == "1" ]]; then
-  export DS4_HIP_Q8_REPACK_SPLIT16=1
-fi
-if [[ "${DS4_SERVER_Q8_WMMA_FAST:-0}" == "1" ]]; then
-  export DS4_HIP_Q8_WMMA_FAST=1
-fi
-if [[ "${DS4_SERVER_Q8_PREQUANT_DECODE:-0}" == "1" ]]; then
-  export DS4_CUDA_Q8_PREQUANT_DECODE=1
-elif [[ -n "${DS4_SERVER_Q8_PREQUANT_DECODE:-}" ]]; then
-  unset DS4_CUDA_Q8_PREQUANT_DECODE || true
-fi
-if [[ "${DS4_SERVER_ATTN_OUT_LOW_SPLITK:-0}" == "1" ]]; then
-  unset DS4_CUDA_DISABLE_SPLITK_ATTN_OUT_LOW || true
-else
-  export DS4_CUDA_DISABLE_SPLITK_ATTN_OUT_LOW=1
-fi
-if [[ "${DS4_SERVER_SHARED_GATE_UP_FUSED_W32:-1}" == "1" ]]; then
-  unset DS4_CUDA_DISABLE_SHARED_GATE_UP_FUSED_W32 || true
-else
-  export DS4_CUDA_DISABLE_SHARED_GATE_UP_FUSED_W32=1
-fi
-if [[ "${DS4_SERVER_Q8_HIPBLASLT:-0}" == "1" ]]; then
-  export DS4_HIP_Q8_HIPBLASLT=1
-fi
-if [[ -n "${DS4_SERVER_Q8_HIPBLASLT_MAX_TOKENS:-}" ]]; then
-  export DS4_HIP_Q8_HIPBLASLT_MAX_TOKENS="$DS4_SERVER_Q8_HIPBLASLT_MAX_TOKENS"
-fi
-if [[ "${DS4_SERVER_MOE_EXPERT_BATCH:-0}" == "1" ]]; then
-  export DS4_HIP_MOE_EXPERT_BATCH=1
-fi
-if [[ -n "${DS4_SERVER_MOE_EXPERT_TILE:-}" ]]; then
-  export DS4_HIP_MOE_EXPERT_TILE="$DS4_SERVER_MOE_EXPERT_TILE"
-fi
-if [[ -n "${DS4_SERVER_MOE_GATE_TILE:-}" ]]; then
-  export DS4_HIP_MOE_GATE_TILE="$DS4_SERVER_MOE_GATE_TILE"
-fi
-if [[ -n "${DS4_SERVER_MOE_DOWN_TILE:-}" ]]; then
-  export DS4_HIP_MOE_DOWN_TILE="$DS4_SERVER_MOE_DOWN_TILE"
-fi
-if [[ -n "${DS4_SERVER_MOE_GATE_RPB:-}" ]]; then
-  export DS4_HIP_MOE_GATE_RPB="$DS4_SERVER_MOE_GATE_RPB"
-fi
-if [[ -n "${DS4_SERVER_MOE_DOWN_RPB:-}" ]]; then
-  export DS4_HIP_MOE_DOWN_RPB="$DS4_SERVER_MOE_DOWN_RPB"
-fi
-if [[ "${DS4_SERVER_MOE_EXPERT_SHARED_X:-0}" == "1" ]]; then
-  export DS4_HIP_MOE_EXPERT_SHARED_X=1
-fi
-if [[ "${DS4_SERVER_MOE_EXPERT_SHARED_MID:-0}" == "1" ]]; then
-  export DS4_HIP_MOE_EXPERT_SHARED_MID=1
-fi
-if [[ "${DS4_SERVER_MOE_DECODE_Q8K_DOWN:-0}" == "1" ]]; then
-  export DS4_CUDA_MOE_DECODE_Q8K_DOWN=1
-  export DS4_HIP_MOE_DECODE_Q8K_DOWN=1
-fi
-if [[ "${DS4_SERVER_MOE_Q8K_DOWN:-0}" == "1" ]]; then
-  export DS4_HIP_MOE_Q8K_DOWN=1
-fi
-if [[ -n "${DS4_SERVER_MOE_Q8K_DOWN_LAYERS:-}" ]]; then
-  export DS4_HIP_MOE_Q8K_DOWN_LAYERS="$DS4_SERVER_MOE_Q8K_DOWN_LAYERS"
-fi
-if [[ "${DS4_SERVER_MOE_Q8K_DOWN_DIRECT:-0}" == "1" ]]; then
-  export DS4_HIP_MOE_Q8K_DOWN_DIRECT=1
-fi
-if [[ -n "${DS4_SERVER_MOE_Q8K_DOWN_TILE:-}" ]]; then
-  export DS4_HIP_MOE_Q8K_DOWN_TILE="$DS4_SERVER_MOE_Q8K_DOWN_TILE"
-fi
-if [[ "${DS4_SERVER_MOE_WMMA_HOT:-0}" == "1" ]]; then
-  export DS4_HIP_MOE_WMMA_HOT=1
-fi
-if [[ -n "${DS4_SERVER_MOE_WMMA_GATE_HOT:-}" ]]; then
-  export DS4_HIP_MOE_WMMA_GATE_HOT="$DS4_SERVER_MOE_WMMA_GATE_HOT"
-fi
-if [[ -n "${DS4_SERVER_MOE_WMMA_DOWN_HOT:-}" ]]; then
-  export DS4_HIP_MOE_WMMA_DOWN_HOT="$DS4_SERVER_MOE_WMMA_DOWN_HOT"
-fi
-if [[ -n "${DS4_SERVER_MOE_WMMA_MTILES:-}" ]]; then
-  export DS4_CUDA_MOE_WMMA_MTILES="$DS4_SERVER_MOE_WMMA_MTILES"
-  export DS4_HIP_MOE_WMMA_MTILES="$DS4_SERVER_MOE_WMMA_MTILES"
-fi
-if [[ "${DS4_SERVER_MOE_WMMA_F16_DOWN_ALL:-0}" == "1" ]]; then
-  export DS4_CUDA_MOE_WMMA_F16_DOWN_ALL=1
-  export DS4_HIP_MOE_WMMA_F16_DOWN_ALL=1
-fi
-if [[ "${DS4_SERVER_MOE_WMMA_F16_SPLIT:-0}" == "1" ]]; then
-  export DS4_CUDA_MOE_WMMA_F16_SPLIT=1
-  export DS4_HIP_MOE_WMMA_F16_SPLIT=1
-fi
-if [[ -n "${DS4_SERVER_MOE_WMMA_F16_SPLIT_MIN:-}" ]]; then
-  export DS4_CUDA_MOE_WMMA_F16_SPLIT_MIN="$DS4_SERVER_MOE_WMMA_F16_SPLIT_MIN"
-  export DS4_HIP_MOE_WMMA_F16_SPLIT_MIN="$DS4_SERVER_MOE_WMMA_F16_SPLIT_MIN"
-fi
-if [[ "${DS4_SERVER_MOE_WMMA_X_F16:-0}" == "1" ]]; then
-  export DS4_CUDA_MOE_WMMA_X_F16=1
-  export DS4_HIP_MOE_WMMA_X_F16=1
-fi
-if [[ "${DS4_SERVER_MOE_SLOT_PARTIAL:-0}" == "1" ]]; then
-  export DS4_CUDA_MOE_SLOT_PARTIAL=1
-  export DS4_HIP_MOE_SLOT_PARTIAL=1
-fi
-if [[ -n "${DS4_SERVER_MOE_WMMA_LAYERS:-}" ]]; then
-  export DS4_HIP_MOE_WMMA_LAYERS="$DS4_SERVER_MOE_WMMA_LAYERS"
-fi
-if [[ "${DS4_SERVER_COPY_MODEL:-0}" == "1" ]]; then
-  export DS4_HIP_COPY_MODEL=1
-fi
-if [[ -n "${DS4_SERVER_COPY_MODEL_CHUNK_MB:-}" ]]; then
-  export DS4_HIP_COPY_MODEL_CHUNK_MB="$DS4_SERVER_COPY_MODEL_CHUNK_MB"
-fi
+# Upstream-shaped ROCm consumes the historical CUDA/HIP env names. The shared
+# helper translates DS4_SERVER_* knobs to both alias families.
+ds4_rocm_export_runtime_env
 
 # Optional speed knobs, off by default for stability.
 if [[ "${DS4_SERVER_TOP_ONLY:-0}" == "1" ]]; then
