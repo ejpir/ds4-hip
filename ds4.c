@@ -10328,9 +10328,9 @@ static bool metal_graph_encode_decode_layer(
 #if defined(DS4_USE_GPU_API) && defined(DS4_USE_HIP)
     const bool overlap_shared_gate_up =
         fuse_shared_gate_up &&
-        (getenv("DS4_CUDA_OVERLAP_SHARED_GATE_UP") != NULL ||
-         getenv("DS4_HIP_OVERLAP_SHARED_GATE_UP") != NULL ||
-         getenv("DS4_SERVER_OVERLAP_SHARED_GATE_UP") != NULL);
+        (ds4_gpu_env_flag_enabled("DS4_CUDA_OVERLAP_SHARED_GATE_UP") ||
+         ds4_gpu_env_flag_enabled("DS4_HIP_OVERLAP_SHARED_GATE_UP") ||
+         ds4_gpu_env_flag_enabled("DS4_SERVER_OVERLAP_SHARED_GATE_UP"));
     if (ok && overlap_shared_gate_up) {
         shared_gate_up_async = ds4_gpu_shared_gate_up_swiglu_q8_0_async_tensor(
             g->shared_gate,
