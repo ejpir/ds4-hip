@@ -94,7 +94,7 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
                                                                               (const float *)raw_kv->ptr,
                                                                               n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
                                                                               1,
-                                                                              0,
+                                                                              n_raw - 1u,
                                                                               n_raw,
                                                                               raw_cap,
                                                                               raw_start,
