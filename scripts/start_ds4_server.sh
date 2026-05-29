@@ -12,10 +12,14 @@ cd "$ROOT_DIR"
 
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   cat <<'EOF'
-Usage: scripts/start_ds4_server.sh [-- extra ds4-server args]
+Usage: scripts/start_ds4_server.sh [--original] [-- extra ds4-server args]
+
+Options:
+  --original                      Use the original Antirez GGUF shipped/downloaded under ./gguf
+                                  instead of the local abliterated default.
 
 Environment:
-  DS4_MODEL=FILE                  GGUF model path
+  DS4_MODEL=FILE                  GGUF model path; overrides --original/default selection
   DS4_SERVER_HOST=127.0.0.1       Bind host
   DS4_SERVER_PORT=8000            Bind port
   DS4_SERVER_CTX=131072           Context size, standard default (128k)
@@ -111,6 +115,8 @@ Safety/perf toggles:
 
 Examples:
   scripts/start_ds4_server.sh
+  scripts/start_ds4_server.sh --original
+  DS4_SERVER_FAST_FULL=1 scripts/start_ds4_server.sh --original
   DS4_SERVER_CTX=65536 scripts/start_ds4_server.sh
   DS4_SERVER_PERFLEVEL=high DS4_SERVER_DEVICE_TENSORS=1 scripts/start_ds4_server.sh
   scripts/start_ds4_server.sh -- --quality
@@ -118,7 +124,33 @@ EOF
   exit 0
 fi
 
-MODEL_DEFAULT="/home/nick/.cache/huggingface/hub/models--cyberneurova--CyberNeurova-DeepSeek-V4-Flash-abliterated-GGUF/snapshots/665c8e035e2602d12d28b84920808b158f337e09/cyberneurova-DeepSeek-V4-Flash-abliterated-Q2_K.gguf"
+USE_ORIGINAL=0
+SERVER_EXTRA_ARGS=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --original)
+      USE_ORIGINAL=1
+      shift
+      ;;
+    --)
+      shift
+      SERVER_EXTRA_ARGS+=("$@")
+      break
+      ;;
+    *)
+      SERVER_EXTRA_ARGS+=("$1")
+      shift
+      ;;
+  esac
+done
+
+ABLITERATED_MODEL_DEFAULT="/home/nick/.cache/huggingface/hub/models--cyberneurova--CyberNeurova-DeepSeek-V4-Flash-abliterated-GGUF/snapshots/665c8e035e2602d12d28b84920808b158f337e09/cyberneurova-DeepSeek-V4-Flash-abliterated-Q2_K.gguf"
+ORIGINAL_MODEL_DEFAULT="$ROOT_DIR/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf"
+if [[ "$USE_ORIGINAL" == "1" ]]; then
+  MODEL_DEFAULT="$ORIGINAL_MODEL_DEFAULT"
+else
+  MODEL_DEFAULT="$ABLITERATED_MODEL_DEFAULT"
+fi
 MODEL="${DS4_MODEL:-$MODEL_DEFAULT}"
 HOST="${DS4_SERVER_HOST:-127.0.0.1}"
 PORT="${DS4_SERVER_PORT:-8000}"
@@ -550,10 +582,7 @@ fi
 
 # Pass additional server args after --, e.g.:
 #   scripts/start_ds4_server.sh -- --quality
-if [[ "${1:-}" == "--" ]]; then
-  shift
-fi
-args+=("$@")
+args+=("${SERVER_EXTRA_ARGS[@]}")
 
 : > "$LOG"
 echo "ds4-server: starting $SERVER_BIN on http://$HOST:$PORT"
