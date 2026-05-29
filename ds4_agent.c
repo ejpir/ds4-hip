@@ -1,4 +1,5 @@
 #include "ds4.h"
+#include "ds4_distributed.h"
 #include "ds4_kvstore.h"
 #include "linenoise.h"
 
@@ -60,6 +61,7 @@ typedef struct {
 typedef struct {
     ds4_engine_options engine;
     agent_generation_options gen;
+    bool non_interactive;
 } agent_config;
 
 typedef enum {
@@ -67,6 +69,7 @@ typedef enum {
     AGENT_WORKER_PREFILL,
     AGENT_WORKER_GENERATING,
     AGENT_WORKER_COMPACTING,
+    AGENT_WORKER_DRAINING,
     AGENT_WORKER_SAVING,
     AGENT_WORKER_ERROR,
     AGENT_WORKER_STOPPED,
@@ -416,6 +419,11 @@ static void usage(FILE *fp) {
         "  --dir-steering-file FILE\n"
         "  --dir-steering-ffn F\n"
         "  --dir-steering-attn F\n"
+        "\n"
+        "Distributed:\n");
+    ds4_dist_usage(fp);
+    fprintf(fp,
+        "\n"
         "  -h, --help             Show this help.\n"
         "\n"
         "Commands:\n"
@@ -461,7 +469,25 @@ static agent_config parse_options(int argc, char **argv) {
         if (!strcmp(arg, "-h") || !strcmp(arg, "--help")) {
             usage(stdout);
             exit(0);
-        } else if (!strcmp(arg, "-p") || !strcmp(arg, "--prompt")) {
+        }
+        char dist_parse_err[256] = {0};
+        ds4_dist_cli_parse_result dist_parse =
+            ds4_dist_parse_cli_arg(arg,
+                                   &i,
+                                   argc,
+                                   argv,
+                                   &c.engine.distributed,
+                                   dist_parse_err,
+                                   sizeof(dist_parse_err));
+        if (dist_parse == DS4_DIST_CLI_ERROR) {
+            fprintf(stderr,
+                    "ds4-agent: %s\n",
+                    dist_parse_err[0] ? dist_parse_err : "invalid distributed option");
+            exit(2);
+        }
+        if (dist_parse == DS4_DIST_CLI_MATCHED) continue;
+
+        if (!strcmp(arg, "-p") || !strcmp(arg, "--prompt")) {
             c.gen.prompt = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "-sys") || !strcmp(arg, "--system")) {
             c.gen.system = need_arg(&i, argc, argv, arg);
@@ -524,6 +550,18 @@ static agent_config parse_options(int argc, char **argv) {
 
     if (c.engine.directional_steering_file && !steering_scale_set)
         c.engine.directional_steering_ffn = 1.0f;
+    char dist_err[256];
+    if (ds4_dist_prepare_engine_options(&c.engine.distributed,
+                                        &c.engine,
+                                        dist_err,
+                                        sizeof(dist_err)) != 0) {
+        fprintf(stderr, "ds4-agent: %s\n", dist_err);
+        exit(2);
+    }
+    if (c.engine.distributed.role == DS4_DISTRIBUTED_WORKER) {
+        fprintf(stderr, "ds4-agent: --role worker is a serving mode; start workers with ./ds4\n");
+        exit(2);
+    }
     return c;
 }
 
@@ -3158,12 +3196,16 @@ static bool agent_kv_save_path(agent_worker *w, const char *path,
     ds4_kvstore_sha1_bytes_hex(text, text_len, sha);
     if (sha_out) memcpy(sha_out, sha, sizeof(sha));
 
-    uint64_t payload_bytes = ds4_session_payload_bytes(w->session);
-    if (payload_bytes == 0) {
-        snprintf(err, err_len, "session has no valid KV payload");
+    ds4_session_payload_file staged = {0};
+    char save_err[160] = {0};
+    if (ds4_session_stage_payload(w->session, &staged,
+                                  save_err, sizeof(save_err)) != 0) {
+        snprintf(err, err_len, "%s",
+                 save_err[0] ? save_err : "session has no valid KV payload");
         free(text);
         return false;
     }
+    uint64_t payload_bytes = staged.bytes;
 
     agent_buf tmpl = {0};
     agent_buf_puts(&tmpl, path);
@@ -3172,6 +3214,7 @@ static bool agent_kv_save_path(agent_worker *w, const char *path,
     int fd = mkstemp(tmp);
     if (fd < 0) {
         snprintf(err, err_len, "%s", strerror(errno));
+        ds4_session_payload_file_free(&staged);
         free(tmp);
         free(text);
         return false;
@@ -3182,6 +3225,7 @@ static bool agent_kv_save_path(agent_worker *w, const char *path,
         snprintf(err, err_len, "%s", strerror(errno));
         close(fd);
         unlink(tmp);
+        ds4_session_payload_file_free(&staged);
         free(tmp);
         free(text);
         return false;
@@ -3197,7 +3241,6 @@ static bool agent_kv_save_path(agent_worker *w, const char *path,
     uint8_t tb[4];
     ds4_kvstore_le_put32(tb, (uint32_t)text_len);
 
-    char save_err[160] = {0};
     errno = 0;
     bool ok = fwrite(h, 1, sizeof(h), fp) == sizeof(h) &&
               fwrite(tb, 1, sizeof(tb), fp) == sizeof(tb) &&
@@ -3221,6 +3264,7 @@ static bool agent_kv_save_path(agent_worker *w, const char *path,
         unlink(tmp);
     }
 
+    ds4_session_payload_file_free(&staged);
     free(tmp);
     free(text);
     return ok;
@@ -3390,6 +3434,55 @@ static bool agent_worker_reset_to_sysprompt(agent_worker *w, char *err, size_t e
     free(text);
     ds4_tokens_free(&sys);
     return true;
+}
+
+static bool agent_worker_should_stop(agent_worker *w) {
+    pthread_mutex_lock(&w->mu);
+    bool stop = w->stop;
+    pthread_mutex_unlock(&w->mu);
+    return stop;
+}
+
+static bool agent_worker_wait_distributed_route(agent_worker *w, char *err, size_t err_len) {
+    if (!w || !w->cfg ||
+        w->cfg->engine.distributed.role != DS4_DISTRIBUTED_COORDINATOR)
+        return true;
+
+    char last[160] = {0};
+    unsigned ticks = 0;
+    const struct timespec delay = {0, 250000000L};
+    for (;;) {
+        int ready = ds4_session_distributed_route_ready(w->session, err, err_len);
+        if (ready > 0) {
+            if (ticks != 0) {
+                if (w->cfg->non_interactive)
+                    fprintf(stderr, "ds4-agent: distributed route ready\n");
+                else
+                    agent_publish_system_status(w, "Distributed route ready.");
+            }
+            if (err_len) err[0] = '\0';
+            return true;
+        }
+        if (ready < 0) return false;
+
+        const char *why = err && err[0] ? err : "route incomplete";
+        if (strcmp(last, why) != 0 || (ticks % 20u) == 0) {
+            if (w->cfg->non_interactive) {
+                fprintf(stderr, "ds4-agent: waiting for distributed route: %s\n", why);
+            } else {
+                char msg[224];
+                snprintf(msg, sizeof(msg), "Waiting for distributed route: %s", why);
+                agent_publish_system_status(w, msg);
+            }
+            snprintf(last, sizeof(last), "%s", why);
+        }
+        if (agent_worker_should_stop(w)) {
+            snprintf(err, err_len, "agent stopped while waiting for distributed route");
+            return false;
+        }
+        nanosleep(&delay, NULL);
+        ticks++;
+    }
 }
 
 static bool agent_worker_has_user_session(agent_worker *w) {
@@ -6428,7 +6521,8 @@ static void *worker_main(void *arg) {
                 w->cfg->engine.model_path ? w->cfg->engine.model_path : "",
                 w->cfg->gen.trace_path ? w->cfg->gen.trace_path : "");
     char init_err[160] = {0};
-    if (!agent_worker_reset_to_sysprompt(w, init_err, sizeof(init_err))) {
+    if (!agent_worker_wait_distributed_route(w, init_err, sizeof(init_err)) ||
+        !agent_worker_reset_to_sysprompt(w, init_err, sizeof(init_err))) {
         agent_set_error(w, init_err[0] ? init_err : "failed to initialize system prompt");
     }
     agent_trace_tokens(w, "initial_system_prompt", &w->transcript, 0);
@@ -6499,6 +6593,15 @@ static bool worker_submit(agent_worker *w, const char *text) {
 static void worker_interrupt(agent_worker *w) {
     pthread_mutex_lock(&w->mu);
     w->interrupt = true;
+    if (w->cfg &&
+        w->cfg->engine.distributed.role == DS4_DISTRIBUTED_COORDINATOR &&
+        (w->status.state == AGENT_WORKER_PREFILL ||
+         w->status.state == AGENT_WORKER_GENERATING ||
+         w->status.state == AGENT_WORKER_COMPACTING))
+    {
+        w->status.state = AGENT_WORKER_DRAINING;
+        agent_wake_locked(w);
+    }
     pthread_mutex_unlock(&w->mu);
 }
 
@@ -6662,6 +6765,10 @@ static void build_status_text(const agent_status *st, char *buf, size_t len) {
     case AGENT_WORKER_COMPACTING:
         snprintf(buf, len, "ctx %s/%s | COMPACTING summary %d tokens %.1f t/s",
                  used, total_ctx, st->generated, st->gen_tps);
+        break;
+    case AGENT_WORKER_DRAINING:
+        snprintf(buf, len, "ctx %s/%s | stopping after distributed cluster drains",
+                 used, total_ctx);
         break;
     case AGENT_WORKER_SAVING:
         snprintf(buf, len, "ctx %s/%s | saving session", used, total_ctx);

@@ -1,4 +1,5 @@
 #include "ds4.h"
+#include "ds4_distributed.h"
 
 /* Purpose-built throughput benchmark.
  *
@@ -35,6 +36,7 @@ typedef struct {
     int gen_tokens;
     int power_percent;
     double step_mul;
+    ds4_dist_options dist;
     bool warm_weights;
     bool quality;
 } bench_config;
@@ -71,13 +73,18 @@ static void usage(FILE *fp) {
         "  --warm-weights         Touch mapped tensor pages before benchmarking.\n"
         "  --power N              Target GPU duty cycle percentage, 1..100. Default: 100\n"
         "\n"
+        "Distributed:\n");
+    ds4_dist_usage(fp);
+    fprintf(fp,
+        "\n"
+        "\n"
         "Sweep:\n"
         "  --ctx-start N          First measured frontier. Default: 2048\n"
         "  --ctx-max N            Last measured frontier. Default: 32768\n"
         "  --ctx-alloc N          Allocated context. Default: ctx-max + gen-tokens + 1\n"
         "  --step-mul F           Multiplicative step. Default: 1\n"
         "  --step-incr N          Linear step when --step-mul is 1. Default: 2048\n"
-        "  --gen-tokens N         Greedy decode tokens per frontier. Default: 128\n"
+        "  --gen-tokens N         Greedy decode tokens per frontier. Use 0 for pure prefill. Default: 128\n"
         "\n"
         "Output:\n"
         "  --csv FILE             Write CSV there instead of stdout.\n"
@@ -88,6 +95,16 @@ static int parse_int(const char *s, const char *opt) {
     char *end = NULL;
     long v = strtol(s, &end, 10);
     if (s[0] == '\0' || *end != '\0' || v <= 0 || v > INT_MAX) {
+        fprintf(stderr, "ds4-bench: invalid value for %s: %s\n", opt, s);
+        exit(2);
+    }
+    return (int)v;
+}
+
+static int parse_nonnegative_int(const char *s, const char *opt) {
+    char *end = NULL;
+    long v = strtol(s, &end, 10);
+    if (s[0] == '\0' || *end != '\0' || v < 0 || v > INT_MAX) {
         fprintf(stderr, "ds4-bench: invalid value for %s: %s\n", opt, s);
         exit(2);
     }
@@ -187,7 +204,25 @@ static bench_config parse_options(int argc, char **argv) {
         if (!strcmp(arg, "-h") || !strcmp(arg, "--help")) {
             usage(stdout);
             exit(0);
-        } else if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
+        }
+        char dist_parse_err[256] = {0};
+        ds4_dist_cli_parse_result dist_parse =
+            ds4_dist_parse_cli_arg(arg,
+                                   &i,
+                                   argc,
+                                   argv,
+                                   &c.dist,
+                                   dist_parse_err,
+                                   sizeof(dist_parse_err));
+        if (dist_parse == DS4_DIST_CLI_ERROR) {
+            fprintf(stderr,
+                    "ds4-bench: %s\n",
+                    dist_parse_err[0] ? dist_parse_err : "invalid distributed option");
+            exit(2);
+        }
+        if (dist_parse == DS4_DIST_CLI_MATCHED) continue;
+
+        if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.model_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--prompt-file")) {
             c.prompt_path = need_arg(&i, argc, argv, arg);
@@ -206,7 +241,7 @@ static bench_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--step-mul")) {
             c.step_mul = parse_double_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--gen-tokens") || !strcmp(arg, "--tokens") || !strcmp(arg, "-n")) {
-            c.gen_tokens = parse_int(need_arg(&i, argc, argv, arg), arg);
+            c.gen_tokens = parse_nonnegative_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--csv")) {
             c.csv_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "-t") || !strcmp(arg, "--threads")) {
@@ -261,6 +296,15 @@ static bench_config parse_options(int argc, char **argv) {
         fprintf(stderr, "ds4-bench: --ctx-alloc must be greater than ctx-max + gen-tokens\n");
         exit(2);
     }
+    char dist_err[256];
+    if (ds4_dist_prepare_engine_options(&c.dist, NULL, dist_err, sizeof(dist_err)) != 0) {
+        fprintf(stderr, "ds4-bench: %s\n", dist_err);
+        exit(2);
+    }
+    if (c.dist.role == DS4_DISTRIBUTED_WORKER) {
+        fprintf(stderr, "ds4-bench: --role worker is a serving mode; start workers with ./ds4\n");
+        exit(2);
+    }
     return c;
 }
 
@@ -277,6 +321,55 @@ static int next_frontier(const bench_config *c, int cur) {
     }
     if (next > c->ctx_max) next = c->ctx_max;
     return next;
+}
+
+static int wait_distributed_route(ds4_session *session) {
+    char err[256] = {0};
+    char last[256] = {0};
+    unsigned ticks = 0;
+    const struct timespec delay = {0, 250000000L};
+
+    for (;;) {
+        int ready = ds4_session_distributed_route_ready(session, err, sizeof(err));
+        if (ready > 0) {
+            if (ticks) fprintf(stderr, "ds4-bench: distributed route ready\n");
+            return 0;
+        }
+        if (ready < 0) {
+            fprintf(stderr,
+                    "ds4-bench: distributed route readiness failed: %s\n",
+                    err[0] ? err : "unknown error");
+            return 1;
+        }
+        const char *why = err[0] ? err : "route incomplete";
+        if (strcmp(last, why) != 0 || (ticks % 20u) == 0) {
+            fprintf(stderr, "ds4-bench: waiting for distributed route: %s\n", why);
+            snprintf(last, sizeof(last), "%s", why);
+        }
+        nanosleep(&delay, NULL);
+        ticks++;
+    }
+}
+
+static void maybe_warn_distributed_step_shape(const bench_config *cfg, ds4_session *session) {
+    if (!cfg || !session || cfg->dist.role != DS4_DISTRIBUTED_COORDINATOR) return;
+    uint32_t chunk = cfg->dist.prefill_chunk;
+    if (chunk == 0) {
+        const int cap = ds4_session_prefill_cap(session);
+        if (cap > 0) chunk = (uint32_t)cap;
+    }
+    if (chunk == 0) return;
+    if (cfg->step_mul == 1.0 &&
+        cfg->step_incr > 0 &&
+        (uint32_t)cfg->step_incr < chunk &&
+        cfg->ctx_start < cfg->ctx_max)
+    {
+        fprintf(stderr,
+                "ds4-bench: note: --step-incr=%d is smaller than distributed prefill chunk %u; "
+                "suffix rows will not show multi-chunk pipeline overlap\n",
+                cfg->step_incr,
+                chunk);
+    }
 }
 
 static bool bench_spec_ngram_enabled(void) {
@@ -365,7 +458,13 @@ int main(int argc, char **argv) {
         .power_percent = cfg.power_percent,
         .warm_weights = cfg.warm_weights,
         .quality = cfg.quality,
+        .distributed = cfg.dist,
     };
+    char dist_err[256];
+    if (ds4_dist_prepare_engine_options(&cfg.dist, &opt, dist_err, sizeof(dist_err)) != 0) {
+        fprintf(stderr, "ds4-bench: %s\n", dist_err);
+        return 2;
+    }
     ds4_engine *engine = NULL;
     if (ds4_engine_open(&engine, &opt) != 0) return 1;
     log_context_memory(cfg.backend, cfg.ctx_alloc);
@@ -396,6 +495,15 @@ int main(int argc, char **argv) {
         ds4_engine_close(engine);
         return 1;
     }
+    if (cfg.dist.role == DS4_DISTRIBUTED_COORDINATOR &&
+        wait_distributed_route(session) != 0)
+    {
+        ds4_session_free(session);
+        ds4_tokens_free(&prompt);
+        ds4_engine_close(engine);
+        return 1;
+    }
+    maybe_warn_distributed_step_shape(&cfg, session);
 
     FILE *out = stdout;
     if (cfg.csv_path) {
@@ -412,6 +520,7 @@ int main(int argc, char **argv) {
     fflush(out);
 
     const int eos = ds4_token_eos(engine);
+    const bool distributed = cfg.dist.role == DS4_DISTRIBUTED_COORDINATOR;
     bench_snapshot snap = {0};
     char err[256];
     int previous = 0;
@@ -497,7 +606,7 @@ int main(int argc, char **argv) {
                 prefill_sec > 0.0 ? (double)prefill_tokens / prefill_sec : 0.0,
                 cfg.gen_tokens,
                 gen_sec > 0.0 ? (double)cfg.gen_tokens / gen_sec : 0.0,
-                (unsigned long long)snap.len);
+                (unsigned long long)(distributed ? 0 : snap.len));
         fflush(out);
 
         previous = frontier;

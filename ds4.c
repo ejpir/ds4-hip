@@ -19,6 +19,7 @@
 #include <float.h>
 #include <inttypes.h>
 #include <ctype.h>
+#include <limits.h>
 #include <math.h>
 #include <pthread.h>
 #include <stdbool.h>
@@ -35,6 +36,7 @@
 #include <unistd.h>
 
 #include "ds4.h"
+#include "ds4_distributed.h"
 
 #ifndef DS4_NO_METAL
 #include "ds4_metal.h"
@@ -2508,6 +2510,136 @@ static void weights_bind(ds4_weights *w, const ds4_model *m) {
     }
 
     weights_validate_layout(w);
+}
+
+typedef struct {
+    uint64_t off;
+    uint64_t end;
+} ds4_model_map_span;
+
+typedef struct {
+    ds4_model_map_span *v;
+    uint32_t len;
+    uint32_t cap;
+    uint64_t max_tensor_bytes;
+} ds4_model_map_span_vec;
+
+static void model_map_span_include_tensor(
+        const ds4_tensor *t,
+        uint64_t *lo,
+        uint64_t *hi,
+        uint64_t *max_tensor_bytes) {
+    if (!t || t->bytes == 0) return;
+    const uint64_t end = t->abs_offset + t->bytes;
+    if (*lo == UINT64_MAX || t->abs_offset < *lo) *lo = t->abs_offset;
+    if (end > *hi) *hi = end;
+    if (t->bytes > *max_tensor_bytes) *max_tensor_bytes = t->bytes;
+}
+
+static void model_map_span_vec_append(ds4_model_map_span_vec *spans, uint64_t lo, uint64_t hi) {
+    if (!spans || lo == UINT64_MAX || hi <= lo) return;
+    if (spans->len == spans->cap) {
+        uint32_t new_cap = spans->cap ? spans->cap * 2u : 16u;
+        spans->v = xrealloc(spans->v, (size_t)new_cap * sizeof(spans->v[0]));
+        spans->cap = new_cap;
+    }
+    spans->v[spans->len++] = (ds4_model_map_span){lo, hi};
+}
+
+static void model_map_span_vec_include_one(ds4_model_map_span_vec *spans, const ds4_tensor *t) {
+    uint64_t lo = UINT64_MAX, hi = 0;
+    model_map_span_include_tensor(t, &lo, &hi, &spans->max_tensor_bytes);
+    model_map_span_vec_append(spans, lo, hi);
+}
+
+static void model_map_span_vec_include_layer(ds4_model_map_span_vec *spans, const ds4_layer_weights *l) {
+#define DS4_INCLUDE_TENSOR(t_) model_map_span_vec_include_one(spans, (t_))
+    DS4_INCLUDE_TENSOR(l->hc_attn_fn);
+    DS4_INCLUDE_TENSOR(l->hc_attn_scale);
+    DS4_INCLUDE_TENSOR(l->hc_attn_base);
+    DS4_INCLUDE_TENSOR(l->attn_norm);
+    DS4_INCLUDE_TENSOR(l->attn_q_a);
+    DS4_INCLUDE_TENSOR(l->attn_q_a_norm);
+    DS4_INCLUDE_TENSOR(l->attn_q_b);
+    DS4_INCLUDE_TENSOR(l->attn_kv);
+    DS4_INCLUDE_TENSOR(l->attn_kv_a_norm);
+    DS4_INCLUDE_TENSOR(l->attn_sinks);
+    DS4_INCLUDE_TENSOR(l->attn_output_a);
+    DS4_INCLUDE_TENSOR(l->attn_output_b);
+    DS4_INCLUDE_TENSOR(l->attn_compressor_ape);
+    DS4_INCLUDE_TENSOR(l->attn_compressor_kv);
+    DS4_INCLUDE_TENSOR(l->attn_compressor_gate);
+    DS4_INCLUDE_TENSOR(l->attn_compressor_norm);
+    DS4_INCLUDE_TENSOR(l->indexer_attn_q_b);
+    DS4_INCLUDE_TENSOR(l->indexer_proj);
+    DS4_INCLUDE_TENSOR(l->indexer_compressor_ape);
+    DS4_INCLUDE_TENSOR(l->indexer_compressor_kv);
+    DS4_INCLUDE_TENSOR(l->indexer_compressor_gate);
+    DS4_INCLUDE_TENSOR(l->indexer_compressor_norm);
+    DS4_INCLUDE_TENSOR(l->hc_ffn_fn);
+    DS4_INCLUDE_TENSOR(l->hc_ffn_scale);
+    DS4_INCLUDE_TENSOR(l->hc_ffn_base);
+    DS4_INCLUDE_TENSOR(l->ffn_norm);
+    DS4_INCLUDE_TENSOR(l->ffn_gate_tid2eid);
+    DS4_INCLUDE_TENSOR(l->ffn_gate_inp);
+    DS4_INCLUDE_TENSOR(l->ffn_exp_probs_b);
+    DS4_INCLUDE_TENSOR(l->ffn_gate_exps);
+    DS4_INCLUDE_TENSOR(l->ffn_up_exps);
+    DS4_INCLUDE_TENSOR(l->ffn_down_exps);
+    DS4_INCLUDE_TENSOR(l->ffn_gate_shexp);
+    DS4_INCLUDE_TENSOR(l->ffn_up_shexp);
+    DS4_INCLUDE_TENSOR(l->ffn_down_shexp);
+#undef DS4_INCLUDE_TENSOR
+}
+
+static void model_map_span_vec_include_output(ds4_model_map_span_vec *spans, const ds4_weights *w) {
+    model_map_span_vec_include_one(spans, w->output_hc_base);
+    model_map_span_vec_include_one(spans, w->output_hc_fn);
+    model_map_span_vec_include_one(spans, w->output_hc_scale);
+    model_map_span_vec_include_one(spans, w->output_norm);
+    model_map_span_vec_include_one(spans, w->output);
+}
+
+static int model_map_span_cmp(const void *a, const void *b) {
+    const ds4_model_map_span *sa = a;
+    const ds4_model_map_span *sb = b;
+    if (sa->off < sb->off) return -1;
+    if (sa->off > sb->off) return 1;
+    if (sa->end < sb->end) return -1;
+    if (sa->end > sb->end) return 1;
+    return 0;
+}
+
+static DS4_MAYBE_UNUSED bool weights_model_map_spans(
+        const ds4_weights *w,
+        uint32_t layer_start,
+        uint32_t layer_end,
+        bool include_output,
+        ds4_model_map_span_vec *spans) {
+    if (!w || !spans) return false;
+    if (layer_start >= DS4_N_LAYER) return false;
+    if (layer_end == UINT32_MAX) layer_end = DS4_N_LAYER - 1u;
+    if (layer_end >= DS4_N_LAYER || layer_end < layer_start) return false;
+
+    memset(spans, 0, sizeof(*spans));
+    if (layer_start == 0) model_map_span_vec_include_one(spans, w->token_embd);
+    for (uint32_t il = layer_start; il <= layer_end; il++) {
+        model_map_span_vec_include_layer(spans, &w->layer[il]);
+    }
+    if (include_output) model_map_span_vec_include_output(spans, w);
+    if (spans->len == 0 || spans->max_tensor_bytes == 0) return false;
+
+    qsort(spans->v, spans->len, sizeof(spans->v[0]), model_map_span_cmp);
+    uint32_t out = 0;
+    for (uint32_t i = 0; i < spans->len; i++) {
+        if (out == 0 || spans->v[i].off > spans->v[out - 1u].end) {
+            spans->v[out++] = spans->v[i];
+        } else if (spans->v[i].end > spans->v[out - 1u].end) {
+            spans->v[out - 1u].end = spans->v[i].end;
+        }
+    }
+    spans->len = out;
+    return spans->len != 0;
 }
 
 static void mtp_weights_bind(ds4_mtp_weights *w, const ds4_model *m) {
@@ -11342,6 +11474,17 @@ static int metal_graph_first_token_full_test(
  * flow and their CPU reads stay outside these generation entry points.
  */
 
+static uint32_t metal_graph_token_split_after_layers(void) {
+    uint32_t split_after_layers = 4;
+    const char *split_env = getenv("DS4_METAL_GRAPH_TOKEN_SPLIT_LAYERS");
+    if (split_env && split_env[0]) {
+        char *end = NULL;
+        unsigned long v = strtoul(split_env, &end, 10);
+        if (end != split_env && v <= DS4_N_LAYER) split_after_layers = (uint32_t)v;
+    }
+    return split_after_layers;
+}
+
 /* Encode a full single-token decode step on Metal.  This is the generation
  * hot path: update caches, run all layers, then produce logits. */
 static bool metal_graph_encode_token_raw_swa(
@@ -14934,7 +15077,9 @@ struct ds4_engine {
     ds4_backend backend;
     int mtp_draft_tokens;
     float mtp_margin;
+    int power_percent;
     bool quality;
+    ds4_distributed_options distributed;
     bool metal_ready;
     bool mtp_ready;
 };
@@ -16387,6 +16532,7 @@ static void ds4_acquire_instance_lock(void) {
 
 struct ds4_session {
     ds4_engine *engine;
+    ds4_dist_session *distributed;
 #ifndef DS4_NO_METAL
     ds4_metal_graph graph;
 #endif
@@ -16401,6 +16547,8 @@ struct ds4_session {
     uint64_t mtp_probe_hit;
     ds4_session_progress_fn progress;
     void *progress_ud;
+    ds4_session_progress_fn display_progress;
+    void *display_progress_ud;
     uint32_t prefill_cap;
     uint32_t progress_chunk_tokens;
     uint32_t ngram_spec_cooldown;
@@ -16430,9 +16578,6 @@ struct ds4_session {
  * for the next token to match a session that had just prefetched the prefix.
  */
 
-#define DS4_SESSION_PAYLOAD_MAGIC UINT32_C(0x34565344) /* "DSV4" */
-#define DS4_SESSION_PAYLOAD_VERSION UINT32_C(1)
-#define DS4_SESSION_PAYLOAD_U32_FIELDS 13u
 #define DS4_SESSION_IO_CHUNK (8u * 1024u * 1024u)
 
 static void payload_set_err(char *err, size_t errlen, const char *msg) {
@@ -16506,6 +16651,27 @@ static DS4_MAYBE_UNUSED int payload_read_u32(FILE *fp, uint32_t *v, uint64_t *re
     if (remaining) *remaining -= sizeof(b);
     *v = payload_get_u32(b);
     return 0;
+}
+
+static int payload_copy_file_bytes(FILE *src, FILE *dst, uint64_t bytes, char *err, size_t errlen) {
+    uint8_t *buf = xmalloc(DS4_SESSION_IO_CHUNK);
+    int rc = 0;
+    while (bytes != 0) {
+        const size_t n = bytes > DS4_SESSION_IO_CHUNK ? DS4_SESSION_IO_CHUNK : (size_t)bytes;
+        if (fread(buf, 1, n, src) != n) {
+            payload_set_err(err, errlen, "failed to read staged session payload");
+            rc = 1;
+            break;
+        }
+        if (fwrite(buf, 1, n, dst) != n) {
+            payload_set_err(err, errlen, "failed to write staged session payload");
+            rc = 1;
+            break;
+        }
+        bytes -= n;
+    }
+    free(buf);
+    return rc;
 }
 
 static DS4_MAYBE_UNUSED uint64_t layer_attn_state_bytes(uint32_t ratio) {
@@ -16747,6 +16913,89 @@ uint64_t ds4_session_payload_bytes(ds4_session *s) {
 #endif
 }
 
+int ds4_session_write_staged_payload(const ds4_session_payload_file *payload,
+                                     FILE *fp, char *err, size_t errlen) {
+    if (!payload || !payload->path || !fp) {
+        payload_set_err(err, errlen, "invalid staged session payload");
+        return 1;
+    }
+    FILE *src = fopen(payload->path, "rb");
+    if (!src) {
+        payload_set_err(err, errlen, "failed to open staged session payload");
+        return 1;
+    }
+    int rc = payload_copy_file_bytes(src, fp, payload->bytes, err, errlen);
+    if (fclose(src) != 0 && rc == 0) {
+        payload_set_err(err, errlen, "failed to close staged session payload");
+        return 1;
+    }
+    return rc;
+}
+
+void ds4_session_payload_file_free(ds4_session_payload_file *payload) {
+    if (!payload) return;
+    if (payload->path) {
+        unlink(payload->path);
+        free(payload->path);
+    }
+    memset(payload, 0, sizeof(*payload));
+}
+
+int ds4_session_stage_payload(ds4_session *s, ds4_session_payload_file *out,
+                              char *err, size_t errlen) {
+    if (!out) {
+        payload_set_err(err, errlen, "invalid session payload staging request");
+        return 1;
+    }
+    memset(out, 0, sizeof(*out));
+    if (!s || !s->checkpoint_valid) {
+        payload_set_err(err, errlen, "session has no valid checkpoint to stage");
+        return 1;
+    }
+
+    char tmpl[] = "/tmp/ds4-session-payload.XXXXXX";
+    int fd = mkstemp(tmpl);
+    if (fd < 0) {
+        payload_set_err(err, errlen, "failed to create staged session payload");
+        return 1;
+    }
+    FILE *fp = fdopen(fd, "wb");
+    if (!fp) {
+        int saved = errno;
+        close(fd);
+        unlink(tmpl);
+        if (errlen) snprintf(err, errlen, "failed to open staged session payload: %s",
+                             strerror(saved));
+        return 1;
+    }
+
+    int rc = ds4_session_save_payload(s, fp, err, errlen);
+    if (rc == 0 && fflush(fp) != 0) {
+        payload_set_err(err, errlen, "failed to flush staged session payload");
+        rc = 1;
+    }
+    off_t pos = -1;
+    if (rc == 0) {
+        pos = ftello(fp);
+        if (pos < 0) {
+            payload_set_err(err, errlen, "failed to measure staged session payload");
+            rc = 1;
+        }
+    }
+    if (fclose(fp) != 0 && rc == 0) {
+        payload_set_err(err, errlen, "failed to close staged session payload");
+        rc = 1;
+    }
+    if (rc != 0) {
+        unlink(tmpl);
+        return 1;
+    }
+    out->path = xmalloc(strlen(tmpl) + 1);
+    strcpy(out->path, tmpl);
+    out->bytes = (uint64_t)pos;
+    return 0;
+}
+
 int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen) {
 #ifdef DS4_NO_METAL
     (void)s; (void)fp;
@@ -16756,6 +17005,9 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
     if (!s || !fp || !s->checkpoint_valid) {
         payload_set_err(err, errlen, "session has no valid checkpoint to save");
         return 1;
+    }
+    if (s->distributed) {
+        return ds4_dist_session_save_payload(s->distributed, s, fp, err, errlen);
     }
     if (ds4_metal_synchronize() == 0) {
         payload_set_err(err, errlen, "failed to synchronize Metal before snapshot");
@@ -16887,6 +17139,9 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
     if (!s || !fp) {
         payload_set_err(err, errlen, "invalid session payload load");
         return 1;
+    }
+    if (s->distributed) {
+        return ds4_dist_session_load_payload(s->distributed, s, fp, payload_bytes, err, errlen);
     }
     uint64_t remaining = payload_bytes;
     uint32_t h[DS4_SESSION_PAYLOAD_U32_FIELDS];
@@ -17082,6 +17337,156 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
     g->mtp_n_raw = 0;
     return 0;
 #endif
+}
+
+int ds4_session_save_snapshot(ds4_session *s, ds4_session_snapshot *snap, char *err, size_t errlen) {
+    if (!s || !snap) {
+        payload_set_err(err, errlen, "invalid session snapshot save");
+        return 1;
+    }
+    if (s->distributed) {
+        payload_set_err(err, errlen, "distributed session snapshots are not supported yet");
+        return 1;
+    }
+    const uint64_t bytes = ds4_session_payload_bytes(s);
+    if (bytes == 0 || bytes > (uint64_t)SIZE_MAX) {
+        payload_set_err(err, errlen, "session snapshot is not available");
+        return 1;
+    }
+    if (snap->cap < bytes) {
+        uint8_t *p = realloc(snap->ptr, (size_t)bytes);
+        if (!p) {
+            payload_set_err(err, errlen, "out of memory while allocating session snapshot");
+            return 1;
+        }
+        snap->ptr = p;
+        snap->cap = bytes;
+    }
+    FILE *mem = fmemopen(snap->ptr, (size_t)bytes, "wb");
+    if (!mem) {
+        payload_set_err(err, errlen, "failed to open memory stream for session snapshot");
+        return 1;
+    }
+    const int rc = ds4_session_save_payload(s, mem, err, errlen);
+    if (fclose(mem) != 0 && rc == 0) {
+        payload_set_err(err, errlen, "failed to finalize memory session snapshot");
+        return 1;
+    }
+    if (rc != 0) return 1;
+    snap->len = bytes;
+    return 0;
+}
+
+int ds4_session_load_snapshot(ds4_session *s, const ds4_session_snapshot *snap, char *err, size_t errlen) {
+    if (!s || !snap || !snap->ptr || snap->len == 0 || snap->len > (uint64_t)SIZE_MAX) {
+        payload_set_err(err, errlen, "invalid session snapshot load");
+        return 1;
+    }
+    if (s->distributed) {
+        payload_set_err(err, errlen, "distributed session snapshots are not supported yet");
+        return 1;
+    }
+    FILE *mem = fmemopen((void *)snap->ptr, (size_t)snap->len, "rb");
+    if (!mem) {
+        payload_set_err(err, errlen, "failed to open memory stream for session snapshot restore");
+        return 1;
+    }
+    const int rc = ds4_session_load_payload(s, mem, snap->len, err, errlen);
+    if (fclose(mem) != 0 && rc == 0) {
+        payload_set_err(err, errlen, "failed to close memory session snapshot");
+        return 1;
+    }
+    return rc;
+}
+
+void ds4_session_snapshot_free(ds4_session_snapshot *snap) {
+    if (!snap) return;
+    free(snap->ptr);
+    memset(snap, 0, sizeof(*snap));
+}
+
+uint64_t ds4_session_layer_payload_bytes(ds4_session *s,
+                                         uint32_t layer_start,
+                                         uint32_t layer_end) {
+    (void)s;
+    (void)layer_start;
+    (void)layer_end;
+    return 0;
+}
+
+int ds4_session_save_layer_payload(ds4_session *s, FILE *fp,
+                                   uint32_t layer_start, uint32_t layer_end,
+                                   char *err, size_t errlen) {
+    (void)s;
+    (void)fp;
+    (void)layer_start;
+    (void)layer_end;
+    payload_set_err(err, errlen, "distributed layer payloads are not supported in this ROCm branch");
+    return 1;
+}
+
+int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
+                                   uint64_t payload_bytes,
+                                   const int *tokens, uint32_t n_tokens,
+                                   uint32_t layer_start, uint32_t layer_end,
+                                   char *err, size_t errlen) {
+    (void)s;
+    (void)fp;
+    (void)payload_bytes;
+    (void)tokens;
+    (void)n_tokens;
+    (void)layer_start;
+    (void)layer_end;
+    payload_set_err(err, errlen, "distributed layer payloads are not supported in this ROCm branch");
+    return 1;
+}
+
+int ds4_session_layer_slice_reset(ds4_session *s, char *err, size_t errlen) {
+    if (s) ds4_session_invalidate(s);
+    payload_set_err(err, errlen, "distributed layer slices are not supported in this ROCm branch");
+    return 1;
+}
+
+int ds4_session_eval_layer_slice(ds4_session *s,
+                                 const int *tokens,
+                                 uint32_t n_tokens,
+                                 uint32_t pos0,
+                                 uint32_t layer_start,
+                                 uint32_t layer_end,
+                                 const float *input_hc,
+                                 float *output_hc,
+                                 bool output_logits,
+                                 float *logits,
+                                 char *err,
+                                 size_t errlen) {
+    (void)s;
+    (void)tokens;
+    (void)n_tokens;
+    (void)pos0;
+    (void)layer_start;
+    (void)layer_end;
+    (void)input_hc;
+    (void)output_hc;
+    (void)output_logits;
+    (void)logits;
+    payload_set_err(err, errlen, "distributed layer slices are not supported in this ROCm branch");
+    return 1;
+}
+
+int ds4_session_eval_output_head_from_hc(ds4_session *s,
+                                         const float *hidden_hc,
+                                         uint32_t n_tokens,
+                                         float *logits,
+                                         char *err,
+                                         size_t errlen) {
+    if (!s || !s->engine || !hidden_hc || n_tokens == 0 || !logits) {
+        payload_set_err(err, errlen, "invalid output-head hidden-state input");
+        return 1;
+    }
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    const float *last_hc = hidden_hc + (uint64_t)(n_tokens - 1u) * hc_dim;
+    output_logits_one(logits, &s->engine->model, &s->engine->weights, last_hc);
+    return 0;
 }
 
 void ds4_engine_dump_tokens(ds4_engine *e, const ds4_tokens *tokens) {
@@ -17347,6 +17752,9 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     e->mtp_model.fd = -1;
     e->backend = opt->backend;
     e->quality = opt->quality;
+    e->distributed = opt->distributed;
+    e->power_percent = opt->power_percent > 0 ? opt->power_percent : 100;
+    if (e->power_percent > 100) e->power_percent = 100;
     e->mtp_draft_tokens = opt->mtp_draft_tokens > 0 ? opt->mtp_draft_tokens : 1;
     if (e->mtp_draft_tokens > 16) e->mtp_draft_tokens = 16;
     e->mtp_margin = opt->mtp_margin >= 0.0f ? opt->mtp_margin : 3.0f;
@@ -17452,6 +17860,41 @@ void ds4_engine_summary(ds4_engine *e) {
     model_summary(&e->model);
 }
 
+int ds4_engine_vocab_size(ds4_engine *e) {
+    return e ? e->vocab.n_vocab : 0;
+}
+
+int ds4_engine_power(ds4_engine *e) {
+    return e ? e->power_percent : 100;
+}
+
+int ds4_engine_set_power(ds4_engine *e, int power_percent) {
+    if (!e || power_percent < 1 || power_percent > 100) return 1;
+    e->power_percent = power_percent;
+    return 0;
+}
+
+const char *ds4_engine_model_name(ds4_engine *e) {
+    (void)e;
+    return "DeepSeek-V4-Flash";
+}
+
+int ds4_engine_layer_count(ds4_engine *e) {
+    (void)e;
+    return (int)DS4_N_LAYER;
+}
+
+uint32_t ds4_engine_layer_compress_ratio(ds4_engine *e, uint32_t layer) {
+    (void)e;
+    if (layer >= DS4_N_LAYER) return 0;
+    return ds4_layer_compress_ratio(layer);
+}
+
+uint64_t ds4_engine_hidden_f32_values(ds4_engine *e) {
+    (void)e;
+    return (uint64_t)DS4_N_HC * DS4_N_EMBD;
+}
+
 void ds4_engine_close(ds4_engine *e) {
     if (!e) return;
     weights_free(&e->weights);
@@ -17492,6 +17935,25 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         s->mtp_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->mtp_logits[0]));
         s->mtp_draft_token = -1;
     }
+    if (e->distributed.role == DS4_DISTRIBUTED_COORDINATOR) {
+        char err[256];
+        if (ds4_dist_session_create(&s->distributed,
+                                    e,
+                                    &e->distributed,
+                                    s,
+                                    ctx_size,
+                                    err,
+                                    sizeof(err)) != 0) {
+            fprintf(stderr,
+                    "ds4: failed to create distributed coordinator session: %s\n",
+                    err[0] ? err : "unknown error");
+            metal_graph_free(&s->graph);
+            free(s->logits);
+            free(s->mtp_logits);
+            free(s);
+            return 1;
+        }
+    }
 #ifdef DS4_USE_GPU_API
     ds4_context_memory ctx_mem = ds4_context_memory_estimate(e->backend, ctx_size);
     gpu_known_footprint_report(ctx_mem.total_bytes);
@@ -17504,6 +17966,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
 
 void ds4_session_free(ds4_session *s) {
     if (!s) return;
+    ds4_dist_session_free(s->distributed);
 #ifndef DS4_NO_METAL
     metal_graph_free(&s->graph);
 #endif
@@ -17516,10 +17979,43 @@ void ds4_session_free(ds4_session *s) {
     free(s);
 }
 
+int ds4_session_distributed_route_ready(ds4_session *s, char *err, size_t errlen) {
+    if (!s || !s->distributed) {
+        if (errlen) snprintf(err, errlen, "session is not a distributed coordinator");
+        return -1;
+    }
+    return ds4_dist_session_route_ready(s->distributed, err, errlen);
+}
+
+int ds4_session_power(ds4_session *s) {
+    return (s && s->engine) ? s->engine->power_percent : 100;
+}
+
+bool ds4_session_is_distributed(ds4_session *s) {
+    return s && s->distributed != NULL;
+}
+
+int ds4_session_set_power(ds4_session *s, int power_percent) {
+    if (!s || !s->engine || power_percent < 1 || power_percent > 100) return 1;
+    s->engine->power_percent = power_percent;
+    return 0;
+}
+
 void ds4_session_set_progress(ds4_session *s, ds4_session_progress_fn fn, void *ud) {
     if (!s) return;
     s->progress = fn;
     s->progress_ud = ud;
+}
+
+void ds4_session_set_display_progress(ds4_session *s, ds4_session_progress_fn fn, void *ud) {
+    if (!s) return;
+    s->display_progress = fn;
+    s->display_progress_ud = ud;
+}
+
+void ds4_session_report_progress(ds4_session *s, const char *event, int current, int total) {
+    if (!s || !s->progress || !event) return;
+    (void)s->progress(s->progress_ud, event, current, total);
 }
 
 void ds4_session_set_prefill_chunk_tokens(ds4_session *s, uint32_t tokens) {
@@ -17804,6 +18300,30 @@ int ds4_session_argmax(ds4_session *s) {
     return sample_argmax(s->logits, DS4_N_VOCAB);
 }
 
+int ds4_session_argmax_excluding(ds4_session *s, int excluded_id) {
+    if (!s) return -1;
+    int token = ds4_session_argmax(s);
+    if (token != excluded_id) return token;
+    ds4_token_score top[16];
+    int n = ds4_session_top_logprobs(s, top, (int)(sizeof(top) / sizeof(top[0])));
+    for (int i = 0; i < n; i++) {
+        if (top[i].id != excluded_id) return top[i].id;
+    }
+    return -1;
+}
+
+int ds4_session_copy_logits(ds4_session *s, float *out, int cap) {
+    if (!s || !out || cap < (int)DS4_N_VOCAB) return 0;
+    memcpy(out, s->logits, (size_t)DS4_N_VOCAB * sizeof(out[0]));
+    return (int)DS4_N_VOCAB;
+}
+
+int ds4_session_set_logits(ds4_session *s, const float *logits, int n) {
+    if (!s || !logits || n != (int)DS4_N_VOCAB) return 1;
+    memcpy(s->logits, logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+    return 0;
+}
+
 static void ds4_session_ensure_sampling_scratch(ds4_session *s) {
     if (s->sample_logits && s->sample_counts && s->sample_touched) return;
     if (!s->sample_logits) s->sample_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->sample_logits[0]));
@@ -17841,6 +18361,12 @@ int ds4_session_sample_with_options(ds4_session *s, const ds4_sampling_options *
                                       s->sample_counts,
                                       s->sample_touched,
                                       rng);
+}
+
+int ds4_sample_logits(const float *logits, int n_vocab, float temperature,
+                      int top_k, float top_p, float min_p, uint64_t *rng) {
+    if (!logits || n_vocab <= 0) return 0;
+    return sample_top_p_min_p(logits, (uint32_t)n_vocab, temperature, top_k, top_p, min_p, rng);
 }
 
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng) {
@@ -17998,7 +18524,6 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
     snprintf(err, errlen, "Metal support is not compiled in");
     return -1;
 #else
-    if (!s || max_tokens <= 0 || accepted_cap <= 0) return 0;
     ds4_engine *e = s->engine;
 
     /*
@@ -18596,4 +19121,8 @@ int ds4_session_pos(ds4_session *s) {
 
 int ds4_session_ctx(ds4_session *s) {
     return s->ctx_size;
+}
+
+int ds4_session_prefill_cap(ds4_session *s) {
+    return s ? (int)s->prefill_cap : 0;
 }

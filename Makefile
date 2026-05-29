@@ -26,9 +26,9 @@ ROCM_LDLIBS ?= -lm -pthread -L$(ROCM_PATH)/lib -lhipblas -lhipblaslt
 
 ifeq ($(UNAME_S),Darwin)
 METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal
-CORE_OBJS = ds4.o ds4_metal.o
-NATIVE_CORE_OBJS = ds4_native.o
-CPU_CORE_OBJS = ds4_cpu.o
+CORE_OBJS = ds4.o ds4_distributed.o ds4_metal.o
+NATIVE_CORE_OBJS = ds4_native.o ds4_distributed.o
+CPU_CORE_OBJS = ds4_cpu.o ds4_distributed.o
 LINK.ds4 = $(CC)
 TEST_CORE_OBJS = $(CORE_OBJS)
 TEST_CFLAGS = $(CFLAGS)
@@ -36,9 +36,9 @@ TEST_LINK = $(CC)
 else
 ifneq ($(HIPCC),)
 CFLAGS += -D_GNU_SOURCE -DDS4_USE_HIP
-CORE_OBJS = ds4.o ds4_rocm.o
-NATIVE_CORE_OBJS = ds4_native.o
-CPU_CORE_OBJS = ds4_cpu.o
+CORE_OBJS = ds4.o ds4_distributed.o ds4_rocm.o
+NATIVE_CORE_OBJS = ds4_native.o ds4_distributed.o
+CPU_CORE_OBJS = ds4_cpu.o ds4_distributed.o
 METAL_LDLIBS := $(LDLIBS)
 HIP_LDLIBS := $(LDLIBS) -lhipblaslt
 LINK.ds4 = $(HIPCC)
@@ -47,9 +47,9 @@ TEST_CFLAGS = $(CFLAGS) -UDS4_USE_HIP -DDS4_NO_METAL -DDS4_NO_GPU
 TEST_LINK = $(CC)
 else
 CFLAGS += -D_GNU_SOURCE -DDS4_NO_METAL
-CORE_OBJS = ds4.o
-NATIVE_CORE_OBJS = ds4_native.o
-CPU_CORE_OBJS = ds4_cpu.o
+CORE_OBJS = ds4.o ds4_distributed.o
+NATIVE_CORE_OBJS = ds4_native.o ds4_distributed.o
+CPU_CORE_OBJS = ds4_cpu.o ds4_distributed.o
 METAL_LDLIBS := $(LDLIBS)
 LINK.ds4 = $(CC)
 TEST_CORE_OBJS = $(CORE_OBJS)
@@ -123,28 +123,31 @@ rocm rocm-upstream: ds4-rocm-upstream ds4-server-rocm-upstream ds4-bench-rocm-up
 ds4-mtp-oracle-bench-rocm-upstream: tools/mtp_oracle_microbench_gpuapi.o ds4_gpuapi.o ds4_rocm.o
 	$(ROCM_HIPCC) -o $@ $^ $(ROCM_LDLIBS)
 
-ds4-rocm-upstream: ds4_cli_gpuapi.o linenoise.o ds4_gpuapi.o ds4_rocm.o
+ds4-rocm-upstream: ds4_cli_gpuapi.o linenoise.o ds4_distributed.o ds4_gpuapi.o ds4_rocm.o
 	$(ROCM_HIPCC) -o $@ $^ $(ROCM_LDLIBS)
 
-ds4-server-rocm-upstream: ds4_server_gpuapi.o ds4_kvstore.o rax.o ds4_gpuapi.o ds4_rocm.o
+ds4-server-rocm-upstream: ds4_server_gpuapi.o ds4_kvstore.o rax.o ds4_distributed.o ds4_gpuapi.o ds4_rocm.o
 	$(ROCM_HIPCC) -o $@ $^ $(ROCM_LDLIBS)
 
-ds4-bench-rocm-upstream: ds4_bench_gpuapi.o ds4_gpuapi.o ds4_rocm.o
+ds4-bench-rocm-upstream: ds4_bench_gpuapi.o ds4_distributed.o ds4_gpuapi.o ds4_rocm.o
 	$(ROCM_HIPCC) -o $@ $^ $(ROCM_LDLIBS)
 
-ds4-eval-rocm-upstream: ds4_eval_gpuapi.o ds4_gpuapi.o ds4_rocm.o
+ds4-eval-rocm-upstream: ds4_eval_gpuapi.o ds4_distributed.o ds4_gpuapi.o ds4_rocm.o
 	$(ROCM_HIPCC) -o $@ $^ $(ROCM_LDLIBS)
 
-ds4-agent-rocm-upstream: ds4_agent_gpuapi.o ds4_web.o ds4_kvstore.o linenoise.o ds4_gpuapi.o ds4_rocm.o
+ds4-agent-rocm-upstream: ds4_agent_gpuapi.o ds4_web.o ds4_kvstore.o linenoise.o ds4_distributed.o ds4_gpuapi.o ds4_rocm.o
 	$(ROCM_HIPCC) -o $@ $^ $(ROCM_LDLIBS)
 
 ds4.o: ds4.c ds4.h ds4_metal.h ds4_gpu.h $(DS4_C_INCS)
 	$(CC) $(CFLAGS) -c -o $@ ds4.c
 
-ds4_cli.o: ds4_cli.c ds4.h linenoise.h
+ds4_cli.o: ds4_cli.c ds4.h ds4_distributed.h linenoise.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_cli.c
 
-ds4_server.o: ds4_server.c ds4.h ds4_kvstore.h rax.h
+ds4_distributed.o: ds4_distributed.c ds4_distributed.h ds4.h
+	$(CC) $(CFLAGS) -c -o $@ ds4_distributed.c
+
+ds4_server.o: ds4_server.c ds4.h ds4_distributed.h ds4_kvstore.h rax.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_server.c
 
 ds4_bench.o: ds4_bench.c ds4.h
@@ -153,7 +156,7 @@ ds4_bench.o: ds4_bench.c ds4.h
 ds4_eval.o: ds4_eval.c ds4.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_eval.c
 
-ds4_agent.o: ds4_agent.c ds4.h ds4_kvstore.h ds4_web.h linenoise.h
+ds4_agent.o: ds4_agent.c ds4.h ds4_distributed.h ds4_kvstore.h ds4_web.h linenoise.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_agent.c
 
 ds4_web.o: ds4_web.c ds4_web.h
