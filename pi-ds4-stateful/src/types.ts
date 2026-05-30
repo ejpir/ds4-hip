@@ -6,6 +6,17 @@ export type UserTurnPolicy = "auto" | "reset" | "delta";
 export type ReadGuardMode = "exact" | "strict";
 export type UiPhase = "idle" | "request" | "response" | "stream" | "tool-call" | "tools" | "done" | "retry" | "error";
 
+export interface PrefillProgress {
+	phase: string;
+	current: number;
+	total: number;
+	percent: number;
+	chunkTps: number;
+	avgTps: number;
+	elapsed: number;
+	timestamp: number;
+}
+
 export interface RuntimeConfig {
 	baseUrl: string;
 	statelessBaseUrl: string;
