@@ -3,12 +3,27 @@ import { STATUS_KEY } from "./config.ts";
 import { compactReason, decisionSummary, requestInfoFromPayload, requestSummary, sessionTag } from "./protocol.ts";
 import { ReadGuard } from "./policies/read-guard.ts";
 import { StatefulSessionStore } from "./session-state.ts";
-import type { RuntimeConfig, StatefulUiRequest, UiPhase } from "./types.ts";
+import type { PrefillProgress, RuntimeConfig, StatefulUiRequest, UiPhase } from "./types.ts";
 import { chars, plural, shortId } from "./util.ts";
 
-function elapsed(info: StatefulUiRequest): string {
-	const seconds = Math.max(0, (Date.now() - info.startedAt) / 1000);
+const PROGRESS_WIDGET_KEY = `${STATUS_KEY}:progress`;
+
+function duration(seconds: number): string {
 	return seconds < 10 ? `${seconds.toFixed(1)}s` : `${Math.round(seconds)}s`;
+}
+
+function elapsed(info: StatefulUiRequest): string {
+	return duration(Math.max(0, (Date.now() - info.startedAt) / 1000));
+}
+
+function rate(tps: number): string {
+	if (!Number.isFinite(tps) || tps <= 0) return "-- tok/s";
+	return tps >= 1000 ? `${(tps / 1000).toFixed(1)}k tok/s` : `${tps.toFixed(tps >= 100 ? 0 : 1)} tok/s`;
+}
+
+function progressPercent(progress: PrefillProgress): number {
+	if (Number.isFinite(progress.percent)) return Math.max(0, Math.min(100, progress.percent));
+	return progress.total > 0 ? Math.max(0, Math.min(100, 100 * progress.current / progress.total)) : 0;
 }
 
 export class StatefulUi {
@@ -18,6 +33,9 @@ export class StatefulUi {
 	private activeThinkingChars = 0;
 	private activeToolCalls = 0;
 	private activeTools = new Map<string, string>();
+	private activePrefill: PrefillProgress | undefined;
+	private activeDecode: PrefillProgress | undefined;
+	private activeCtx: ExtensionContext | undefined;
 	private lastUiRefresh = 0;
 	lastHttpSummary = "no response yet";
 
@@ -28,9 +46,12 @@ export class StatefulUi {
 	) {}
 
 	beginAgent(ctx: ExtensionContext): void {
+		this.activeCtx = ctx;
 		this.activePhase = "request";
 		this.activeRequest = undefined;
 		this.activeTools = new Map<string, string>();
+		this.activePrefill = undefined;
+		this.activeDecode = undefined;
 		this.activeTextChars = 0;
 		this.activeThinkingChars = 0;
 		this.activeToolCalls = 0;
@@ -38,10 +59,13 @@ export class StatefulUi {
 	}
 
 	beforeProviderRequest(payload: unknown, ctx: ExtensionContext): void {
+		this.activeCtx = ctx;
 		const info = requestInfoFromPayload(payload);
 		if (!info) return;
 		this.activeRequest = info;
 		this.activePhase = "request";
+		this.activePrefill = undefined;
+		this.activeDecode = undefined;
 		this.activeTextChars = 0;
 		this.activeThinkingChars = 0;
 		this.activeToolCalls = 0;
@@ -52,6 +76,7 @@ export class StatefulUi {
 	}
 
 	afterProviderResponse(status: number, headers: Record<string, string> | undefined, ctx: ExtensionContext): void {
+		this.activeCtx = ctx;
 		if (!this.activeRequest) return;
 		this.activeRequest.httpStatus = status;
 		const revision = headers?.["x-ds4-session-revision"] ?? headers?.["X-DS4-Session-Revision"];
@@ -60,8 +85,26 @@ export class StatefulUi {
 		this.refresh(ctx, true);
 	}
 
-	messageUpdate(update: any, ctx: ExtensionContext): void {
+	prefillProgress(progress: PrefillProgress): void {
 		if (!this.activeRequest) return;
+		if (progress.phase === "decode") {
+			this.activeDecode = progress;
+			this.activePrefill = undefined;
+			if (this.activePhase !== "retry" && this.activePhase !== "error") this.activePhase = "stream";
+		} else {
+			this.activePrefill = progress;
+			this.activeDecode = undefined;
+			if (this.activePhase !== "retry" && this.activePhase !== "error" && this.activePhase !== "stream") {
+				this.activePhase = "request";
+			}
+		}
+		if (this.activeCtx) this.refresh(this.activeCtx);
+	}
+
+	messageUpdate(update: any, ctx: ExtensionContext): void {
+		this.activeCtx = ctx;
+		if (!this.activeRequest) return;
+		this.activePrefill = undefined;
 		if (update.type === "text_delta") this.activeTextChars += update.delta.length;
 		else if (update.type === "thinking_delta") this.activeThinkingChars += update.delta.length;
 		else if (update.type === "toolcall_start") this.activeToolCalls = Math.max(this.activeToolCalls, 1);
@@ -74,18 +117,21 @@ export class StatefulUi {
 	}
 
 	messageEnd(message: { role: string; stopReason?: string }, ctx: ExtensionContext): void {
+		this.activeCtx = ctx;
 		if (!this.activeRequest || message.role !== "assistant") return;
 		this.activePhase = message.stopReason === "toolUse" ? "tool-call" : message.stopReason === "error" ? "error" : "done";
 		this.refresh(ctx, true);
 	}
 
 	toolExecutionStart(toolCallId: string, toolName: string, ctx: ExtensionContext): void {
+		this.activeCtx = ctx;
 		this.activeTools.set(toolCallId, toolName);
 		this.activePhase = "tools";
 		this.refresh(ctx, true);
 	}
 
 	toolExecutionEnd(toolCallId: string, ctx: ExtensionContext): void {
+		this.activeCtx = ctx;
 		this.activeTools.delete(toolCallId);
 		this.activePhase = this.activeTools.size > 0 ? "tools" : "done";
 		this.refresh(ctx, true);
@@ -95,11 +141,17 @@ export class StatefulUi {
 		this.activePhase = "idle";
 		this.activeRequest = undefined;
 		this.activeTools = new Map<string, string>();
+		this.activePrefill = undefined;
+		this.activeDecode = undefined;
+		this.activeCtx = undefined;
 		this.activeTextChars = 0;
 		this.activeThinkingChars = 0;
 		this.activeToolCalls = 0;
 		ctx.ui.setStatus(STATUS_KEY, this.statusText(ctx));
-		if (ctx.hasUI) ctx.ui.setWorkingMessage();
+		if (ctx.hasUI) {
+			ctx.ui.setWidget(PROGRESS_WIDGET_KEY, undefined);
+			ctx.ui.setWorkingMessage();
+		}
 	}
 
 	applyStatus(ctx: ExtensionContext): void {
@@ -170,6 +222,7 @@ export class StatefulUi {
 	refresh(ctx: ExtensionContext, force = false): void {
 		ctx.ui.setStatus(STATUS_KEY, this.statusText(ctx));
 		if (!ctx.hasUI) return;
+		this.updateProgressWidget(ctx);
 		const now = Date.now();
 		if (!force && now - this.lastUiRefresh < 500) return;
 		this.lastUiRefresh = now;
@@ -206,6 +259,50 @@ export class StatefulUi {
 		return ` ${t.fg(color, `HTTP ${status}`)}`;
 	}
 
+	private progressBar(progress: PrefillProgress, ctx: ExtensionContext, width = 18): string {
+		const t = ctx.ui.theme;
+		const pct = progressPercent(progress);
+		const filled = Math.max(0, Math.min(width, Math.round(width * pct / 100)));
+		return t.fg("success", "█".repeat(filled)) + t.fg("dim", "░".repeat(width - filled));
+	}
+
+	private progressSummary(progress: PrefillProgress | undefined, ctx: ExtensionContext, withBar = false): string | undefined {
+		if (!progress) return undefined;
+		const pct = progressPercent(progress);
+		const total = progress.total > 0 ? progress.total : 0;
+		const current = total > 0 ? Math.max(0, Math.min(total, progress.current)) : Math.max(0, progress.current);
+		const speed = progress.chunkTps > 0 ? progress.chunkTps : progress.avgTps;
+		const avg = progress.avgTps > 0 && progress.chunkTps > 0 ? ` avg ${rate(progress.avgTps)}` : "";
+		const count = total > 0 ? `${current}/${total}` : `${current}`;
+		const bar = withBar ? `${this.progressBar(progress, ctx)} ` : "";
+		return `${bar}${pct.toFixed(1)}% ${count} tok · ${rate(speed)}${avg} · ${duration(progress.elapsed)}`;
+	}
+
+	private prefillSummary(ctx: ExtensionContext, withBar = false): string | undefined {
+		return this.progressSummary(this.activePrefill, ctx, withBar);
+	}
+
+	private decodeSummary(ctx: ExtensionContext, withBar = false): string | undefined {
+		return this.progressSummary(this.activeDecode, ctx, withBar);
+	}
+
+	private updateProgressWidget(ctx: ExtensionContext): void {
+		const line = this.progressWidgetLine(ctx);
+		ctx.ui.setWidget(PROGRESS_WIDGET_KEY, line ? [line] : undefined);
+	}
+
+	private progressWidgetLine(ctx: ExtensionContext): string | undefined {
+		if (!this.config.enabled || !this.activeRequest) return undefined;
+		const t = ctx.ui.theme;
+		const label = this.activeDecode ? "decode" : this.activePrefill ? "prefill" : this.activePhase === "request" || this.activePhase === "response" ? "prefill" : undefined;
+		if (!label) return undefined;
+		const progress = this.activeDecode ?? this.activePrefill;
+		const summary = progress
+			? this.progressSummary(progress, ctx, true)
+			: `${this.progressBar({ phase: label, current: 0, total: 1, percent: 0, chunkTps: 0, avgTps: 0, elapsed: Math.max(0, (Date.now() - this.activeRequest.startedAt) / 1000), timestamp: Date.now() }, ctx)} waiting for server progress · ${elapsed(this.activeRequest)}`;
+		return `${t.fg("accent", "◆ DS4")} ${t.fg("accent", label)} ${summary}`;
+	}
+
 	private statusText(ctx: ExtensionContext): string | undefined {
 		if (!this.config.enabled) return undefined;
 		const t = ctx.ui.theme;
@@ -214,11 +311,16 @@ export class StatefulUi {
 			const info = this.activeRequest;
 			const sent = info.sentMessages >= 0 ? info.sentMessages : 0;
 			const full = info.fullMessages >= 0 ? info.fullMessages : 0;
+			const prefill = this.activePhase === "request" ? this.prefillSummary(ctx) : undefined;
+			const decode = this.activePhase === "stream" ? this.decodeSummary(ctx) : undefined;
+			const streamDetail = decode ?? `think ${chars(this.activeThinkingChars)} · text ${chars(this.activeTextChars)} · tools ${this.activeToolCalls}`;
 			const detail = this.activePhase === "stream"
-				? ` ${t.fg("dim", `think ${chars(this.activeThinkingChars)} · text ${chars(this.activeTextChars)} · tools ${this.activeToolCalls}`)}`
+				? ` ${t.fg("dim", streamDetail)}`
 				: this.activePhase === "tools"
 					? ` ${t.fg("dim", `${plural(this.activeTools.size, "tool")}`)}`
-					: "";
+					: prefill
+						? ` ${t.fg("dim", prefill)}`
+						: "";
 			return `${brand} ${this.modeBadge(ctx, info.mode)} ${this.phaseLabel(ctx)} ${t.fg("dim", `r${info.parentRevision} · ${sent}/${full} msg`)}${this.httpBadge(ctx)}${detail}`;
 		}
 		if (this.sessions.sessions.size === 1) {
@@ -239,12 +341,16 @@ export class StatefulUi {
 		const reason = t.fg("dim", compactReason(this.activeRequest.reason));
 		const clock = t.fg("dim", elapsed(this.activeRequest));
 		if (this.activePhase === "request") {
+			const prefill = this.prefillSummary(ctx, true);
+			if (prefill) return `${t.fg("accent", "◆ DS4")} ${label} ${t.fg("accent", "prefill")} ${prefill}`;
 			return `${t.fg("accent", "◆ DS4")} ${label} ${t.fg("accent", "prefill")} ${reason} · ${clock}`;
 		}
 		if (this.activePhase === "retry") {
 			return `${t.fg("warning", "↻ DS4 stale delta")} ${label} ${t.fg("dim", "→ full reset")} · ${clock}`;
 		}
 		if (this.activePhase === "stream") {
+			const decode = this.decodeSummary(ctx, true);
+			if (decode) return `${t.fg("accent", "◒ DS4 decode")} ${label}${http} ${decode}`;
 			const tool = this.activeToolCalls > 0 ? ` · ${plural(this.activeToolCalls, "tool call")}` : "";
 			return `${t.fg("accent", "◒ DS4 streaming")} ${label}${http} ${t.fg("dim", `think ${chars(this.activeThinkingChars)} · text ${chars(this.activeTextChars)}${tool}`)}`;
 		}

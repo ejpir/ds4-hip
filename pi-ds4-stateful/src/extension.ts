@@ -17,7 +17,7 @@ export default function registerDs4StatefulExtension(pi: ExtensionAPI) {
 	const isActiveDs4StatefulContext = (ctx: ExtensionContext) =>
 		config.enabled && isDs4StatefulContext(ctx);
 
-	pi.registerProvider(PROVIDER_ID, ds4StatefulProviderConfig(config, sessions));
+	pi.registerProvider(PROVIDER_ID, ds4StatefulProviderConfig(config, sessions, (progress) => ui.prefillProgress(progress)));
 
 	pi.on("session_start", (_event, ctx) => {
 		readGuard.clearAll();

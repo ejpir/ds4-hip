@@ -10181,6 +10181,11 @@ typedef struct {
     double last_t;
     int last_current;
     bool seen;
+    int active_chunk_start;
+    int active_chunk_end;
+    double progress_last_t;
+    int progress_last_current;
+    bool progress_seen;
     /* SSE keepalive during long prefill: send HTTP/SSE headers ahead of
      * generation and emit a `:` comment line every few seconds so HTTP/TCP
      * idle timeouts on the client side don't close the connection while the
@@ -10236,12 +10241,19 @@ static void log_flags(char *buf, size_t len, bool responses_protocol,
 #undef ADD_FLAG
 }
 
+typedef struct {
+    double elapsed;
+    double chunk_tps;
+    double avg_tps;
+} server_decode_progress;
+
 static void log_decode_progress(req_kind kind, int prompt_tokens, int completion,
                                 bool responses_protocol,
                                 bool tools, bool thinking,
                                 bool dsml_start, bool dsml_end,
                                 double decode_t0,
-                                double *last_t, int *last_completion) {
+                                double *last_t, int *last_completion,
+                                server_decode_progress *out) {
     const double now = now_sec();
     const double elapsed = now - decode_t0;
     const double interval_s = now - *last_t;
@@ -10265,8 +10277,32 @@ static void log_decode_progress(req_kind kind, int prompt_tokens, int completion
                chunk_tps,
                avg_tps,
                elapsed);
+    if (out) {
+        out->elapsed = elapsed;
+        out->chunk_tps = chunk_tps;
+        out->avg_tps = avg_tps;
+    }
     *last_t = now;
     *last_completion = completion;
+}
+
+static void send_decode_progress_comment(int fd, const request *req,
+                                         int completion, int max_tokens,
+                                         const server_decode_progress *progress) {
+    if (fd < 0 || !req || !req->stream || !progress) return;
+    int total = max_tokens > 0 ? max_tokens : completion;
+    if (total < completion) total = completion;
+    double pct = total > 0 ? 100.0 * (double)completion / (double)total : 100.0;
+    char msg[256];
+    int n = snprintf(msg, sizeof(msg),
+                     ": ds4-decode-progress {\"phase\":\"decode\",\"current\":%d,\"total\":%d,\"percent\":%.1f,\"chunk_tps\":%.2f,\"avg_tps\":%.2f,\"elapsed\":%.3f}\n\n",
+                     completion,
+                     total,
+                     pct,
+                     progress->chunk_tps,
+                     progress->avg_tps,
+                     progress->elapsed);
+    if (n > 0 && (size_t)n < sizeof(msg)) (void)send_all(fd, msg, (size_t)n);
 }
 
 typedef struct {
@@ -10340,13 +10376,40 @@ static void log_tool_calls_summary(const char *ctx, const tool_calls *calls,
     buf_free(&names);
 }
 
+static void send_prefill_progress_comment(server_prefill_progress *p,
+                                          const char *phase,
+                                          int display_current,
+                                          int display_total,
+                                          double pct,
+                                          double chunk_tps,
+                                          double avg_tps,
+                                          double elapsed,
+                                          double now) {
+    if (!p || !p->stream || p->fd < 0 || p->stream_failed) return;
+    char msg[256];
+    int n = snprintf(msg, sizeof(msg),
+                     ": ds4-prefill-progress {\"phase\":\"%s\",\"current\":%d,\"total\":%d,\"percent\":%.1f,\"chunk_tps\":%.2f,\"avg_tps\":%.2f,\"elapsed\":%.3f}\n\n",
+                     phase,
+                     display_current,
+                     display_total,
+                     pct,
+                     chunk_tps,
+                     avg_tps,
+                     elapsed);
+    if (n > 0 && (size_t)n < sizeof(msg)) {
+        if (send_all(p->fd, msg, (size_t)n)) p->last_keepalive = now;
+        else p->stream_failed = true;
+    }
+}
+
 static bool server_progress_cb(void *ud, const char *event, int current, int total) {
     server_prefill_progress *p = ud;
-    if (!p || !event || strcmp(event, "prefill_chunk")) return true;
+    if (!p || !event) return true;
 
     double now = now_sec();
     /* Keep the HTTP/SSE connection alive while prefill runs.  We write the SSE
-     * response headers the first time the callback fires and then emit a
+     * response headers the first time the callback fires, emit lightweight
+     * progress comments for clients that understand them, and keep sending a
      * comment line (`:` prefix, ignored by SSE clients) every few seconds.
      * Best-effort: if the client has already gone away, the writes fail
      * silently and the outer code will discover the closed socket the next
@@ -10368,6 +10431,42 @@ static bool server_progress_cb(void *ud, const char *event, int current, int tot
             }
         }
     }
+    if (!strcmp(event, "prefill_chunk_begin")) {
+        p->active_chunk_start = p->last_current;
+        p->active_chunk_end = current;
+        return true;
+    }
+    if (!strcmp(event, "prefill_layer_done")) {
+        if (p->active_chunk_end > p->active_chunk_start && total > 0) {
+            int estimated = p->active_chunk_start +
+                (int)(((int64_t)(p->active_chunk_end - p->active_chunk_start) * current) / total);
+            int display_start = p->cached_tokens;
+            if (display_start < 0 || display_start > p->prompt_tokens) display_start = 0;
+            int display_total = p->prompt_tokens - display_start;
+            if (display_total <= 0) {
+                display_start = 0;
+                display_total = p->prompt_tokens;
+            }
+            int display_current = estimated - display_start;
+            if (display_current < 0) display_current = 0;
+            if (display_current > display_total) display_current = display_total;
+            double elapsed = now - p->t0;
+            double pct = display_total > 0 ? 100.0 * (double)display_current / (double)display_total : 100.0;
+            double avg_tps = elapsed > 0.0 ? (double)display_current / elapsed : 0.0;
+            int interval_tokens = p->progress_seen ? estimated - p->progress_last_current : 0;
+            if (interval_tokens < 0) interval_tokens = 0;
+            double interval_s = p->progress_seen ? now - p->progress_last_t : 0.0;
+            double chunk_tps = interval_s > 0.0 ? (double)interval_tokens / interval_s : 0.0;
+            p->progress_last_current = estimated;
+            p->progress_last_t = now;
+            p->progress_seen = true;
+            send_prefill_progress_comment(p, "prefill", display_current, display_total,
+                                          pct, chunk_tps, avg_tps, elapsed, now);
+        }
+        return true;
+    }
+    if (strcmp(event, "prefill_chunk")) return true;
+
     double elapsed = now - p->t0;
     if (p->seen && current == p->last_current) {
         if (p->srv && current > p->cached_tokens) {
@@ -10411,6 +10510,8 @@ static bool server_progress_cb(void *ud, const char *event, int current, int tot
                chunk_tps,
                avg_tps,
                elapsed);
+    send_prefill_progress_comment(p, phase, display_current, display_total,
+                                  pct, chunk_tps, avg_tps, elapsed, now);
     if (p->srv && current > p->cached_tokens) {
         kv_cache_maybe_store_continued(p->srv);
     }
@@ -11138,7 +11239,7 @@ static void generate_job(server *s, job *j) {
     bool saw_orphan_tool_end = false;
     size_t tool_scan_from = 0;
     int next_tool_progress = 128;
-    int next_decode_log = 50;
+    int next_decode_log = 10;
     uint64_t rng = j->req.seed ? j->req.seed :
         (((uint64_t)time(NULL) << 32) ^ ((uint64_t)s->seq << 1) ^ (uint64_t)(uintptr_t)j);
     if (max_tokens < 0) max_tokens = 0;
@@ -11363,6 +11464,7 @@ static void generate_job(server *s, job *j) {
             }
 
             if (completion >= next_decode_log) {
+                server_decode_progress decode_progress = {0};
                 log_decode_progress(j->req.kind, prompt_tokens, completion,
                                     responses_protocol,
                                     j->req.has_tools,
@@ -11371,7 +11473,9 @@ static void generate_job(server *s, job *j) {
                                     saw_tool_end,
                                     decode_t0,
                                     &last_decode_log_t,
-                                    &last_decode_log_completion);
+                                    &last_decode_log_completion,
+                                    &decode_progress);
+                send_decode_progress_comment(j->fd, &j->req, completion, max_tokens, &decode_progress);
                 next_decode_log += 50;
             }
 
@@ -11410,6 +11514,7 @@ static void generate_job(server *s, job *j) {
     }
 
     if (completion > last_decode_log_completion) {
+        server_decode_progress decode_progress = {0};
         log_decode_progress(j->req.kind, prompt_tokens, completion,
                             responses_protocol,
                             j->req.has_tools,
@@ -11418,7 +11523,9 @@ static void generate_job(server *s, job *j) {
                             saw_tool_end,
                             decode_t0,
                             &last_decode_log_t,
-                            &last_decode_log_completion);
+                            &last_decode_log_completion,
+                            &decode_progress);
+        send_decode_progress_comment(j->fd, &j->req, completion, max_tokens, &decode_progress);
     }
     const double decode_sec = now_sec() - decode_t0;
     const double decode_tps = decode_sec > 0.0 ? (double)completion / decode_sec : 0.0;

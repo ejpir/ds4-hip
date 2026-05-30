@@ -9,7 +9,7 @@ import type {
 	ToolCall,
 } from "@earendil-works/pi-ai";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
-import type { JsonObject } from "./types.ts";
+import type { JsonObject, PrefillProgress } from "./types.ts";
 
 export function isTextBlock(block: unknown): block is TextContent {
 	return !!block && typeof block === "object" && (block as { type?: unknown }).type === "text";
@@ -176,7 +176,12 @@ function safeJson(text: string): Record<string, unknown> {
 	}
 }
 
-async function* sseData(response: Response): AsyncGenerator<string> {
+interface SseEvent {
+	data?: string;
+	comments: string[];
+}
+
+async function* sseEvents(response: Response): AsyncGenerator<SseEvent> {
 	if (!response.body) return;
 	const reader = response.body.getReader();
 	const decoder = new TextDecoder();
@@ -189,14 +194,42 @@ async function* sseData(response: Response): AsyncGenerator<string> {
 		while (idx >= 0) {
 			const raw = buffer.slice(0, idx);
 			buffer = buffer.slice(idx + 2);
-			const data = raw
-				.split("\n")
-				.filter((line) => line.startsWith("data:"))
-				.map((line) => line.slice(5).trimStart())
-				.join("\n");
-			if (data) yield data;
+			const dataLines: string[] = [];
+			const comments: string[] = [];
+			for (const line of raw.split("\n")) {
+				if (line.startsWith("data:")) dataLines.push(line.slice(5).trimStart());
+				else if (line.startsWith(":")) comments.push(line.slice(1).trimStart());
+			}
+			const data = dataLines.length > 0 ? dataLines.join("\n") : undefined;
+			if (data || comments.length > 0) yield { data, comments };
 			idx = buffer.indexOf("\n\n");
 		}
+	}
+}
+
+function progressFromComment(comment: string): PrefillProgress | undefined {
+	const text = comment.trim();
+	const prefillPrefix = "ds4-prefill-progress ";
+	const decodePrefix = "ds4-decode-progress ";
+	const prefix = text.startsWith(prefillPrefix) ? prefillPrefix : text.startsWith(decodePrefix) ? decodePrefix : undefined;
+	if (!prefix) return undefined;
+	try {
+		const raw = JSON.parse(text.slice(prefix.length));
+		const current = Number(raw.current);
+		const total = Number(raw.total);
+		const percent = Number.isFinite(Number(raw.percent)) ? Number(raw.percent) : total > 0 ? 100 * current / total : 0;
+		return {
+			phase: typeof raw.phase === "string" ? raw.phase : prefix === decodePrefix ? "decode" : "prefill",
+			current: Number.isFinite(current) ? current : 0,
+			total: Number.isFinite(total) ? total : 0,
+			percent: Number.isFinite(percent) ? percent : 0,
+			chunkTps: Number.isFinite(Number(raw.chunk_tps)) ? Number(raw.chunk_tps) : 0,
+			avgTps: Number.isFinite(Number(raw.avg_tps)) ? Number(raw.avg_tps) : 0,
+			elapsed: Number.isFinite(Number(raw.elapsed)) ? Number(raw.elapsed) : 0,
+			timestamp: Date.now(),
+		};
+	} catch {
+		return undefined;
 	}
 }
 
@@ -206,6 +239,7 @@ export async function streamFetchOnce(
 	apiKey: string,
 	options: SimpleStreamOptions | undefined,
 	onResponse: SimpleStreamOptions["onResponse"],
+	onPrefillProgress?: (progress: PrefillProgress) => void,
 ) {
 	const stream = createAssistantMessageEventStream();
 	(async () => {
@@ -276,8 +310,13 @@ export async function streamFetchOnce(
 				return block;
 			};
 
-			for await (const data of sseData(response)) {
-				if (data === "[DONE]") continue;
+			for await (const event of sseEvents(response)) {
+				for (const comment of event.comments) {
+					const progress = progressFromComment(comment);
+					if (progress) onPrefillProgress?.(progress);
+				}
+				const data = event.data;
+				if (!data || data === "[DONE]") continue;
 				const chunk = JSON.parse(data);
 				if (chunk.id) output.responseId ||= chunk.id;
 				if (chunk.usage) output.usage = parseUsage(chunk.usage);

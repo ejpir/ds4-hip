@@ -3,7 +3,7 @@ import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import { API_ID, MODEL_ID, PROVIDER_ID } from "./config.ts";
 import { buildOpenAIPayload, emptyUsage, streamFetchOnce } from "./openai.ts";
 import { StatefulSessionStore } from "./session-state.ts";
-import type { PendingCommit, RuntimeConfig } from "./types.ts";
+import type { PendingCommit, PrefillProgress, RuntimeConfig } from "./types.ts";
 
 function isStatefulConflict(event: AssistantMessageEvent, pending: PendingCommit | undefined): boolean {
 	if (event.type !== "error" || pending?.mode !== "delta") return false;
@@ -21,7 +21,11 @@ function applySamplingConfig(payload: unknown, config: RuntimeConfig): unknown {
 	return out;
 }
 
-export function createDs4StatefulStream(config: RuntimeConfig, sessions: StatefulSessionStore) {
+export function createDs4StatefulStream(
+	config: RuntimeConfig,
+	sessions: StatefulSessionStore,
+	onPrefillProgress?: (progress: PrefillProgress) => void,
+) {
 	return function streamDs4Stateful(model: Model<Api>, context: Context, options?: SimpleStreamOptions) {
 		const outer = createAssistantMessageEventStream();
 		const key = sessions.key(options);
@@ -35,7 +39,7 @@ export function createDs4StatefulStream(config: RuntimeConfig, sessions: Statefu
 			const finalPayload = await userOnPayload?.(payload, statelessModel);
 			sessions.lastMode = "none";
 			sessions.lastReason = "stateful disabled; sent stateless chat/completions";
-			return streamFetchOnce(statelessModel, finalPayload === undefined ? payload : finalPayload, apiKey, options, userOnResponse);
+			return streamFetchOnce(statelessModel, finalPayload === undefined ? payload : finalPayload, apiKey, options, userOnResponse, onPrefillProgress);
 		};
 
 		const runOnce = async (forceReset: boolean, pendingRef: { current?: PendingCommit }) => {
@@ -45,7 +49,7 @@ export function createDs4StatefulStream(config: RuntimeConfig, sessions: Statefu
 			sessions.lastMode = selected.mode;
 			sessions.lastReason = selected.reason;
 			const finalPayload = await userOnPayload?.(selected.payload, model);
-			return streamFetchOnce(model, finalPayload === undefined ? selected.payload : finalPayload, apiKey, options, userOnResponse);
+			return streamFetchOnce(model, finalPayload === undefined ? selected.payload : finalPayload, apiKey, options, userOnResponse, onPrefillProgress);
 		};
 
 		(async () => {
@@ -99,7 +103,11 @@ export function createDs4StatefulStream(config: RuntimeConfig, sessions: Statefu
 	};
 }
 
-export function ds4StatefulProviderConfig(config: RuntimeConfig, sessions: StatefulSessionStore) {
+export function ds4StatefulProviderConfig(
+	config: RuntimeConfig,
+	sessions: StatefulSessionStore,
+	onPrefillProgress?: (progress: PrefillProgress) => void,
+) {
 	return {
 		name: "ds4.c stateful",
 		baseUrl: config.baseUrl,
@@ -134,7 +142,7 @@ export function ds4StatefulProviderConfig(config: RuntimeConfig, sessions: State
 				},
 			},
 		],
-		streamSimple: createDs4StatefulStream(config, sessions),
+		streamSimple: createDs4StatefulStream(config, sessions, onPrefillProgress),
 	};
 }
 
