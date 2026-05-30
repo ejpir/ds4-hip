@@ -976,6 +976,38 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
                                          CUBLAS_GEMM_DEFAULT);
         return cublas_ok(st, "f16 matmul");
     }
+    /* The 4096x256 F16 router projection is latency-bound and the ordered
+     * 32-thread row kernel is at least as fast on gfx1151; keep shared-X for
+     * compressor/indexer F16 decode where reusing x across rows is the win. */
+    const bool f16_decode_router_shape = (in_dim == 4096u && out_dim == 256u);
+    const bool f16_decode_force_router_sharedx =
+        cuda_env_present("DS4_CUDA_F16_DECODE_SHAREDX_ROUTER") ||
+        cuda_env_present("DS4_HIP_F16_DECODE_SHAREDX_ROUTER");
+    if (n_tok == 1u && !g_quality_mode && !cuda_runtime_config()->graph_dump &&
+        (!f16_decode_router_shape || f16_decode_force_router_sharedx) &&
+        !cuda_env_present("DS4_CUDA_NO_F16_DECODE_SHAREDX") &&
+        !cuda_env_present("DS4_HIP_NO_F16_DECODE_SHAREDX") &&
+        !cuda_env_present("DS4_CUDA_NO_F16_DECODE_SHAREDX_SINGLE") &&
+        !cuda_env_present("DS4_HIP_NO_F16_DECODE_SHAREDX_SINGLE")) {
+        const uint32_t max_shared = cuda_parse_u32_env_alias("DS4_CUDA_F16_DECODE_SHAREDX_MAX",
+                                                            "DS4_HIP_F16_DECODE_SHAREDX_MAX",
+                                                            8192u, 256u, 16384u);
+        if (in_dim <= max_shared && in_dim * sizeof(float) <= 65536u) {
+            uint32_t rows_per_block = cuda_parse_u32_env_alias("DS4_CUDA_F16_DECODE_RPB",
+                                                               "DS4_HIP_F16_DECODE_RPB",
+                                                               16u, 1u, 32u);
+            if (rows_per_block != 1u && rows_per_block != 2u && rows_per_block != 4u &&
+                rows_per_block != 8u && rows_per_block != 16u && rows_per_block != 32u) {
+                rows_per_block = 16u;
+            }
+            matmul_f16_f32_sharedx_warp_rows_w32_kernel<<<
+                    ((unsigned)out_dim + rows_per_block - 1u) / rows_per_block,
+                    rows_per_block * 32u,
+                    (size_t)in_dim * sizeof(float)>>>(
+                    (float *)out->ptr, w, (const float *)x->ptr, (uint32_t)in_dim, out_dim);
+            return cuda_ok(cudaGetLastError(), "matmul_f16 sharedx launch");
+        }
+    }
     dim3 grid((unsigned)out_dim, (unsigned)n_tok, 1);
     if (ordered_router) {
         matmul_f16_ordered_chunks_kernel<<<grid, 32>>>((float *)out->ptr, w, (const float *)x->ptr, in_dim, out_dim, n_tok);
@@ -1022,6 +1054,29 @@ extern "C" int ds4_gpu_matmul_f16_pair_tensor(
     const __half *w0 = (const __half *)cuda_model_range_ptr(model_map, weight0_offset, weight_bytes, "f16_pair0");
     const __half *w1 = (const __half *)cuda_model_range_ptr(model_map, weight1_offset, weight_bytes, "f16_pair1");
     if (!w0 || !w1) return 0;
+    if (!g_quality_mode && !cuda_runtime_config()->graph_dump &&
+        !cuda_env_present("DS4_CUDA_NO_F16_DECODE_SHAREDX") &&
+        !cuda_env_present("DS4_HIP_NO_F16_DECODE_SHAREDX")) {
+        const uint32_t max_shared = cuda_parse_u32_env_alias("DS4_CUDA_F16_DECODE_SHAREDX_MAX",
+                                                            "DS4_HIP_F16_DECODE_SHAREDX_MAX",
+                                                            8192u, 256u, 16384u);
+        if (in_dim <= max_shared && in_dim * sizeof(float) <= 65536u) {
+            uint32_t rows_per_block = cuda_parse_u32_env_alias("DS4_CUDA_F16_DECODE_RPB",
+                                                               "DS4_HIP_F16_DECODE_RPB",
+                                                               16u, 1u, 32u);
+            if (rows_per_block != 1u && rows_per_block != 2u && rows_per_block != 4u &&
+                rows_per_block != 8u && rows_per_block != 16u && rows_per_block != 32u) {
+                rows_per_block = 16u;
+            }
+            matmul_f16_pair_f32_sharedx_warp_rows_w32_kernel<<<
+                    ((unsigned)out_dim + rows_per_block - 1u) / rows_per_block,
+                    rows_per_block * 32u,
+                    (size_t)in_dim * sizeof(float)>>>(
+                    (float *)out0->ptr, (float *)out1->ptr, w0, w1,
+                    (const float *)x->ptr, (uint32_t)in_dim, out_dim);
+            return cuda_ok(cudaGetLastError(), "matmul_f16_pair sharedx launch");
+        }
+    }
     matmul_f16_pair_ordered_chunks_kernel<<<(unsigned)out_dim, 32>>>(
         (float *)out0->ptr,
         (float *)out1->ptr,
