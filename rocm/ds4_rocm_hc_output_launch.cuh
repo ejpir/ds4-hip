@@ -1,10 +1,10 @@
 extern "C" int ds4_gpu_repeat_hc_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *row, uint32_t n_embd, uint32_t n_hc) {
-    if (!out || !row || n_embd == 0 || n_hc == 0 ||
-        row->bytes < (uint64_t)n_embd * sizeof(float) ||
-        out->bytes < (uint64_t)n_embd * n_hc * sizeof(float)) {
+    uint64_t n = 0;
+    if (n_embd == 0 || n_hc == 0 ||
+        !cuda_u64_mul_checked(n_embd, n_hc, &n) ||
+        !cuda_tensor_has_f32(row, n_embd) || !cuda_tensor_has_f32(out, n)) {
         return 0;
     }
-    uint64_t n = (uint64_t)n_embd * n_hc;
     repeat_hc_kernel<<<(n + 255) / 256, 256>>>((float *)out->ptr, (const float *)row->ptr, n_embd, n_hc);
     return cuda_ok(cudaGetLastError(), "repeat_hc launch");
 }
@@ -12,9 +12,9 @@ extern "C" int ds4_gpu_repeat_hc_tensor(ds4_gpu_tensor *out, const ds4_gpu_tenso
 extern "C" int ds4_gpu_hc_split_sinkhorn_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *mix, const void *model_map, uint64_t model_size, uint64_t scale_offset, uint64_t base_offset, uint32_t n_hc, uint32_t sinkhorn_iters, float eps) {
     if (!out || !mix || !model_map || n_hc != 4) return 0;
     const uint64_t mix_bytes = 24ull * sizeof(float);
-    if (scale_offset > model_size || model_size - scale_offset < 3ull * sizeof(float) ||
-        base_offset > model_size || model_size - base_offset < mix_bytes ||
-        mix->bytes < mix_bytes || out->bytes < mix_bytes) return 0;
+    if (!cuda_model_range_fits(model_size, scale_offset, 3ull * sizeof(float)) ||
+        !cuda_model_range_fits(model_size, base_offset, mix_bytes) ||
+        !cuda_tensor_has_bytes(mix, mix_bytes) || !cuda_tensor_has_bytes(out, mix_bytes)) return 0;
     const float *scale = (const float *)cuda_model_range_ptr(model_map, scale_offset, 3ull * sizeof(float), "hc_scale");
     const float *base = (const float *)cuda_model_range_ptr(model_map, base_offset, mix_bytes, "hc_base");
     if (!scale || !base) return 0;

@@ -25,8 +25,8 @@ enum {
     DS4_ROCM_N_EXPERT_USED = 6u,
     DS4_ROCM_COMPRESSOR_MAX_RATIO = 128u
 };
-static const float DS4_ROCM_EXPERT_WEIGHT_SCALE = 1.5f;
-static const float DS4_ROCM_EXPERT_WEIGHT_SCALE_TOL = 1.0e-6f;
+#define DS4_ROCM_EXPERT_WEIGHT_SCALE 1.5f
+#define DS4_ROCM_EXPERT_WEIGHT_SCALE_TOL 1.0e-6f
 
 struct cuda_model_range {
     const void *host_base;

@@ -1,8 +1,6 @@
 extern "C" int ds4_gpu_swiglu_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *gate, const ds4_gpu_tensor *up, uint32_t n, float clamp, float weight) {
-    if (!out || !gate || !up ||
-        out->bytes < (uint64_t)n * sizeof(float) ||
-        gate->bytes < (uint64_t)n * sizeof(float) ||
-        up->bytes < (uint64_t)n * sizeof(float)) return 0;
+    if (!cuda_tensor_has_f32(out, n) || !cuda_tensor_has_f32(gate, n) || !cuda_tensor_has_f32(up, n)) return 0;
+    if (n == 0u) return 1;
     swiglu_kernel<<<(n + 255) / 256, 256>>>((float *)out->ptr, (const float *)gate->ptr, (const float *)up->ptr, n, clamp, weight);
     return cuda_ok(cudaGetLastError(), "swiglu launch");
 }
@@ -31,13 +29,13 @@ extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
         !cuda_u64_mul_checked(out_dim, row_bytes, &weight_bytes) ||
         !cuda_u64_mul3_checked(in_dim, 1u, sizeof(float), &x_bytes) ||
         !cuda_u64_mul3_checked(out_dim, 1u, sizeof(float), &out_bytes) ||
-        x->bytes < x_bytes || gate->bytes < out_bytes || up->bytes < out_bytes || mid->bytes < out_bytes) {
+        !cuda_tensor_has_bytes(x, x_bytes) || !cuda_tensor_has_bytes(gate, out_bytes) ||
+        !cuda_tensor_has_bytes(up, out_bytes) || !cuda_tensor_has_bytes(mid, out_bytes)) {
         return 0;
     }
     if (in_dim == 4096u && (in_dim & 31u) == 0u &&
-        gate_offset <= model_size && up_offset <= model_size &&
-        weight_bytes <= model_size - gate_offset &&
-        weight_bytes <= model_size - up_offset &&
+        cuda_model_range_fits(model_size, gate_offset, weight_bytes) &&
+        cuda_model_range_fits(model_size, up_offset, weight_bytes) &&
         !cuda_runtime_config()->disable_shared_gate_up_fused_w32) {
         const char *wg = cuda_model_range_ptr(model_map, gate_offset, weight_bytes, "shared_gate_q8");
         const char *wu = cuda_model_range_ptr(model_map, up_offset, weight_bytes, "shared_up_q8");
@@ -78,14 +76,9 @@ extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
     if (!cuda_runtime_config()->disable_shared_gate_up_pair) {
         if (cuda_runtime_config()->q8_prequant_decode &&
             !cuda_runtime_config()->disable_shared_gate_up_pair_swiglu &&
-            gate && up && mid && x && out_dim <= UINT32_MAX &&
-            gate_offset <= model_size && up_offset <= model_size &&
-            weight_bytes <= model_size - gate_offset &&
-            weight_bytes <= model_size - up_offset &&
-            x->bytes >= in_dim * sizeof(float) &&
-            gate->bytes >= out_dim * sizeof(float) &&
-            up->bytes >= out_dim * sizeof(float) &&
-            mid->bytes >= out_dim * sizeof(float)) {
+            out_dim <= UINT32_MAX &&
+            cuda_model_range_fits(model_size, gate_offset, weight_bytes) &&
+            cuda_model_range_fits(model_size, up_offset, weight_bytes)) {
             const char *wg = cuda_model_range_ptr(model_map, gate_offset, weight_bytes, "shared_gate_q8_pair");
             const char *wu = cuda_model_range_ptr(model_map, up_offset, weight_bytes, "shared_up_q8_pair");
             if (!wg || !wu) return 0;

@@ -12,10 +12,10 @@ static bool ds4_str_has_cstr(ds4_str s, const char *needle) {
     return false;
 }
 
-static uint64_t g_startup_model_file_bytes;
-static uint64_t g_startup_tensor_bytes;
-static uint64_t g_startup_q8_f16_original_bytes;
-static uint64_t g_startup_q8_f16_expanded_bytes;
+static uint64_t g_startup_model_file_bytes DS4_MAYBE_UNUSED;
+static uint64_t g_startup_tensor_bytes DS4_MAYBE_UNUSED;
+static uint64_t g_startup_q8_f16_original_bytes DS4_MAYBE_UNUSED;
+static uint64_t g_startup_q8_f16_expanded_bytes DS4_MAYBE_UNUSED;
 
 static void tensor_stat_add(uint64_t *count, uint64_t *bytes, const ds4_tensor *t) {
     if (count) (*count)++;
@@ -170,7 +170,7 @@ static const char *env_first_nonempty(const char *a, const char *b, const char *
     return fallback;
 }
 
-static void gpu_fast_path_summary(bool quality) {
+static DS4_MAYBE_UNUSED void gpu_fast_path_summary(bool quality) {
     const bool copy_model = env_truthy("DS4_CUDA_COPY_MODEL") ||
                             env_truthy("DS4_CUDA_COPY_MODEL_CHUNKED") ||
                             env_truthy("DS4_CUDA_COPY_MODEL_STAGED");
@@ -257,7 +257,7 @@ static void gpu_fast_path_summary(bool quality) {
             onoff(env_truthy("DS4_CUDA_SHARED_GATE_UP_BATCH_FUSED")));
 }
 
-static void gpu_known_footprint_report(uint64_t context_bytes) {
+static DS4_MAYBE_UNUSED void gpu_known_footprint_report(uint64_t context_bytes) {
     const bool copy_model = env_truthy("DS4_CUDA_COPY_MODEL") ||
                             env_truthy("DS4_CUDA_COPY_MODEL_CHUNKED") ||
                             env_truthy("DS4_CUDA_COPY_MODEL_STAGED");

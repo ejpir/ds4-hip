@@ -6548,6 +6548,7 @@ static void layer_ffn_batch(
         const int         * token_ids,
         uint32_t            n_tok,
         uint32_t            il) {
+    if (n_tok == 0) return;
     const uint32_t n_hc = DS4_N_HC;
     const uint64_t hc_dim = (uint64_t)n_hc * DS4_N_EMBD;
     float *ffn_cur = xmalloc((size_t)n_tok * DS4_N_EMBD * sizeof(ffn_cur[0]));
@@ -12211,17 +12212,6 @@ static int metal_graph_first_token_full_test(
  * encoder as diagnostics, but diagnostics are not required for normal command
  * flow and their CPU reads stay outside these generation entry points.
  */
-
-static uint32_t metal_graph_token_split_after_layers(void) {
-    uint32_t split_after_layers = 4;
-    const char *split_env = getenv("DS4_METAL_GRAPH_TOKEN_SPLIT_LAYERS");
-    if (split_env && split_env[0]) {
-        char *end = NULL;
-        unsigned long v = strtoul(split_env, &end, 10);
-        if (end != split_env && v <= DS4_N_LAYER) split_after_layers = (uint32_t)v;
-    }
-    return split_after_layers;
-}
 
 /* Encode a full single-token decode step on Metal.  This is the generation
  * hot path: update caches, run all layers, then produce logits. */
@@ -18550,6 +18540,12 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     const uint32_t load_layer_start = opt->load_layer_start;
     const uint32_t load_layer_end = opt->load_layer_end;
     const bool load_output = opt->load_output;
+#ifndef DS4_USE_GPU_API
+    (void)load_slice;
+    (void)load_layer_start;
+    (void)load_layer_end;
+    (void)load_output;
+#endif
 
 #ifndef DS4_NO_METAL
     if (e->backend == DS4_BACKEND_GPU) {
@@ -18569,6 +18565,9 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         uint64_t *load_offsets = NULL;
         uint64_t *load_sizes = NULL;
         uint32_t load_span_count = 0;
+#ifndef DS4_USE_GPU_API
+        (void)load_span_count;
+#endif
 #ifdef DS4_USE_GPU_API
         (void)ds4_gpu_set_model_fd(e->model.fd);
         if (load_slice) {

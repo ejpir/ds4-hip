@@ -317,6 +317,69 @@ static int routed_moe_q2_float_down_launch(
     return cuda_ok(cudaGetLastError(), "routed_moe iq2/q2 float-down sum launch");
 }
 
+typedef struct {
+    int q4k_path;
+    int iq2_path;
+    int q2k_path;
+    uint64_t gate_bytes;
+    uint64_t down_bytes;
+} routed_moe_launch_plan;
+
+static int routed_moe_build_plan(
+        const ds4_gpu_tensor *out,
+        const ds4_gpu_tensor *gate,
+        const ds4_gpu_tensor *up,
+        const ds4_gpu_tensor *mid,
+        const ds4_gpu_tensor *down,
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t gate_offset,
+        uint64_t up_offset,
+        uint64_t down_offset,
+        uint32_t gate_type,
+        uint32_t down_type,
+        uint64_t gate_expert_bytes,
+        uint64_t down_expert_bytes,
+        uint32_t expert_in_dim,
+        uint32_t expert_mid_dim,
+        uint32_t out_dim,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t n_expert,
+        const ds4_gpu_tensor *x,
+        uint32_t n_tokens,
+        routed_moe_launch_plan *plan) {
+    if (!plan) return 0;
+    memset(plan, 0, sizeof(*plan));
+    if (!out || !gate || !up || !mid || !down || !model_map || !selected || !weights || !x ||
+        n_tokens == 0 || n_expert != DS4_ROCM_N_EXPERT_USED ||
+        expert_in_dim == 0u || expert_mid_dim == 0u || out_dim == 0u ||
+        expert_in_dim % CUDA_QK_K != 0 || expert_mid_dim % CUDA_QK_K != 0 ||
+        !cuda_tensor_has_elems2(x, n_tokens, expert_in_dim, sizeof(float)) ||
+        !cuda_tensor_has_elems2(selected, n_tokens, n_expert, sizeof(int32_t)) ||
+        !cuda_tensor_has_elems2(weights, n_tokens, n_expert, sizeof(float)) ||
+        !cuda_tensor_has_elems3(gate, n_tokens, n_expert, expert_mid_dim, sizeof(float)) ||
+        !cuda_tensor_has_elems3(up, n_tokens, n_expert, expert_mid_dim, sizeof(float)) ||
+        !cuda_tensor_has_elems3(mid, n_tokens, n_expert, expert_mid_dim, sizeof(float)) ||
+        !cuda_tensor_has_elems3(down, n_tokens, n_expert, out_dim, sizeof(float)) ||
+        !cuda_tensor_has_elems2(out, n_tokens, out_dim, sizeof(float))) {
+        return 0;
+    }
+    plan->q4k_path = (gate_type == 12u && down_type == 12u);
+    plan->iq2_path = (gate_type == 16u && down_type == 10u);
+    plan->q2k_path = (gate_type == 10u && down_type == 10u);
+    if (!plan->q4k_path && !plan->iq2_path && !plan->q2k_path) return 0;
+    if (plan->q4k_path && (n_tokens != 1u || n_expert != DS4_ROCM_N_EXPERT_USED)) return 0;
+    if (!cuda_u64_mul_checked(DS4_ROCM_N_EXPERT, gate_expert_bytes, &plan->gate_bytes) ||
+        !cuda_u64_mul_checked(DS4_ROCM_N_EXPERT, down_expert_bytes, &plan->down_bytes) ||
+        !cuda_model_range_fits(model_size, gate_offset, plan->gate_bytes) ||
+        !cuda_model_range_fits(model_size, up_offset, plan->gate_bytes) ||
+        !cuda_model_range_fits(model_size, down_offset, plan->down_bytes)) {
+        return 0;
+    }
+    return 1;
+}
+
 static int routed_moe_launch(
         ds4_gpu_tensor *out,
         ds4_gpu_tensor *gate,
@@ -343,33 +406,19 @@ static int routed_moe_launch(
         float clamp,
         const ds4_gpu_tensor *x,
         uint32_t n_tokens) {
-    if (!out || !gate || !up || !mid || !down || !model_map || !selected || !weights || !x ||
-        n_tokens == 0 || n_expert != DS4_ROCM_N_EXPERT_USED ||
-        expert_in_dim == 0u || expert_mid_dim == 0u || out_dim == 0u ||
-        expert_in_dim % CUDA_QK_K != 0 || expert_mid_dim % CUDA_QK_K != 0 ||
-        !cuda_tensor_has_elems2(x, n_tokens, expert_in_dim, sizeof(float)) ||
-        !cuda_tensor_has_elems2(selected, n_tokens, n_expert, sizeof(int32_t)) ||
-        !cuda_tensor_has_elems2(weights, n_tokens, n_expert, sizeof(float)) ||
-        !cuda_tensor_has_elems3(gate, n_tokens, n_expert, expert_mid_dim, sizeof(float)) ||
-        !cuda_tensor_has_elems3(up, n_tokens, n_expert, expert_mid_dim, sizeof(float)) ||
-        !cuda_tensor_has_elems3(mid, n_tokens, n_expert, expert_mid_dim, sizeof(float)) ||
-        !cuda_tensor_has_elems3(down, n_tokens, n_expert, out_dim, sizeof(float)) ||
-        !cuda_tensor_has_elems2(out, n_tokens, out_dim, sizeof(float))) {
+    routed_moe_launch_plan plan;
+    if (!routed_moe_build_plan(out, gate, up, mid, down, model_map, model_size,
+                               gate_offset, up_offset, down_offset, gate_type, down_type,
+                               gate_expert_bytes, down_expert_bytes, expert_in_dim,
+                               expert_mid_dim, out_dim, selected, weights, n_expert, x,
+                               n_tokens, &plan)) {
         return 0;
     }
-    const int q4k_path = (gate_type == 12u && down_type == 12u);
-    const int iq2_path = (gate_type == 16u && down_type == 10u);
-    const int q2k_path = (gate_type == 10u && down_type == 10u);
-    if (!q4k_path && !iq2_path && !q2k_path) return 0;
-    if (q4k_path && (n_tokens != 1u || n_expert != DS4_ROCM_N_EXPERT_USED)) return 0;
-    uint64_t gate_bytes = 0, down_bytes = 0;
-    if (!cuda_u64_mul_checked(DS4_ROCM_N_EXPERT, gate_expert_bytes, &gate_bytes) ||
-        !cuda_u64_mul_checked(DS4_ROCM_N_EXPERT, down_expert_bytes, &down_bytes) ||
-        !cuda_model_range_fits(model_size, gate_offset, gate_bytes) ||
-        !cuda_model_range_fits(model_size, up_offset, gate_bytes) ||
-        !cuda_model_range_fits(model_size, down_offset, down_bytes)) {
-        return 0;
-    }
+    const int q4k_path = plan.q4k_path;
+    const int iq2_path = plan.iq2_path;
+    const int q2k_path = plan.q2k_path;
+    const uint64_t gate_bytes = plan.gate_bytes;
+    const uint64_t down_bytes = plan.down_bytes;
     const char *gate_w = cuda_model_range_ptr(model_map, gate_offset, gate_bytes, "moe_gate");
     const char *up_w = cuda_model_range_ptr(model_map, up_offset, gate_bytes, "moe_up");
     const char *down_w = cuda_model_range_ptr(model_map, down_offset, down_bytes, "moe_down");

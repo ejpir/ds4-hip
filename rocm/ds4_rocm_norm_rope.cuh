@@ -410,34 +410,38 @@ __device__ static DS4_CUDA_UNUSED void rope_tail_one_dev(float *x, uint32_t head
 }
 
 extern "C" int ds4_gpu_rms_norm_plain_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, uint32_t n, float eps) {
-    if (!out || !x || out->bytes < (uint64_t)n * sizeof(float) ||
-        x->bytes < (uint64_t)n * sizeof(float)) return 0;
+    if (!cuda_tensor_has_f32(out, n) || !cuda_tensor_has_f32(x, n)) return 0;
+    if (n == 0u) return 1;
     rms_norm_plain_kernel<<<1, 256>>>((float *)out->ptr, (const float *)x->ptr, n, 1, eps);
     return cuda_ok(cudaGetLastError(), "rms_norm_plain launch");
 }
 extern "C" int ds4_gpu_rms_norm_plain_rows_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, uint32_t n, uint32_t rows, float eps) {
-    if (!out || !x || out->bytes < (uint64_t)n * rows * sizeof(float) ||
-        x->bytes < (uint64_t)n * rows * sizeof(float)) return 0;
+    if (!cuda_tensor_has_elems2(out, n, rows, sizeof(float)) ||
+        !cuda_tensor_has_elems2(x, n, rows, sizeof(float))) return 0;
+    if (n == 0u || rows == 0u) return 1;
     rms_norm_plain_kernel<<<rows, 256>>>((float *)out->ptr, (const float *)x->ptr, n, rows, eps);
     return cuda_ok(cudaGetLastError(), "rms_norm_plain launch");
 }
 extern "C" int ds4_gpu_rms_norm_weight_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t n, float eps) {
-    if (!out || !x || !model_map || weight_offset > model_size ||
-        model_size - weight_offset < (uint64_t)n * sizeof(float) ||
-        out->bytes < (uint64_t)n * sizeof(float) ||
-        x->bytes < (uint64_t)n * sizeof(float)) return 0;
-    const char *wptr = cuda_model_range_ptr(model_map, weight_offset, (uint64_t)n * sizeof(float), "rms_weight");
+    uint64_t weight_bytes = 0;
+    if (!model_map || !cuda_u64_mul_checked(n, sizeof(float), &weight_bytes) ||
+        !cuda_model_range_fits(model_size, weight_offset, weight_bytes) ||
+        !cuda_tensor_has_f32(out, n) || !cuda_tensor_has_f32(x, n)) return 0;
+    if (n == 0u) return 1;
+    const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "rms_weight");
     if (!wptr) return 0;
     const float *w = (const float *)wptr;
     rms_norm_weight_kernel<<<1, 256>>>((float *)out->ptr, (const float *)x->ptr, w, n, 1, eps);
     return cuda_ok(cudaGetLastError(), "rms_norm_weight launch");
 }
 extern "C" int ds4_gpu_rms_norm_weight_rows_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t n, uint32_t rows, float eps) {
-    if (!out || !x || !model_map || weight_offset > model_size ||
-        model_size - weight_offset < (uint64_t)n * sizeof(float) ||
-        out->bytes < (uint64_t)n * rows * sizeof(float) ||
-        x->bytes < (uint64_t)n * rows * sizeof(float)) return 0;
-    const char *wptr = cuda_model_range_ptr(model_map, weight_offset, (uint64_t)n * sizeof(float), "rms_weight");
+    uint64_t weight_bytes = 0;
+    if (!model_map || !cuda_u64_mul_checked(n, sizeof(float), &weight_bytes) ||
+        !cuda_model_range_fits(model_size, weight_offset, weight_bytes) ||
+        !cuda_tensor_has_elems2(out, n, rows, sizeof(float)) ||
+        !cuda_tensor_has_elems2(x, n, rows, sizeof(float))) return 0;
+    if (n == 0u || rows == 0u) return 1;
+    const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "rms_weight");
     if (!wptr) return 0;
     const float *w = (const float *)wptr;
     rms_norm_weight_kernel<<<rows, 256>>>((float *)out->ptr, (const float *)x->ptr, w, n, rows, eps);
@@ -457,21 +461,22 @@ extern "C" int ds4_gpu_dsv4_qkv_rms_norm_rows_tensor(
         uint32_t                rows,
         float                   eps) {
     if (!cuda_env_present("DS4_CUDA_DISABLE_QKV_RMS_FUSED")) {
-        if (!q_out || !q || !kv_out || !kv || !model_map ||
-            q_weight_offset > model_size ||
-            kv_weight_offset > model_size ||
-            model_size - q_weight_offset < (uint64_t)q_n * sizeof(float) ||
-            model_size - kv_weight_offset < (uint64_t)kv_n * sizeof(float) ||
-            q_out->bytes < (uint64_t)q_n * rows * sizeof(float) ||
-            q->bytes < (uint64_t)q_n * rows * sizeof(float) ||
-            kv_out->bytes < (uint64_t)kv_n * rows * sizeof(float) ||
-            kv->bytes < (uint64_t)kv_n * rows * sizeof(float)) {
+        uint64_t q_weight_bytes = 0, kv_weight_bytes = 0;
+        if (!model_map || !cuda_u64_mul_checked(q_n, sizeof(float), &q_weight_bytes) ||
+            !cuda_u64_mul_checked(kv_n, sizeof(float), &kv_weight_bytes) ||
+            !cuda_model_range_fits(model_size, q_weight_offset, q_weight_bytes) ||
+            !cuda_model_range_fits(model_size, kv_weight_offset, kv_weight_bytes) ||
+            !cuda_tensor_has_elems2(q_out, q_n, rows, sizeof(float)) ||
+            !cuda_tensor_has_elems2(q, q_n, rows, sizeof(float)) ||
+            !cuda_tensor_has_elems2(kv_out, kv_n, rows, sizeof(float)) ||
+            !cuda_tensor_has_elems2(kv, kv_n, rows, sizeof(float))) {
             return 0;
         }
+        if ((q_n == 0u && kv_n == 0u) || rows == 0u) return 1;
         const float *q_w = (const float *)cuda_model_range_ptr(model_map,
-                q_weight_offset, (uint64_t)q_n * sizeof(float), "q_rms_weight");
+                q_weight_offset, q_weight_bytes, "q_rms_weight");
         const float *kv_w = (const float *)cuda_model_range_ptr(model_map,
-                kv_weight_offset, (uint64_t)kv_n * sizeof(float), "kv_rms_weight");
+                kv_weight_offset, kv_weight_bytes, "kv_rms_weight");
         if (!q_w || !kv_w) return 0;
         dim3 grid(rows, 2u, 1u);
         dsv4_qkv_rms_norm_rows_kernel<<<grid, 256>>>(
@@ -493,14 +498,20 @@ extern "C" int ds4_gpu_dsv4_qkv_rms_norm_rows_tensor(
                                                  kv_weight_offset, kv_n, rows, eps);
 }
 extern "C" int ds4_gpu_head_rms_norm_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, float eps) {
-    if (!x || x->bytes < (uint64_t)n_tok * n_head * head_dim * sizeof(float)) return 0;
-    head_rms_norm_kernel<<<n_tok * n_head, 256>>>((float *)x->ptr, n_tok, n_head, head_dim, eps);
+    uint64_t rows64 = 0;
+    if (!cuda_u64_mul_checked(n_tok, n_head, &rows64) || rows64 > UINT32_MAX ||
+        !cuda_tensor_has_elems3(x, n_tok, n_head, head_dim, sizeof(float))) return 0;
+    if (rows64 == 0u || head_dim == 0u) return 1;
+    head_rms_norm_kernel<<<(uint32_t)rows64, 256>>>((float *)x->ptr, n_tok, n_head, head_dim, eps);
     return cuda_ok(cudaGetLastError(), "head_rms_norm launch");
 }
 extern "C" int ds4_gpu_head_rms_norm_rope_tail_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, uint32_t n_rot, uint32_t pos0, uint32_t n_ctx_orig, bool inverse, float freq_base, float freq_scale, float ext_factor, float attn_factor, float beta_fast, float beta_slow, float eps) {
-    if (!x || n_rot > head_dim || (n_rot & 1u) ||
-        x->bytes < (uint64_t)n_tok * n_head * head_dim * sizeof(float)) return 0;
-    head_rms_norm_rope_tail_kernel<<<n_tok * n_head, 256>>>((float *)x->ptr, n_tok, n_head, head_dim, n_rot, pos0, n_ctx_orig, inverse ? 1 : 0, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow, eps);
+    uint64_t rows64 = 0;
+    if (n_rot > head_dim || (n_rot & 1u) ||
+        !cuda_u64_mul_checked(n_tok, n_head, &rows64) || rows64 > UINT32_MAX ||
+        !cuda_tensor_has_elems3(x, n_tok, n_head, head_dim, sizeof(float))) return 0;
+    if (rows64 == 0u || head_dim == 0u) return 1;
+    head_rms_norm_rope_tail_kernel<<<(uint32_t)rows64, 256>>>((float *)x->ptr, n_tok, n_head, head_dim, n_rot, pos0, n_ctx_orig, inverse ? 1 : 0, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow, eps);
     return cuda_ok(cudaGetLastError(), "head_rms_norm_rope_tail launch");
 }
 extern "C" int ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(

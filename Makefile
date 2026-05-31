@@ -44,8 +44,10 @@ METAL_LDLIBS := $(LDLIBS)
 endif
 
 NODE ?= node
+PYTHON ?= python3
+ROCM_API_SMOKE ?= /tmp/rocm_api_smoke
 
-.PHONY: all help clean test pi-stateful-test cpu cuda cuda-spark cuda-generic cuda-regression rocm rocm-upstream
+.PHONY: all help clean test pi-stateful-test cpu cuda cuda-spark cuda-generic cuda-regression rocm rocm-upstream check-rocm-exports rocm-api-smoke rocm-api-smoke-build
 
 ifeq ($(UNAME_S),Darwin)
 all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
@@ -55,6 +57,8 @@ help:
 	@echo "  make              Build Metal ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, and ./ds4-agent"
 	@echo "  make cpu          Build CPU-only ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, and ./ds4-agent"
 	@echo "  make rocm         Build ROCm upstream-shaped binaries"
+	@echo "  make check-rocm-exports  Check ds4_gpu.h vs ROCm exports"
+	@echo "  make rocm-api-smoke      Build and run lightweight ROCm API smoke"
 	@echo "  make test         Build and run tests"
 	@echo "  make clean        Remove build outputs"
 
@@ -73,6 +77,8 @@ help:
 	@echo "  make cuda CUDA_ARCH=sm_N Build CUDA with an explicit nvcc -arch value"
 	@echo "  make rocm                Build ROCm upstream-shaped binaries"
 	@echo "  make rocm-upstream       Build ROCm upstream-shaped binaries"
+	@echo "  make check-rocm-exports  Check ds4_gpu.h vs ROCm exports"
+	@echo "  make rocm-api-smoke      Build and run lightweight ROCm API smoke"
 	@echo "  make cpu                 Build CPU-only ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, and ./ds4-agent"
 	@echo "  make test                Build and run tests"
 	@echo "  make pi-stateful-test    Run Pi DS4 stateful provider regression tests"
@@ -123,6 +129,15 @@ cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o ds4_eval_cpu.o ds4_agent_cpu
 
 rocm rocm-upstream: ds4-rocm-upstream ds4-server-rocm-upstream ds4-bench-rocm-upstream ds4-eval-rocm-upstream ds4-agent-rocm-upstream
 	@echo "ROCm upstream-shaped binaries built with ROCM_ARCH=$(ROCM_ARCH)"
+
+check-rocm-exports: ds4_rocm.o
+	$(PYTHON) tools/check_gpu_api_exports.py --backend ds4_rocm.o
+
+rocm-api-smoke-build: ds4_rocm.o
+	tools/run_rocm_api_smoke.sh --build-only --out $(ROCM_API_SMOKE)
+
+rocm-api-smoke: ds4_rocm.o
+	tools/run_rocm_api_smoke.sh --out $(ROCM_API_SMOKE)
 
 ds4-mtp-oracle-bench-rocm-upstream: tools/mtp_oracle_microbench_gpuapi.o ds4_gpuapi.o ds4_rocm.o
 	$(ROCM_HIPCC) -o $@ $^ $(ROCM_LDLIBS)

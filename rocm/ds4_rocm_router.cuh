@@ -19,25 +19,25 @@ __global__ static void router_select_kernel(
         int hash_mode) {
     uint32_t t = blockIdx.x;
     if (t >= n_tokens || threadIdx.x != 0) return;
-    const float *log = logits + (uint64_t)t * 256;
-    float *prob = probs + (uint64_t)t * 256;
-    int32_t *sel = selected + (uint64_t)t * 6;
-    float *w = weights + (uint64_t)t * 6;
+    const float *log = logits + (uint64_t)t * DS4_ROCM_N_EXPERT;
+    float *prob = probs + (uint64_t)t * DS4_ROCM_N_EXPERT;
+    int32_t *sel = selected + (uint64_t)t * DS4_ROCM_N_EXPERT_USED;
+    float *w = weights + (uint64_t)t * DS4_ROCM_N_EXPERT_USED;
 
-    for (int i = 0; i < 256; i++) prob[i] = sqrtf(softplus_dev(log[i]));
+    for (int i = 0; i < DS4_ROCM_N_EXPERT; i++) prob[i] = sqrtf(softplus_dev(log[i]));
 
     if (hash_mode) {
         int32_t tok = tokens ? tokens[t] : token_scalar;
         if (tok < 0 || (uint32_t)tok >= hash_rows) tok = 0;
-        const int32_t *row = hash + (uint64_t)tok * 6;
-        for (int i = 0; i < 6; i++) sel[i] = row[i];
+        const int32_t *row = hash + (uint64_t)tok * DS4_ROCM_N_EXPERT_USED;
+        for (int i = 0; i < DS4_ROCM_N_EXPERT_USED; i++) sel[i] = row[i];
     } else {
-        for (int i = 0; i < 6; i++) sel[i] = -1;
-        for (int i = 0; i < 256; i++) {
+        for (int i = 0; i < DS4_ROCM_N_EXPERT_USED; i++) sel[i] = -1;
+        for (int i = 0; i < DS4_ROCM_N_EXPERT; i++) {
             float score = prob[i] + (has_bias ? bias[i] : 0.0f);
-            for (int j = 0; j < 6; j++) {
+            for (int j = 0; j < DS4_ROCM_N_EXPERT_USED; j++) {
                 if (sel[j] < 0 || score > prob[sel[j]] + (has_bias ? bias[sel[j]] : 0.0f)) {
-                    for (int k = 5; k > j; k--) sel[k] = sel[k - 1];
+                    for (int k = DS4_ROCM_N_EXPERT_USED - 1; k > j; k--) sel[k] = sel[k - 1];
                     sel[j] = i;
                     break;
                 }
@@ -46,14 +46,14 @@ __global__ static void router_select_kernel(
     }
 
     float sum = 0.0f;
-    for (int i = 0; i < 6; i++) {
+    for (int i = 0; i < DS4_ROCM_N_EXPERT_USED; i++) {
         int e = sel[i];
-        float v = (e >= 0 && e < 256) ? prob[e] : 0.0f;
+        float v = (e >= 0 && e < DS4_ROCM_N_EXPERT) ? prob[e] : 0.0f;
         w[i] = v;
         sum += v;
     }
     sum = fmaxf(sum, 6.103515625e-5f);
-    for (int i = 0; i < 6; i++) w[i] = w[i] / sum * 1.5f;
+    for (int i = 0; i < DS4_ROCM_N_EXPERT_USED; i++) w[i] = w[i] / sum * DS4_ROCM_EXPERT_WEIGHT_SCALE;
 }
 
 __global__ static void router_select_parallel_kernel(
@@ -71,12 +71,12 @@ __global__ static void router_select_parallel_kernel(
         int hash_mode) {
     uint32_t t = blockIdx.x;
     uint32_t i = threadIdx.x;
-    if (t >= n_tokens || i >= 256u) return;
-    const float *log = logits + (uint64_t)t * 256;
-    float *prob = probs + (uint64_t)t * 256;
-    int32_t *sel = selected + (uint64_t)t * 6;
-    float *w = weights + (uint64_t)t * 6;
-    __shared__ float sprob[256];
+    if (t >= n_tokens || i >= DS4_ROCM_N_EXPERT) return;
+    const float *log = logits + (uint64_t)t * DS4_ROCM_N_EXPERT;
+    float *prob = probs + (uint64_t)t * DS4_ROCM_N_EXPERT;
+    int32_t *sel = selected + (uint64_t)t * DS4_ROCM_N_EXPERT_USED;
+    float *w = weights + (uint64_t)t * DS4_ROCM_N_EXPERT_USED;
+    __shared__ float sprob[DS4_ROCM_N_EXPERT];
 
     const float p = sqrtf(softplus_dev(log[i]));
     sprob[i] = p;
@@ -87,15 +87,15 @@ __global__ static void router_select_parallel_kernel(
     if (hash_mode) {
         int32_t tok = tokens ? tokens[t] : token_scalar;
         if (tok < 0 || (uint32_t)tok >= hash_rows) tok = 0;
-        const int32_t *row = hash + (uint64_t)tok * 6;
-        for (int j = 0; j < 6; j++) sel[j] = row[j];
+        const int32_t *row = hash + (uint64_t)tok * DS4_ROCM_N_EXPERT_USED;
+        for (int j = 0; j < DS4_ROCM_N_EXPERT_USED; j++) sel[j] = row[j];
     } else {
-        for (int j = 0; j < 6; j++) sel[j] = -1;
-        for (int e = 0; e < 256; e++) {
+        for (int j = 0; j < DS4_ROCM_N_EXPERT_USED; j++) sel[j] = -1;
+        for (int e = 0; e < DS4_ROCM_N_EXPERT; e++) {
             float score = sprob[e] + (has_bias ? bias[e] : 0.0f);
-            for (int j = 0; j < 6; j++) {
+            for (int j = 0; j < DS4_ROCM_N_EXPERT_USED; j++) {
                 if (sel[j] < 0 || score > sprob[sel[j]] + (has_bias ? bias[sel[j]] : 0.0f)) {
-                    for (int k = 5; k > j; k--) sel[k] = sel[k - 1];
+                    for (int k = DS4_ROCM_N_EXPERT_USED - 1; k > j; k--) sel[k] = sel[k - 1];
                     sel[j] = e;
                     break;
                 }
@@ -104,14 +104,14 @@ __global__ static void router_select_parallel_kernel(
     }
 
     float sum = 0.0f;
-    for (int j = 0; j < 6; j++) {
+    for (int j = 0; j < DS4_ROCM_N_EXPERT_USED; j++) {
         int e = sel[j];
-        float v = (e >= 0 && e < 256) ? sprob[e] : 0.0f;
+        float v = (e >= 0 && e < DS4_ROCM_N_EXPERT) ? sprob[e] : 0.0f;
         w[j] = v;
         sum += v;
     }
     sum = fmaxf(sum, 6.103515625e-5f);
-    for (int j = 0; j < 6; j++) w[j] = w[j] / sum * 1.5f;
+    for (int j = 0; j < DS4_ROCM_N_EXPERT_USED; j++) w[j] = w[j] / sum * DS4_ROCM_EXPERT_WEIGHT_SCALE;
 }
 
 __device__ __forceinline__ static bool router_score_better(float av, uint32_t ai, float bv, uint32_t bi) {
@@ -136,16 +136,16 @@ __global__ static void router_select_warp_topk_kernel(
     const uint32_t t = blockIdx.x * blockDim.y + row_in_block;
     if (t >= n_tokens || lane >= 32u) return;
 
-    const float *log = logits + (uint64_t)t * 256u;
-    float *prob = probs + (uint64_t)t * 256u;
-    int32_t *sel = selected + (uint64_t)t * 6u;
-    float *w = weights + (uint64_t)t * 6u;
-    __shared__ float sprob[4][256];
-    float local_prob[8];
-    float local_score[8];
+    const float *log = logits + (uint64_t)t * DS4_ROCM_N_EXPERT;
+    float *prob = probs + (uint64_t)t * DS4_ROCM_N_EXPERT;
+    int32_t *sel = selected + (uint64_t)t * DS4_ROCM_N_EXPERT_USED;
+    float *w = weights + (uint64_t)t * DS4_ROCM_N_EXPERT_USED;
+    __shared__ float sprob[4][DS4_ROCM_N_EXPERT];
+    float local_prob[DS4_ROCM_N_EXPERT / 32u];
+    float local_score[DS4_ROCM_N_EXPERT / 32u];
 
     #pragma unroll
-    for (uint32_t j = 0; j < 8u; j++) {
+    for (uint32_t j = 0; j < DS4_ROCM_N_EXPERT / 32u; j++) {
         const uint32_t e = lane + j * 32u;
         const float p = sqrtf(softplus_dev(log[e]));
         local_prob[j] = p;
@@ -159,32 +159,32 @@ __global__ static void router_select_warp_topk_kernel(
         if (lane == 0) {
             int32_t tok = tokens ? tokens[t] : token_scalar;
             if (tok < 0 || (uint32_t)tok >= hash_rows) tok = 0;
-            const int32_t *row = hash + (uint64_t)tok * 6u;
+            const int32_t *row = hash + (uint64_t)tok * DS4_ROCM_N_EXPERT_USED;
             float sum = 0.0f;
             #pragma unroll
-            for (uint32_t j = 0; j < 6u; j++) {
+            for (uint32_t j = 0; j < DS4_ROCM_N_EXPERT_USED; j++) {
                 const int32_t e = row[j];
                 sel[j] = e;
-                const float v = (e >= 0 && e < 256) ? sprob[row_in_block][(uint32_t)e] : 0.0f;
+                const float v = (e >= 0 && e < DS4_ROCM_N_EXPERT) ? sprob[row_in_block][(uint32_t)e] : 0.0f;
                 w[j] = v;
                 sum += v;
             }
             sum = fmaxf(sum, 6.103515625e-5f);
             #pragma unroll
-            for (uint32_t j = 0; j < 6u; j++) w[j] = w[j] / sum * 1.5f;
+            for (uint32_t j = 0; j < DS4_ROCM_N_EXPERT_USED; j++) w[j] = w[j] / sum * DS4_ROCM_EXPERT_WEIGHT_SCALE;
         }
         return;
     }
 
-    float out_prob[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
-    uint32_t out_idx[6] = {0, 0, 0, 0, 0, 0};
+    float out_prob[DS4_ROCM_N_EXPERT_USED] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    uint32_t out_idx[DS4_ROCM_N_EXPERT_USED] = {0, 0, 0, 0, 0, 0};
     #pragma unroll
-    for (uint32_t k = 0; k < 6u; k++) {
+    for (uint32_t k = 0; k < DS4_ROCM_N_EXPERT_USED; k++) {
         float best_score = -INFINITY;
         float best_prob = 0.0f;
         uint32_t best_idx = UINT32_MAX;
         #pragma unroll
-        for (uint32_t j = 0; j < 8u; j++) {
+        for (uint32_t j = 0; j < DS4_ROCM_N_EXPERT / 32u; j++) {
             const uint32_t e = lane + j * 32u;
             const float s = local_score[j];
             if (router_score_better(s, e, best_score, best_idx)) {
@@ -205,7 +205,7 @@ __global__ static void router_select_warp_topk_kernel(
             }
         }
         #pragma unroll
-        for (uint32_t j = 0; j < 8u; j++) {
+        for (uint32_t j = 0; j < DS4_ROCM_N_EXPERT / 32u; j++) {
             const uint32_t e = lane + j * 32u;
             if (e == best_idx) local_score[j] = -INFINITY;
         }
@@ -218,14 +218,14 @@ __global__ static void router_select_warp_topk_kernel(
     if (lane == 0) {
         float sum = 0.0f;
         #pragma unroll
-        for (uint32_t j = 0; j < 6u; j++) {
+        for (uint32_t j = 0; j < DS4_ROCM_N_EXPERT_USED; j++) {
             sel[j] = (int32_t)out_idx[j];
             w[j] = out_prob[j];
             sum += out_prob[j];
         }
         sum = fmaxf(sum, 6.103515625e-5f);
         #pragma unroll
-        for (uint32_t j = 0; j < 6u; j++) w[j] = w[j] / sum * 1.5f;
+        for (uint32_t j = 0; j < DS4_ROCM_N_EXPERT_USED; j++) w[j] = w[j] / sum * DS4_ROCM_EXPERT_WEIGHT_SCALE;
     }
 }
 
@@ -264,7 +264,7 @@ extern "C" int ds4_gpu_router_select_tensor(ds4_gpu_tensor *selected, ds4_gpu_te
                                                          bias, hash, (const float *)logits->ptr, NULL, tok, hash_rows, 1,
                                                          has_bias && !hash_mode, hash_mode);
         } else if (!cuda_env_present("DS4_CUDA_NO_PARALLEL_ROUTER_SELECT")) {
-            router_select_parallel_kernel<<<1, 256>>>((int32_t *)selected->ptr, (float *)weights->ptr, (float *)probs->ptr,
+            router_select_parallel_kernel<<<1, DS4_ROCM_N_EXPERT>>>((int32_t *)selected->ptr, (float *)weights->ptr, (float *)probs->ptr,
                                                       bias, hash, (const float *)logits->ptr, NULL, tok, hash_rows, 1,
                                                       has_bias && !hash_mode, hash_mode);
         } else {
@@ -319,7 +319,7 @@ extern "C" int ds4_gpu_router_select_batch_tensor(ds4_gpu_tensor *selected, ds4_
                                                                         has_bias && !hash_mode,
                                                                         hash_mode);
     } else if (!cuda_env_present("DS4_CUDA_NO_PARALLEL_ROUTER_SELECT")) {
-        router_select_parallel_kernel<<<n_tokens, 256>>>((int32_t *)selected->ptr,
+        router_select_parallel_kernel<<<n_tokens, DS4_ROCM_N_EXPERT>>>((int32_t *)selected->ptr,
                                                          (float *)weights->ptr,
                                                          (float *)probs->ptr,
                                                          bias,
