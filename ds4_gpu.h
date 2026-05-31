@@ -724,6 +724,11 @@ int ds4_gpu_directional_steering_project_tensor(
         uint32_t                rows,
         float                   scale);
 
+/* Router/MoE helpers are DS4 graph primitives, not general MoE APIs.
+ * The ROCm backend currently supports the DS4/DeepSeek shape only:
+ *   n_expert == 256, n_expert_used == 6, expert_weight_scale == 1.5f.
+ * Legacy callers may pass 0 for these shape parameters to request the DS4
+ * default, but new call sites should pass the explicit model constants. */
 int ds4_gpu_router_select_tensor(
         ds4_gpu_tensor       *selected,
         ds4_gpu_tensor       *weights,
