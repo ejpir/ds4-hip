@@ -3,6 +3,7 @@ import { STATUS_KEY } from "./config.ts";
 import { compactReason, decisionSummary, requestInfoFromPayload, requestSummary, sessionTag } from "./protocol.ts";
 import { ReadGuard } from "./policies/read-guard.ts";
 import { StatefulSessionStore } from "./session-state.ts";
+import type { Ds4ToolCoach } from "./coach.ts";
 import type { PrefillProgress, RuntimeConfig, StatefulUiRequest, UiPhase } from "./types.ts";
 import { chars, plural, shortId } from "./util.ts";
 
@@ -43,6 +44,7 @@ export class StatefulUi {
 		private readonly config: RuntimeConfig,
 		private readonly sessions: StatefulSessionStore,
 		private readonly readGuard: ReadGuard,
+		private readonly coach?: Ds4ToolCoach,
 	) {}
 
 	beginAgent(ctx: ExtensionContext): void {
@@ -183,6 +185,9 @@ export class StatefulUi {
 			? "new user messages use delta"
 			: "new user messages reset; tool results use delta";
 		const samplingLine = `presence=${this.config.presencePenalty.toFixed(2)} frequency=${this.config.frequencyPenalty.toFixed(2)} repeat=${this.config.repeatPenalty.toFixed(2)} last_n=${this.config.repeatLastN}`;
+		const coachLine = this.config.coachEnabled
+			? t.fg("success", `on calls=${this.coach?.calls ?? 0}/${this.coach?.attempts ?? 0} last=${this.coach?.lastDurationMs ? duration(this.coach.lastDurationMs / 1000) : "--"} max=${this.config.coachMaxTokens} timeout=${this.config.coachTimeoutMs}ms`)
+			: t.fg("dim", "off");
 		const lines: string[] = [
 			`${title} ${providerState}`,
 			"",
@@ -196,8 +201,12 @@ export class StatefulUi {
 			rule("Policy"),
 			row("user turn", `${t.fg("text", this.config.userTurnPolicy)} ${t.fg("dim", `(${userTurnNote})`)}`),
 			row("turn focus", onOff(this.config.turnFocusEnabled)),
-			row("read guard", `${this.config.readGuardEnabled ? t.fg("success", this.config.readGuardMode) : t.fg("dim", "off")} ${t.fg("dim", `seen=${this.readGuard.seenCount}`)}`),
+			row("read guard", this.config.coachEnabled
+				? `${t.fg("dim", "bypassed by coach")} ${t.fg("dim", `configured=${this.config.readGuardEnabled ? this.config.readGuardMode : "off"}`)}`
+				: `${this.config.readGuardEnabled ? t.fg("success", this.config.readGuardMode) : t.fg("dim", "off")} ${t.fg("dim", `seen=${this.readGuard.seenCount}`)}`),
 			row("sampling", t.fg("dim", samplingLine)),
+			row("coach", coachLine),
+			row("last coach", t.fg("dim", this.coach?.lastSummary ?? "none")),
 			row("last guard block", t.fg("dim", this.readGuard.lastSummary)),
 			foot(),
 			"",

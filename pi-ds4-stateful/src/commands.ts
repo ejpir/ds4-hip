@@ -1,5 +1,6 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { COMMAND_USAGE, parseReadGuardMode, parseUserTurnPolicy } from "./config.ts";
+import { Ds4ToolCoach } from "./coach.ts";
 import { ReadGuard } from "./policies/read-guard.ts";
 import { StatefulSessionStore } from "./session-state.ts";
 import type { RuntimeConfig } from "./types.ts";
@@ -11,6 +12,7 @@ export function registerDs4StatefulCommand(
 	sessions: StatefulSessionStore,
 	readGuard: ReadGuard,
 	ui: StatefulUi,
+	coach?: Ds4ToolCoach,
 ): void {
 	pi.registerCommand("ds4-stateful", {
 		description: `Control the DS4 stateful provider. Usage: ${COMMAND_USAGE}`,
@@ -35,6 +37,31 @@ export function registerDs4StatefulCommand(
 				if (policy) config.userTurnPolicy = policy;
 				else if (parts.length > 1 && parts[1] !== "status") {
 					ctx.ui.notify("Usage: /ds4-stateful user-turn [auto|reset|delta|status]", "error");
+					return;
+				}
+			} else if (parts[0] === "coach") {
+				if (parts[1] === "on") {
+					config.coachEnabled = true;
+					coach?.clear();
+				} else if (parts[1] === "off") {
+					config.coachEnabled = false;
+					coach?.clear();
+				} else if (parts[1] === "timeout") {
+					const timeout = Number.parseInt(parts[2] ?? "", 10);
+					if (!Number.isFinite(timeout) || timeout < 1000 || timeout > 120000) {
+						ctx.ui.notify("Usage: /ds4-stateful coach timeout <1000..120000 ms>", "error");
+						return;
+					}
+					config.coachTimeoutMs = timeout;
+				} else if (parts[1] === "max-tokens") {
+					const maxTokens = Number.parseInt(parts[2] ?? "", 10);
+					if (!Number.isFinite(maxTokens) || maxTokens < 32 || maxTokens > 2048) {
+						ctx.ui.notify("Usage: /ds4-stateful coach max-tokens <32..2048>", "error");
+						return;
+					}
+					config.coachMaxTokens = maxTokens;
+				} else if (parts.length > 1 && parts[1] !== "status") {
+					ctx.ui.notify("Usage: /ds4-stateful coach [on|off|timeout <ms>|max-tokens <n>|status]", "error");
 					return;
 				}
 			} else if (parts[0] === "focus" || parts[0] === "turn-focus") {

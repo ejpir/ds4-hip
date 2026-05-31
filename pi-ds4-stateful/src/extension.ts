@@ -1,6 +1,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { loadRuntimeConfig, PROVIDER_ID } from "./config.ts";
 import { registerDs4StatefulCommand } from "./commands.ts";
+import { Ds4ToolCoach, formatCoachNote } from "./coach.ts";
 import { ds4StatefulProviderConfig } from "./provider.ts";
 import { isDs4StatefulContext } from "./protocol.ts";
 import { checkBashFileReadFallback } from "./policies/bash-file-read-guard.ts";
@@ -13,7 +14,8 @@ export default function registerDs4StatefulExtension(pi: ExtensionAPI) {
 	const config = loadRuntimeConfig();
 	const sessions = new StatefulSessionStore();
 	const readGuard = new ReadGuard();
-	const ui = new StatefulUi(config, sessions, readGuard);
+	const coach = new Ds4ToolCoach(config);
+	const ui = new StatefulUi(config, sessions, readGuard, coach);
 	const isActiveDs4StatefulContext = (ctx: ExtensionContext) =>
 		config.enabled && isDs4StatefulContext(ctx);
 
@@ -21,6 +23,7 @@ export default function registerDs4StatefulExtension(pi: ExtensionAPI) {
 
 	pi.on("session_start", (_event, ctx) => {
 		readGuard.clearAll();
+		coach.clear();
 		ui.applyStatus(ctx);
 	});
 	pi.on("model_select", (_event, ctx) => ui.applyStatus(ctx));
@@ -30,7 +33,7 @@ export default function registerDs4StatefulExtension(pi: ExtensionAPI) {
 		if (!isActiveDs4StatefulContext(ctx)) return;
 		readGuard.beginTurn();
 		ui.beginAgent(ctx);
-		return { systemPrompt: appendToolUseGuidance(event.systemPrompt) };
+		return { systemPrompt: config.coachEnabled ? event.systemPrompt : appendToolUseGuidance(event.systemPrompt) };
 	});
 
 	pi.on("before_provider_request", (event, ctx) => {
@@ -66,6 +69,7 @@ export default function registerDs4StatefulExtension(pi: ExtensionAPI) {
 	pi.on("tool_call", (event, ctx) => {
 		if (!isActiveDs4StatefulContext(ctx)) return;
 		const input = (event as any).input;
+		if (config.coachEnabled) return;
 		if (event.toolName === "bash" && config.readGuardEnabled) {
 			const bashBlock = checkBashFileReadFallback(input, readGuard.hasBlockedReadsThisTurn());
 			if (bashBlock) return bashBlock;
@@ -78,9 +82,16 @@ export default function registerDs4StatefulExtension(pi: ExtensionAPI) {
 		return readGuard.checkRead(input, config.readGuardMode);
 	});
 
-	pi.on("tool_result", (event, ctx) => {
-		if (!isActiveDs4StatefulContext(ctx) || !config.readGuardEnabled || event.toolName !== "read" || event.isError) return;
-		readGuard.rememberRead((event as any).input, event.content);
+	pi.on("tool_result", async (event, ctx) => {
+		if (!isActiveDs4StatefulContext(ctx)) return;
+		if (!config.coachEnabled && config.readGuardEnabled && event.toolName === "read" && !event.isError) {
+			readGuard.rememberRead((event as any).input, event.content);
+		}
+		const advice = await coach.reviewToolResult(event, ctx);
+		if (!advice) return;
+		return {
+			content: [...event.content, { type: "text" as const, text: formatCoachNote(advice) }],
+		};
 	});
 
 	pi.on("agent_end", (_event, ctx) => {
@@ -88,5 +99,5 @@ export default function registerDs4StatefulExtension(pi: ExtensionAPI) {
 		ui.clearWorking(ctx);
 	});
 
-	registerDs4StatefulCommand(pi, config, sessions, readGuard, ui);
+	registerDs4StatefulCommand(pi, config, sessions, readGuard, ui, coach);
 }

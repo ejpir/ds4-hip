@@ -31,6 +31,9 @@ export interface RuntimeConfig {
 	frequencyPenalty: number;
 	repeatPenalty: number;
 	repeatLastN: number;
+	coachEnabled: boolean;
+	coachMaxTokens: number;
+	coachTimeoutMs: number;
 }
 
 export interface StatefulSession {

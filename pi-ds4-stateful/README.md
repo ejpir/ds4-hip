@@ -48,8 +48,9 @@ The extension also includes DS4-specific, configurable policies:
 - read guard: blocks exact duplicate reads and ranges fully covered by earlier reads
 - optional strict read guard: after a duplicate/covered read, blocks further same-file reads for that turn
 - optional turn-focus marker on follow-up user turns after the first turn
+- optional same-model side coach: on failed/suspicious tool results, a tiny stateless DS4 call returns concise next-action guidance and appends it to the tool result
 
-These policies live outside the server protocol; they are Pi-agent behavior guardrails.
+These policies live outside the server protocol; they are Pi-agent behavior guardrails. The low-latency default is prompt-guidance plus runtime guards. When the optional coach is enabled, the extension skips the hardcoded tool-use prompt guidance and bypasses hard blocking read/bash guards, relying on tool-result coaching instead.
 
 ## Install/test locally
 
@@ -82,6 +83,9 @@ PI_DS4_PRESENCE_PENALTY=0       # optional OpenAI-style sampling penalty
 PI_DS4_FREQUENCY_PENALTY=0      # try 0.10-0.20 when testing repetition loops
 PI_DS4_REPEAT_PENALTY=1         # llama.cpp-style; 1 disables
 PI_DS4_REPEAT_LAST_N=1024       # token window for penalties; 0 = all generated tokens
+PI_DS4_COACH=0                  # 1 enables same-model stateless side-call coaching and bypasses hardcoded prompt/read/bash guards
+PI_DS4_COACH_MAX_TOKENS=300
+PI_DS4_COACH_TIMEOUT_MS=30000
 DS4_STATEFUL_CONTEXT=100000
 DS4_STATEFUL_MAX_TOKENS=384000
 ```
@@ -94,6 +98,9 @@ Slash command:
 /ds4-stateful on|off
 /ds4-stateful user-turn auto|reset|delta
 /ds4-stateful read-guard on|off|exact|strict
+/ds4-stateful coach on|off
+/ds4-stateful coach timeout <ms>
+/ds4-stateful coach max-tokens <n>
 /ds4-stateful focus on|off
 ```
 
@@ -109,7 +116,8 @@ src/openai.ts                    Pi <-> OpenAI message conversion and SSE parser
 src/session-state.ts             reset/delta selection, revisions, commits
 src/protocol.ts                  stateful payload diagnostics and summaries
 src/policies/read-guard.ts       read range tracking/blocking
-src/policies/prompt-guidance.ts  model-facing tool-output/read guidance
+src/policies/prompt-guidance.ts  model-facing tool-output/read guidance (disabled when coach is on)
+src/coach.ts                     same-model stateless side-call coach for tool-result guidance
 src/ui.ts                        status line, working message, diagnostics
 src/commands.ts                  /ds4-stateful command parser
 ```

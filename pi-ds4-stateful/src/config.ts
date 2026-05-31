@@ -6,7 +6,7 @@ export const STATUS_KEY = "ds4-stateful";
 export const API_ID = "ds4-stateful-chat-completions";
 
 export const COMMAND_USAGE =
-	"/ds4-stateful [on|off|reset|status|focus on|off|read-guard on|off|exact|strict|user-turn auto|reset|delta]";
+	"/ds4-stateful [on|off|reset|status|coach on|off|timeout <ms>|max-tokens <n>|read-guard on|off|exact|strict|focus on|off|user-turn auto|reset|delta]";
 
 function envInt(name: string, fallback: number, min: number, max: number): number {
 	const raw = process.env[name];
@@ -23,6 +23,17 @@ function envFloat(names: string[], fallback: number, min: number, max: number): 
 		const n = Number.parseFloat(raw);
 		if (!Number.isFinite(n)) continue;
 		return Math.max(min, Math.min(max, n));
+	}
+	return fallback;
+}
+
+function envFlag(names: string[], fallback: boolean): boolean {
+	for (const name of names) {
+		const raw = process.env[name];
+		if (raw === undefined) continue;
+		const v = raw.trim().toLowerCase();
+		if (["1", "true", "yes", "on"].includes(v)) return true;
+		if (["0", "false", "no", "off"].includes(v)) return false;
 	}
 	return fallback;
 }
@@ -70,5 +81,8 @@ export function loadRuntimeConfig(): RuntimeConfig {
 		frequencyPenalty: envFloat(["PI_DS4_FREQUENCY_PENALTY", "DS4_STATEFUL_FREQUENCY_PENALTY"], 0, -2, 2),
 		repeatPenalty: envFloat(["PI_DS4_REPEAT_PENALTY", "DS4_STATEFUL_REPEAT_PENALTY"], 1, 1, 10),
 		repeatLastN: envInt("PI_DS4_REPEAT_LAST_N", envInt("DS4_STATEFUL_REPEAT_LAST_N", 1024, 0, 1048576), 0, 1048576),
+		coachEnabled: envFlag(["PI_DS4_COACH", "DS4_STATEFUL_COACH"], false),
+		coachMaxTokens: envInt("PI_DS4_COACH_MAX_TOKENS", envInt("DS4_STATEFUL_COACH_MAX_TOKENS", 300, 32, 2048), 32, 2048),
+		coachTimeoutMs: envInt("PI_DS4_COACH_TIMEOUT_MS", envInt("DS4_STATEFUL_COACH_TIMEOUT_MS", 30000, 1000, 120000), 1000, 120000),
 	};
 }
