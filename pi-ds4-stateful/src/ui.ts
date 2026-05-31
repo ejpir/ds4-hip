@@ -268,11 +268,18 @@ export class StatefulUi {
 
 	private progressSummary(progress: PrefillProgress | undefined, ctx: ExtensionContext, withBar = false): string | undefined {
 		if (!progress) return undefined;
+		const speed = progress.chunkTps > 0 ? progress.chunkTps : progress.avgTps;
+		const avg = progress.avgTps > 0 && progress.chunkTps > 0 ? ` avg ${rate(progress.avgTps)}` : "";
+		if (progress.phase === "decode") {
+			// Decode length is not known until a stop/tool call/length condition is hit.
+			// The server's `total` is the max-token cap, not the expected response size,
+			// so render decode as an indeterminate generated-token counter.
+			const current = Math.max(0, progress.current);
+			return `${current} tok · ${rate(speed)}${avg} · ${duration(progress.elapsed)}`;
+		}
 		const pct = progressPercent(progress);
 		const total = progress.total > 0 ? progress.total : 0;
 		const current = total > 0 ? Math.max(0, Math.min(total, progress.current)) : Math.max(0, progress.current);
-		const speed = progress.chunkTps > 0 ? progress.chunkTps : progress.avgTps;
-		const avg = progress.avgTps > 0 && progress.chunkTps > 0 ? ` avg ${rate(progress.avgTps)}` : "";
 		const count = total > 0 ? `${current}/${total}` : `${current}`;
 		const bar = withBar ? `${this.progressBar(progress, ctx)} ` : "";
 		return `${bar}${pct.toFixed(1)}% ${count} tok · ${rate(speed)}${avg} · ${duration(progress.elapsed)}`;
@@ -293,10 +300,14 @@ export class StatefulUi {
 
 	private progressWidgetLine(ctx: ExtensionContext): string | undefined {
 		if (!this.config.enabled || !this.activeRequest) return undefined;
+		// Show prefill in the widget: during prefill, normal assistant streaming has
+		// not started yet, and this is the most reliable visible TUI location. Decode
+		// stays in the normal working message to avoid duplicate decode lines.
+		if (this.activeDecode || this.activePhase === "stream") return undefined;
 		const t = ctx.ui.theme;
-		const label = this.activeDecode ? "decode" : this.activePrefill ? "prefill" : this.activePhase === "request" || this.activePhase === "response" ? "prefill" : undefined;
+		const label = this.activePrefill ? "prefill" : this.activePhase === "request" || this.activePhase === "response" ? "prefill" : undefined;
 		if (!label) return undefined;
-		const progress = this.activeDecode ?? this.activePrefill;
+		const progress = this.activePrefill;
 		const summary = progress
 			? this.progressSummary(progress, ctx, true)
 			: `${this.progressBar({ phase: label, current: 0, total: 1, percent: 0, chunkTps: 0, avgTps: 0, elapsed: Math.max(0, (Date.now() - this.activeRequest.startedAt) / 1000), timestamp: Date.now() }, ctx)} waiting for server progress · ${elapsed(this.activeRequest)}`;
@@ -340,10 +351,10 @@ export class StatefulUi {
 		const http = this.activeRequest.httpStatus ? ` ${this.httpBadge(ctx).trim()}` : "";
 		const reason = t.fg("dim", compactReason(this.activeRequest.reason));
 		const clock = t.fg("dim", elapsed(this.activeRequest));
-		if (this.activePhase === "request") {
-			const prefill = this.prefillSummary(ctx, true);
-			if (prefill) return `${t.fg("accent", "◆ DS4")} ${label} ${t.fg("accent", "prefill")} ${prefill}`;
-			return `${t.fg("accent", "◆ DS4")} ${label} ${t.fg("accent", "prefill")} ${reason} · ${clock}`;
+		if (this.activePhase === "request" || this.activePhase === "response") {
+			// Prefill is rendered in PROGRESS_WIDGET_KEY; keep the spinner line clear so
+			// the same prefill progress is not shown twice.
+			return undefined;
 		}
 		if (this.activePhase === "retry") {
 			return `${t.fg("warning", "↻ DS4 stale delta")} ${label} ${t.fg("dim", "→ full reset")} · ${clock}`;
