@@ -125,6 +125,8 @@ def main() -> int:
     ap.add_argument("--skip-forced", action="store_true")
     ap.add_argument("--allow-server", action="store_true",
                     help="allow running even if /tmp/ds4-server.pid is live")
+    ap.add_argument("--skip-export-check", action="store_true",
+                    help="skip ds4_gpu.h vs candidate binary export parity check")
     ap.add_argument("--greedy-top-k", type=int, default=20)
     ap.add_argument("--forced-top-k", type=int, default=128)
     ap.add_argument("--near-tie-logit-margin", type=float, default=0.25)
@@ -146,6 +148,27 @@ def main() -> int:
     if not cand_bin.exists():
         print(f"candidate binary not found: {args.candidate_bin}", file=sys.stderr)
         return 2
+    if not args.skip_export_check:
+        export_cmd = [
+            sys.executable,
+            "tools/check_gpu_api_exports.py",
+            "--backend",
+            str(cand_bin),
+        ]
+        export_proc = subprocess.run(
+            export_cmd,
+            cwd=repo_root(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        if export_proc.stdout:
+            print(export_proc.stdout.strip())
+        if export_proc.returncode != 0:
+            if export_proc.stderr:
+                print(export_proc.stderr.strip(), file=sys.stderr)
+            print("ROCm candidate export parity check failed", file=sys.stderr)
+            return 2
     model = Path(args.model)
     if not model.exists():
         print(f"model not found: {model}", file=sys.stderr)
