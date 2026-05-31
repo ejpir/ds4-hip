@@ -70,8 +70,8 @@ __global__ static void compressor_prefill_pool_kernel(
     if (d >= head_dim || c >= n_comp) return;
     uint32_t coff = ratio == 4u ? 2u : 1u;
     uint32_t width = coff * head_dim;
-    float vals[128];
-    float scores[128];
+    float vals[DS4_ROCM_COMPRESSOR_MAX_RATIO];
+    float scores[DS4_ROCM_COMPRESSOR_MAX_RATIO];
     float max_s = -INFINITY;
     uint32_t n_cand = 0;
     if (ratio == 4u) {
@@ -128,8 +128,8 @@ __global__ static void compressor_update_pool_kernel(
     if (d >= head_dim) return;
     uint32_t coff = ratio == 4u ? 2u : 1u;
     uint32_t width = coff * head_dim;
-    float vals[128];
-    float scores[128];
+    float vals[DS4_ROCM_COMPRESSOR_MAX_RATIO];
+    float scores[DS4_ROCM_COMPRESSOR_MAX_RATIO];
     float max_s = -INFINITY;
     uint32_t n_cand = 0;
     if (ratio == 4u) {
@@ -183,7 +183,7 @@ static int cuda_ape_type_supported(uint32_t type) {
 }
 
 static int cuda_compressor_shape_supported(uint32_t head_dim, uint32_t ratio) {
-    if (head_dim == 0u || ratio == 0u || ratio > 128u) return 0;
+    if (head_dim == 0u || ratio == 0u || ratio > DS4_ROCM_COMPRESSOR_MAX_RATIO) return 0;
     const uint32_t coff = ratio == 4u ? 2u : 1u;
     return head_dim <= UINT32_MAX / coff;
 }

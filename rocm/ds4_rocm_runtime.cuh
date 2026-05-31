@@ -20,6 +20,14 @@ static int g_cublas_ready;
 #endif
 static int g_quality_mode;
 
+enum {
+    DS4_ROCM_N_EXPERT = 256u,
+    DS4_ROCM_N_EXPERT_USED = 6u,
+    DS4_ROCM_COMPRESSOR_MAX_RATIO = 128u
+};
+static const float DS4_ROCM_EXPERT_WEIGHT_SCALE = 1.5f;
+static const float DS4_ROCM_EXPERT_WEIGHT_SCALE_TOL = 1.0e-6f;
+
 struct cuda_model_range {
     const void *host_base;
     uint64_t offset;
@@ -102,6 +110,48 @@ static int cuda_u64_mul_checked(uint64_t a, uint64_t b, uint64_t *out) {
 static int cuda_u64_mul3_checked(uint64_t a, uint64_t b, uint64_t c, uint64_t *out) {
     uint64_t tmp = 0;
     return cuda_u64_mul_checked(a, b, &tmp) && cuda_u64_mul_checked(tmp, c, out);
+}
+
+static int cuda_model_range_fits(uint64_t model_size, uint64_t offset, uint64_t bytes) {
+    return offset <= model_size && bytes <= model_size - offset;
+}
+
+static int cuda_tensor_has_bytes(const ds4_gpu_tensor *t, uint64_t bytes) {
+    return t && t->ptr && t->bytes >= bytes;
+}
+
+static int cuda_tensor_has_elems(const ds4_gpu_tensor *t, uint64_t elems, uint64_t elem_size) {
+    uint64_t bytes = 0;
+    return cuda_u64_mul_checked(elems, elem_size, &bytes) && cuda_tensor_has_bytes(t, bytes);
+}
+
+static int cuda_tensor_has_elems2(const ds4_gpu_tensor *t, uint64_t a, uint64_t b, uint64_t elem_size) {
+    uint64_t bytes = 0;
+    return cuda_u64_mul3_checked(a, b, elem_size, &bytes) && cuda_tensor_has_bytes(t, bytes);
+}
+
+static int cuda_tensor_has_elems3(const ds4_gpu_tensor *t, uint64_t a, uint64_t b, uint64_t c, uint64_t elem_size) {
+    uint64_t ab = 0, elems = 0, bytes = 0;
+    return cuda_u64_mul_checked(a, b, &ab) &&
+           cuda_u64_mul_checked(ab, c, &elems) &&
+           cuda_u64_mul_checked(elems, elem_size, &bytes) &&
+           cuda_tensor_has_bytes(t, bytes);
+}
+
+static int cuda_tensor_has_f32(const ds4_gpu_tensor *t, uint64_t elems) {
+    return cuda_tensor_has_elems(t, elems, sizeof(float));
+}
+
+static int cuda_tensor_has_i32(const ds4_gpu_tensor *t, uint64_t elems) {
+    return cuda_tensor_has_elems(t, elems, sizeof(int32_t));
+}
+
+static int cuda_tensor_has_f16(const ds4_gpu_tensor *t, uint64_t elems) {
+    return cuda_tensor_has_elems(t, elems, sizeof(__half));
+}
+
+static int cuda_tensor_has_u16(const ds4_gpu_tensor *t, uint64_t elems) {
+    return cuda_tensor_has_elems(t, elems, sizeof(uint16_t));
 }
 
 static const char *cuda_model_range_ptr_from_fd(
