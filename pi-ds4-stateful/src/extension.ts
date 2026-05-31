@@ -79,13 +79,15 @@ export default function registerDs4StatefulExtension(pi: ExtensionAPI) {
 			return;
 		}
 		if (!config.readGuardEnabled || event.toolName !== "read") return;
-		return readGuard.checkRead(input, config.readGuardMode);
+		const readBlock = readGuard.checkRead(input, config.readGuardMode);
+		if (readBlock) return readBlock;
+		readGuard.markReadRequested(input);
 	});
 
 	pi.on("tool_result", async (event, ctx) => {
 		if (!isActiveDs4StatefulContext(ctx)) return;
-		if (!config.coachEnabled && config.readGuardEnabled && event.toolName === "read" && !event.isError) {
-			readGuard.rememberRead((event as any).input, event.content);
+		if (!config.coachEnabled && config.readGuardEnabled && event.toolName === "read") {
+			readGuard.finishRead((event as any).input, event.content, event.isError);
 		}
 		const advice = await coach.reviewToolResult(event, ctx);
 		if (!advice) return;

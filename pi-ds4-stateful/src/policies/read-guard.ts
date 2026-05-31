@@ -62,6 +62,7 @@ function readRangeEnd(range: SeenReadRange): number {
 
 export class ReadGuard {
 	private readonly seenReadRanges = new Map<string, SeenReadRange>();
+	private readonly pendingReadRanges = new Map<string, SeenReadRange>();
 	private readonly blockedReadPathsThisTurn = new Map<string, number>();
 	lastSummary = "no read guard blocks yet";
 
@@ -81,12 +82,25 @@ export class ReadGuard {
 
 	clearAll(summary = "no read guard blocks yet"): void {
 		this.seenReadRanges.clear();
+		this.pendingReadRanges.clear();
 		this.blockedReadPathsThisTurn.clear();
 		this.lastSummary = summary;
 	}
 
 	beginTurn(): void {
 		this.blockedReadPathsThisTurn.clear();
+		this.pendingReadRanges.clear();
+	}
+
+	markReadRequested(input: unknown): void {
+		const range = readRange(input);
+		if (range) this.pendingReadRanges.set(range.key, range);
+	}
+
+	finishRead(input: unknown, content: unknown, isError: boolean): void {
+		const range = readRange(input);
+		if (range) this.pendingReadRanges.delete(range.key);
+		if (!isError) this.rememberRead(input, content);
 	}
 
 	rememberRead(input: unknown, content: unknown): void {
@@ -112,6 +126,9 @@ export class ReadGuard {
 		for (const [key, range] of this.seenReadRanges) {
 			if (range.path === path) this.seenReadRanges.delete(key);
 		}
+		for (const [key, range] of this.pendingReadRanges) {
+			if (range.path === path) this.pendingReadRanges.delete(key);
+		}
 	}
 
 	checkRead(input: unknown, mode: ReadGuardMode): ReadGuardDecision | undefined {
@@ -121,6 +138,8 @@ export class ReadGuard {
 		if (seen) return { block: true, reason: this.duplicateReadReason(seen) };
 		const coveredBy = this.coveringReadRange(range);
 		if (coveredBy) return { block: true, reason: this.coveredReadReason(range, coveredBy) };
+		const pending = this.pendingReadRanges.get(range.key) ?? this.pendingCoveringReadRange(range);
+		if (pending) return { block: true, reason: this.pendingReadReason(range, pending) };
 		if (mode === "strict" && (this.blockedReadPathsThisTurn.get(range.path) ?? 0) > 0) {
 			return { block: true, reason: this.followupReadBlockedReason(range) };
 		}
@@ -133,9 +152,20 @@ export class ReadGuard {
 			.sort((a, b) => a.offset - b.offset);
 	}
 
+	private pendingReadRangesForPath(path: string): SeenReadRange[] {
+		return [...this.pendingReadRanges.values()]
+			.filter((range) => range.path === path)
+			.sort((a, b) => a.offset - b.offset);
+	}
+
 	private coveringReadRange(range: SeenReadRange): SeenReadRange | undefined {
 		const end = readRangeEnd(range);
 		return this.readRangesForPath(range.path).find((seen) => seen.offset <= range.offset && readRangeEnd(seen) >= end);
+	}
+
+	private pendingCoveringReadRange(range: SeenReadRange): SeenReadRange | undefined {
+		const end = readRangeEnd(range);
+		return this.pendingReadRangesForPath(range.path).find((pending) => pending.offset <= range.offset && readRangeEnd(pending) >= end);
 	}
 
 	private seenReadRangesSummary(path: string): string {
@@ -168,6 +198,12 @@ export class ReadGuard {
 		const count = this.bumpBlocked(range.path);
 		this.lastSummary = `blocked covered read ${range.label} covered by ${coveredBy.label} (turn blocks for path=${count})`;
 		return `${this.guardControlPrefix()} Covered read blocked: ${range.label} is already covered by earlier read ${coveredBy.label}, which is still in model context. Do not retry this read, do not bypass it with bash file-dump commands, and do not claim this range is unavailable or not in context. Stop reading this file range and answer from existing context unless a different precise fact is needed. If needed, use grep/rg or an unread targeted range instead of splitting/rereading already-seen ranges. Seen ranges for this file: ${this.seenReadRangesSummary(range.path)}.`;
+	}
+
+	private pendingReadReason(range: SeenReadRange, pending: SeenReadRange): string {
+		const count = this.bumpBlocked(range.path);
+		this.lastSummary = `blocked in-flight read ${range.label} covered by requested ${pending.label} (turn blocks for path=${count})`;
+		return `${this.guardControlPrefix()} In-flight read blocked: ${range.label} is already covered by read request ${pending.label} from this same turn. Wait for/use that read result; do not issue overlapping reads before the first result arrives, and do not bypass it with bash file-dump commands. Seen ranges for this file: ${this.seenReadRangesSummary(range.path)}.`;
 	}
 
 	private followupReadBlockedReason(range: SeenReadRange): string {
