@@ -259,7 +259,8 @@ __global__ static void shared_gate_up_swiglu_q8_0_pair_preq_warp8_kernel(
         uint64_t out_dim,
         uint64_t blocks,
         int use_dp4a,
-        int store_gate_up) {
+        int store_gate_up,
+        float clamp) {
     const uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
     const uint32_t lane = threadIdx.x & 31u;
     if (row >= out_dim) return;
@@ -288,7 +289,13 @@ __global__ static void shared_gate_up_swiglu_q8_0_pair_preq_warp8_kernel(
             gate[row] = g;
             up[row] = u;
         }
-        mid[row] = (g / (1.0f + expf(-g))) * u;
+        float sg = g;
+        float su = u;
+        if (clamp > 1.0e-6f) {
+            sg = fminf(sg, clamp);
+            su = fminf(fmaxf(su, -clamp), clamp);
+        }
+        mid[row] = (sg / (1.0f + expf(-sg))) * su;
     }
 }
 
@@ -948,7 +955,8 @@ __global__ static void shared_gate_up_swiglu_q8_0_w32_kernel(
         uint32_t n_blocks,
         uint64_t out_dim,
         uint64_t row_bytes,
-        int store_gate_up) {
+        int store_gate_up,
+        float clamp) {
     const uint64_t row = (uint64_t)blockIdx.x;
     if (row >= out_dim) return;
     const uint32_t lane = threadIdx.x & 31u;
@@ -974,7 +982,13 @@ __global__ static void shared_gate_up_swiglu_q8_0_w32_kernel(
             gate[row] = g;
             up[row] = u;
         }
-        mid[row] = (g / (1.0f + expf(-g))) * u;
+        float sg = g;
+        float su = u;
+        if (clamp > 1.0e-6f) {
+            sg = fminf(sg, clamp);
+            su = fminf(fmaxf(su, -clamp), clamp);
+        }
+        mid[row] = (sg / (1.0f + expf(-sg))) * su;
     }
 }
 
@@ -988,7 +1002,8 @@ __global__ static void shared_gate_up_swiglu_q8_0_rows_w32_kernel(
         uint32_t n_blocks,
         uint64_t out_dim,
         uint64_t row_bytes,
-        int store_gate_up) {
+        int store_gate_up,
+        float clamp) {
     const uint32_t tid = threadIdx.x;
     const uint32_t lane = tid & 31u;
     const uint32_t wave = tid >> 5u;
@@ -1017,7 +1032,13 @@ __global__ static void shared_gate_up_swiglu_q8_0_rows_w32_kernel(
             gate[row] = g;
             up[row] = u;
         }
-        mid[row] = (g / (1.0f + expf(-g))) * u;
+        float sg = g;
+        float su = u;
+        if (clamp > 1.0e-6f) {
+            sg = fminf(sg, clamp);
+            su = fminf(fmaxf(su, -clamp), clamp);
+        }
+        mid[row] = (sg / (1.0f + expf(-sg))) * su;
     }
 }
 

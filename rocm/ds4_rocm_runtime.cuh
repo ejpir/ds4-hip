@@ -91,6 +91,19 @@ static cudaEvent_t g_model_stage_event[4];
 static uint64_t g_model_stage_bytes;
 
 static int cuda_ok(cudaError_t err, const char *what);
+
+static int cuda_u64_mul_checked(uint64_t a, uint64_t b, uint64_t *out) {
+    if (!out) return 0;
+    if (a != 0u && b > UINT64_MAX / a) return 0;
+    *out = a * b;
+    return 1;
+}
+
+static int cuda_u64_mul3_checked(uint64_t a, uint64_t b, uint64_t c, uint64_t *out) {
+    uint64_t tmp = 0;
+    return cuda_u64_mul_checked(a, b, &tmp) && cuda_u64_mul_checked(tmp, c, out);
+}
+
 static const char *cuda_model_range_ptr_from_fd(
         const void *model_map,
         uint64_t offset,
@@ -659,8 +672,9 @@ static const __half *cuda_q8_f16_ptr(
     const char *q8 = cuda_model_range_ptr(model_map, offset, weight_bytes, "q8_0");
     if (!q8) return NULL;
 
-    if (in_dim != 0 && out_dim > UINT64_MAX / in_dim / sizeof(__half)) return NULL;
-    const uint64_t out_bytes = in_dim * out_dim * sizeof(__half);
+    uint64_t out_bytes = 0;
+    if (in_dim == 0u || out_dim == 0u ||
+        !cuda_u64_mul3_checked(in_dim, out_dim, sizeof(__half), &out_bytes)) return NULL;
     if (!cuda_q8_f16_cache_has_budget(out_bytes, label)) return NULL;
 
     __half *dev = NULL;
@@ -712,8 +726,9 @@ static const __half *cuda_q8_f16_transpose_ptr(
     if (!cuda_q8_f16_cache_allowed(label, in_dim, out_dim)) return NULL;
     const char *q8 = cuda_model_range_ptr(model_map, offset, weight_bytes, "q8_0");
     if (!q8) return NULL;
-    if (in_dim != 0 && out_dim > UINT64_MAX / in_dim / sizeof(__half)) return NULL;
-    const uint64_t out_bytes = in_dim * out_dim * sizeof(__half);
+    uint64_t out_bytes = 0;
+    if (in_dim == 0u || out_dim == 0u ||
+        !cuda_u64_mul3_checked(in_dim, out_dim, sizeof(__half), &out_bytes)) return NULL;
     if (!cuda_q8_f16_cache_has_budget(out_bytes, label)) return NULL;
     __half *dev = NULL;
     cudaError_t err = cudaMalloc(&dev, (size_t)out_bytes);
@@ -766,7 +781,9 @@ static float *cuda_q8_f32_ptr(
     const char *q8 = cuda_model_range_ptr(model_map, offset, weight_bytes, label ? label : "q8_0");
     if (!q8) return NULL;
 
-    const uint64_t out_bytes = in_dim * out_dim * sizeof(float);
+    uint64_t out_bytes = 0;
+    if (in_dim == 0u || out_dim == 0u ||
+        !cuda_u64_mul3_checked(in_dim, out_dim, sizeof(float), &out_bytes)) return NULL;
     float *dev = NULL;
     cudaError_t err = cudaMalloc(&dev, (size_t)out_bytes);
     if (err != cudaSuccess) {
@@ -1175,8 +1192,15 @@ static int cuda_model_stage_pool_alloc(uint64_t bytes) {
             return 0;
         }
     }
+    uint64_t alloc_bytes = bytes;
+    if (g_model_direct_align > 1u) {
+        const uint64_t pad = g_model_direct_align - 1u;
+        if (alloc_bytes > UINT64_MAX - pad) return 0;
+        alloc_bytes += pad;
+    }
+    if (alloc_bytes > (uint64_t)SIZE_MAX) return 0;
     for (size_t i = 0; i < 4; i++) {
-        cudaError_t err = cudaMallocHost(&g_model_stage_raw[i], (size_t)bytes);
+        cudaError_t err = cudaMallocHost(&g_model_stage_raw[i], (size_t)alloc_bytes);
         if (err != cudaSuccess) {
             fprintf(stderr, DS4_GPU_LOG_PREFIX "pinned model staging allocation failed: %s\n", cudaGetErrorString(err));
             (void)cudaGetLastError();

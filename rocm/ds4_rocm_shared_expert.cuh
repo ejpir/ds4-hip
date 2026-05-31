@@ -18,10 +18,22 @@ extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
         uint64_t                out_dim,
         const ds4_gpu_tensor *x,
         float                   clamp) {
-    (void)clamp;
+    if (!gate || !up || !mid || !model_map || !x ||
+        in_dim == 0u || out_dim == 0u || in_dim > UINT32_MAX || out_dim > UINT32_MAX) {
+        return 0;
+    }
     const uint64_t blocks = (in_dim + 31u) / 32u;
-    const uint64_t row_bytes = blocks * 34u;
-    const uint64_t weight_bytes = out_dim * row_bytes;
+    uint64_t row_bytes = 0;
+    uint64_t weight_bytes = 0;
+    uint64_t x_bytes = 0;
+    uint64_t out_bytes = 0;
+    if (!cuda_u64_mul_checked(blocks, 34u, &row_bytes) ||
+        !cuda_u64_mul_checked(out_dim, row_bytes, &weight_bytes) ||
+        !cuda_u64_mul3_checked(in_dim, 1u, sizeof(float), &x_bytes) ||
+        !cuda_u64_mul3_checked(out_dim, 1u, sizeof(float), &out_bytes) ||
+        x->bytes < x_bytes || gate->bytes < out_bytes || up->bytes < out_bytes || mid->bytes < out_bytes) {
+        return 0;
+    }
     if (in_dim == 4096u && (in_dim & 31u) == 0u &&
         gate_offset <= model_size && up_offset <= model_size &&
         weight_bytes <= model_size - gate_offset &&
@@ -45,7 +57,8 @@ extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
                     (uint32_t)blocks,
                     out_dim,
                     row_bytes,
-                    store_gate_up);
+                    store_gate_up,
+                    clamp);
         } else {
             shared_gate_up_swiglu_q8_0_w32_kernel<<<(unsigned)out_dim, 32>>>(
                     (float *)gate->ptr,
@@ -57,7 +70,8 @@ extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
                     (uint32_t)blocks,
                     out_dim,
                     row_bytes,
-                    store_gate_up);
+                    store_gate_up,
+                    clamp);
         }
         return cuda_ok(cudaGetLastError(), "shared gate/up fused q8 launch");
     }
@@ -99,7 +113,8 @@ extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
                     out_dim,
                     blocks,
                     use_dp4a,
-                    store_gate_up);
+                    store_gate_up,
+                    clamp);
             return cuda_ok(cudaGetLastError(), "shared gate/up pair prequant swiglu launch");
         }
         return ds4_gpu_matmul_q8_0_pair_tensor(gate, up,
@@ -107,13 +122,13 @@ extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
                                                  gate_offset, up_offset,
                                                  in_dim, out_dim, out_dim,
                                                  x, 1) &&
-               ds4_gpu_swiglu_tensor(mid, gate, up, (uint32_t)out_dim, 0.0f, 1.0f);
+               ds4_gpu_swiglu_tensor(mid, gate, up, (uint32_t)out_dim, clamp, 1.0f);
     }
     return ds4_gpu_matmul_q8_0_tensor(gate, model_map, model_size,
                                         gate_offset, in_dim, out_dim, x, 1) &&
            ds4_gpu_matmul_q8_0_tensor(up, model_map, model_size,
                                         up_offset, in_dim, out_dim, x, 1) &&
-           ds4_gpu_swiglu_tensor(mid, gate, up, (uint32_t)out_dim, 0.0f, 1.0f);
+           ds4_gpu_swiglu_tensor(mid, gate, up, (uint32_t)out_dim, clamp, 1.0f);
 }
 
 static cudaStream_t g_shared_gate_up_stream = NULL;
@@ -187,12 +202,19 @@ extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_async_tensor(
         uint64_t                out_dim,
         const ds4_gpu_tensor *x,
         float                   clamp) {
-    (void)clamp;
     if (g_quality_mode || cuda_runtime_config()->graph_dump) return 0;
     if (g_shared_gate_up_pending && !cuda_shared_gate_up_async_wait_internal()) return 0;
+    if (!gate || !up || !mid || !model_map || !x ||
+        in_dim == 0u || out_dim == 0u || in_dim > UINT32_MAX || out_dim > UINT32_MAX) {
+        return 0;
+    }
     const uint64_t blocks = (in_dim + 31u) / 32u;
-    const uint64_t row_bytes = blocks * 34u;
-    const uint64_t weight_bytes = out_dim * row_bytes;
+    uint64_t row_bytes = 0;
+    uint64_t weight_bytes = 0;
+    if (!cuda_u64_mul_checked(blocks, 34u, &row_bytes) ||
+        !cuda_u64_mul_checked(out_dim, row_bytes, &weight_bytes)) {
+        return 0;
+    }
     if (!cuda_runtime_config()->q8_prequant_decode ||
         cuda_runtime_config()->disable_shared_gate_up_pair ||
         !gate || !up || !mid || !model_map || !x ||
@@ -286,7 +308,8 @@ extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_async_tensor(
                 out_dim,
                 blocks,
                 use_dp4a,
-                0);
+                0,
+                clamp);
         if (!cuda_ok(cudaGetLastError(), "shared gate/up async prequant swiglu launch")) return 0;
     } else {
         matmul_q8_0_pair_preq_warp8_kernel<<<((unsigned)out_dim + 7u) / 8u, 256, 0, g_shared_gate_up_stream>>>(
@@ -307,7 +330,7 @@ extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_async_tensor(
                 (const float *)gate->ptr,
                 (const float *)up->ptr,
                 (uint32_t)out_dim,
-                0.0f,
+                clamp,
                 1.0f);
         if (!cuda_ok(cudaGetLastError(), "shared gate/up async swiglu launch")) return 0;
     }
@@ -331,17 +354,19 @@ extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_batch_tensor(
         uint64_t                out_dim,
         const ds4_gpu_tensor *x,
         uint64_t                n_tok) {
+    uint64_t x_bytes = 0, out_bytes = 0;
     if (!gate || !up || !mid || !model_map || !x || n_tok == 0 ||
-        (in_dim & 31u) != 0u || in_dim > UINT32_MAX || out_dim > UINT32_MAX || n_tok > UINT32_MAX ||
-        x->bytes < n_tok * in_dim * sizeof(float) ||
-        gate->bytes < n_tok * out_dim * sizeof(float) ||
-        up->bytes < n_tok * out_dim * sizeof(float) ||
-        mid->bytes < n_tok * out_dim * sizeof(float)) {
+        (in_dim & 31u) != 0u || in_dim == 0u || out_dim == 0u ||
+        in_dim > UINT32_MAX || out_dim > UINT32_MAX || n_tok > UINT32_MAX ||
+        !cuda_u64_mul3_checked(n_tok, in_dim, sizeof(float), &x_bytes) ||
+        !cuda_u64_mul3_checked(n_tok, out_dim, sizeof(float), &out_bytes) ||
+        x->bytes < x_bytes || gate->bytes < out_bytes || up->bytes < out_bytes || mid->bytes < out_bytes) {
         return 0;
     }
     const uint64_t blocks = (in_dim + 31u) / 32u;
-    const uint64_t row_bytes = blocks * 34u;
-    const uint64_t weight_bytes = out_dim * row_bytes;
+    uint64_t row_bytes = 0, weight_bytes = 0;
+    if (!cuda_u64_mul_checked(blocks, 34u, &row_bytes) ||
+        !cuda_u64_mul_checked(out_dim, row_bytes, &weight_bytes)) return 0;
     if (gate_offset > model_size || up_offset > model_size ||
         weight_bytes > model_size - gate_offset || weight_bytes > model_size - up_offset) {
         return 0;

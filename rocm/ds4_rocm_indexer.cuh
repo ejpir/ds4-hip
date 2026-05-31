@@ -587,6 +587,42 @@ __global__ static void indexer_scores_wmma128_kernel(
 #endif
 }
 
+__global__ static void argmax_kernel(int32_t *out_idx, const float *logits, uint32_t n_vocab) {
+    enum { THREADS = 1024 };
+    __shared__ float sm_val[THREADS];
+    __shared__ int32_t sm_idx[THREADS];
+
+    const uint32_t tid = threadIdx.x;
+    float local_v = -INFINITY;
+    int32_t local_i = 0;
+    for (uint32_t i = tid; i < n_vocab; i += THREADS) {
+        const float v = logits[i];
+        if (v > local_v) {
+            local_v = v;
+            local_i = (int32_t)i;
+        }
+    }
+    sm_val[tid] = local_v;
+    sm_idx[tid] = local_i;
+    __syncthreads();
+
+    for (uint32_t s = THREADS / 2u; s > 0u; s >>= 1u) {
+        if (tid < s) {
+            const float vr = sm_val[tid + s];
+            const int32_t ir = sm_idx[tid + s];
+            const float vl = sm_val[tid];
+            const int32_t il = sm_idx[tid];
+            if ((vr > vl) || (vr == vl && ir < il)) {
+                sm_val[tid] = vr;
+                sm_idx[tid] = ir;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0u) *out_idx = sm_idx[0];
+}
+
 __global__ static void indexer_topk_kernel(uint32_t *selected, const float *scores, uint32_t n_comp, uint32_t n_tokens, uint32_t top_k) {
     uint32_t t = blockIdx.x;
     if (t >= n_tokens || threadIdx.x != 0) return;
@@ -1335,6 +1371,23 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
                                          (const float *)scores->ptr,
                                          n_comp, n_tokens, top_k);
     return cuda_ok(cudaGetLastError(), "indexer topk launch");
+}
+
+extern "C" int ds4_gpu_argmax_tensor(
+        ds4_gpu_tensor       *out_idx,
+        const ds4_gpu_tensor *logits,
+        uint32_t                n_vocab) {
+    uint64_t logits_bytes = 0;
+    if (!out_idx || !logits || n_vocab == 0u ||
+        out_idx->bytes < sizeof(int32_t) ||
+        !cuda_u64_mul3_checked(n_vocab, 1u, sizeof(float), &logits_bytes) ||
+        logits->bytes < logits_bytes) {
+        return 0;
+    }
+    argmax_kernel<<<1, 1024>>>((int32_t *)out_idx->ptr,
+                               (const float *)logits->ptr,
+                               n_vocab);
+    return cuda_ok(cudaGetLastError(), "argmax launch");
 }
 
 extern "C" int ds4_gpu_dsv4_topk_mask_tensor(

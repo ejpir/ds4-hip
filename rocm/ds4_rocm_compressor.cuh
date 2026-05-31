@@ -182,6 +182,12 @@ static int cuda_ape_type_supported(uint32_t type) {
     return type == 0u || type == 1u || type == 8u;
 }
 
+static int cuda_compressor_shape_supported(uint32_t head_dim, uint32_t ratio) {
+    if (head_dim == 0u || ratio == 0u || ratio > 128u) return 0;
+    const uint32_t coff = ratio == 4u ? 2u : 1u;
+    return head_dim <= UINT32_MAX / coff;
+}
+
 extern "C" int ds4_gpu_compressor_store_batch_tensor(
         const ds4_gpu_tensor *kv,
         const ds4_gpu_tensor *sc,
@@ -196,7 +202,7 @@ extern "C" int ds4_gpu_compressor_store_batch_tensor(
         uint32_t                pos0,
         uint32_t                n_tokens) {
     if (!kv || !sc || !state_kv || !state_score || !model_map ||
-        head_dim == 0 || ratio == 0 || n_tokens == 0 ||
+        !cuda_compressor_shape_supported(head_dim, ratio) || n_tokens == 0 ||
         !cuda_ape_type_supported(ape_type)) {
         return 0;
     }
@@ -255,7 +261,7 @@ extern "C" int ds4_gpu_compressor_update_tensor(
         float                   beta_slow,
         float                   rms_eps) {
     if (!kv_cur || !sc_cur || !state_kv || !state_score || !comp_cache ||
-        !model_map || head_dim == 0 || ratio == 0 ||
+        !model_map || !cuda_compressor_shape_supported(head_dim, ratio) ||
         n_rot > head_dim || (n_rot & 1u) != 0 ||
         !cuda_ape_type_supported(ape_type) || norm_type != 0u) {
         return 0;
@@ -337,7 +343,7 @@ extern "C" int ds4_gpu_compressor_prefill_tensor(
         float                   beta_slow,
         float                   rms_eps) {
     if (!comp_cache || !state_kv || !state_score || !kv || !sc || !model_map ||
-        head_dim == 0 || ratio == 0 || n_tokens == 0 ||
+        !cuda_compressor_shape_supported(head_dim, ratio) || n_tokens == 0 ||
         n_rot > head_dim || (n_rot & 1u) != 0 ||
         !cuda_ape_type_supported(ape_type) || norm_type != 0u) {
         return 0;

@@ -230,10 +230,14 @@ __global__ static void router_select_warp_topk_kernel(
 }
 
 extern "C" int ds4_gpu_router_select_tensor(ds4_gpu_tensor *selected, ds4_gpu_tensor *weights, ds4_gpu_tensor *probs, const void *model_map, uint64_t model_size, uint64_t bias_offset, uint64_t hash_offset, uint32_t hash_rows, uint32_t token, uint32_t n_expert, uint32_t n_expert_used, float expert_weight_scale, uint32_t n_expert_groups, uint32_t n_group_used, bool has_bias, bool hash_mode, const ds4_gpu_tensor *logits) {
-    (void)n_expert;
-    (void)n_expert_used;
-    (void)expert_weight_scale;
-    if (!selected || !weights || !probs || !logits || !model_map || n_expert_groups > 1u || n_group_used > 0u) return 0;
+    if (!selected || !weights || !probs || !logits || !model_map || n_expert_groups > 1u || n_group_used > 0u ||
+        (n_expert != 0u && n_expert != 256u) ||
+        (n_expert_used != 0u && n_expert_used != 6u) ||
+        (expert_weight_scale != 0.0f && !(fabsf(expert_weight_scale - 1.5f) <= 1.0e-6f)) ||
+        logits->bytes < 256ull * sizeof(float) ||
+        probs->bytes < 256ull * sizeof(float) ||
+        selected->bytes < 6ull * sizeof(int32_t) ||
+        weights->bytes < 6ull * sizeof(float)) return 0;
     int32_t tok = (int32_t)token;
     int ok = 1;
     const float *bias = NULL;
@@ -244,10 +248,13 @@ extern "C" int ds4_gpu_router_select_tensor(ds4_gpu_tensor *selected, ds4_gpu_te
         if (!bias) ok = 0;
     }
     if (ok && hash_mode) {
-        const uint64_t hash_bytes = (uint64_t)hash_rows * 6u * sizeof(int32_t);
-        if (hash_offset > model_size || hash_bytes > model_size - hash_offset) ok = 0;
-        else hash = (const int32_t *)cuda_model_range_ptr(model_map, hash_offset, hash_bytes, "router_hash");
-        if (!hash) ok = 0;
+        if (hash_rows == 0u) ok = 0;
+        else {
+            const uint64_t hash_bytes = (uint64_t)hash_rows * 6u * sizeof(int32_t);
+            if (hash_offset > model_size || hash_bytes > model_size - hash_offset) ok = 0;
+            else hash = (const int32_t *)cuda_model_range_ptr(model_map, hash_offset, hash_bytes, "router_hash");
+            if (!hash) ok = 0;
+        }
     }
     if (ok) {
         if (!cuda_env_present("DS4_CUDA_NO_WARP_ROUTER_SELECT") &&
@@ -270,11 +277,12 @@ extern "C" int ds4_gpu_router_select_tensor(ds4_gpu_tensor *selected, ds4_gpu_te
     return ok;
 }
 extern "C" int ds4_gpu_router_select_batch_tensor(ds4_gpu_tensor *selected, ds4_gpu_tensor *weights, ds4_gpu_tensor *probs, const void *model_map, uint64_t model_size, uint64_t bias_offset, uint64_t hash_offset, uint32_t hash_rows, uint32_t n_expert_groups, uint32_t n_group_used, bool has_bias, bool hash_mode, const ds4_gpu_tensor *logits, const ds4_gpu_tensor *tokens, uint32_t n_expert, uint32_t n_expert_used, float expert_weight_scale, uint32_t n_tokens) {
-    (void)n_expert;
-    (void)n_expert_used;
-    (void)expert_weight_scale;
     if (!selected || !weights || !probs || !logits || !tokens || !model_map || n_tokens == 0 ||
         n_expert_groups > 1u || n_group_used > 0u ||
+        (n_expert != 0u && n_expert != 256u) ||
+        (n_expert_used != 0u && n_expert_used != 6u) ||
+        (expert_weight_scale != 0.0f && !(fabsf(expert_weight_scale - 1.5f) <= 1.0e-6f)) ||
+        tokens->bytes < (uint64_t)n_tokens * sizeof(int32_t) ||
         logits->bytes < (uint64_t)n_tokens * 256u * sizeof(float) ||
         probs->bytes < (uint64_t)n_tokens * 256u * sizeof(float) ||
         selected->bytes < (uint64_t)n_tokens * 6u * sizeof(int32_t) ||
@@ -289,6 +297,7 @@ extern "C" int ds4_gpu_router_select_batch_tensor(ds4_gpu_tensor *selected, ds4_
         if (!bias) return 0;
     }
     if (hash_mode) {
+        if (hash_rows == 0u) return 0;
         const uint64_t hash_bytes = (uint64_t)hash_rows * 6u * sizeof(int32_t);
         if (hash_offset > model_size || hash_bytes > model_size - hash_offset) return 0;
         hash = (const int32_t *)cuda_model_range_ptr(model_map, hash_offset, hash_bytes, "router_hash");

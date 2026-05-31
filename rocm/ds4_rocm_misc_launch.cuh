@@ -13,10 +13,12 @@ extern "C" int ds4_gpu_directional_steering_project_tensor(
         uint32_t                width,
         uint32_t                rows,
         float                   scale) {
-    if (!x || !directions || width == 0 || rows == 0 || scale == 0.0f) return 0;
-    const uint64_t x_bytes = (uint64_t)width * rows * sizeof(float);
-    const uint64_t dir_bytes = (uint64_t)(layer + 1u) * width * sizeof(float);
-    if (x->bytes < x_bytes || directions->bytes < dir_bytes) return 0;
+    if (!x || !directions || width == 0 || rows == 0) return 0;
+    uint64_t x_bytes = 0, dir_bytes = 0;
+    if (!cuda_u64_mul3_checked(width, rows, sizeof(float), &x_bytes) ||
+        !cuda_u64_mul3_checked((uint64_t)layer + 1u, width, sizeof(float), &dir_bytes) ||
+        x->bytes < x_bytes || directions->bytes < dir_bytes) return 0;
+    if (scale == 0.0f) return 1;
 
     uint32_t nth = 256u;
     while (nth > width && nth > 1u) nth >>= 1;

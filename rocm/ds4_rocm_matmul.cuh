@@ -122,12 +122,18 @@ static int cuda_matmul_q8_0_tensor_f16_gemm(
         const ds4_gpu_tensor *x,
         uint64_t n_tok,
         const char *label) {
-    if (!g_cublas_ready || !out || !x || !model_map || n_tok == 0) return 0;
+    if (!g_cublas_ready || !out || !x || !model_map ||
+        in_dim == 0u || out_dim == 0u || n_tok == 0u ||
+        in_dim > UINT32_MAX || out_dim > UINT32_MAX || n_tok > UINT32_MAX) return 0;
     const uint64_t blocks = (in_dim + 31u) / 32u;
-    if (weight_offset > model_size || out_dim > UINT64_MAX / (blocks * 34u)) return 0;
-    const uint64_t weight_bytes = out_dim * blocks * 34u;
-    if (weight_bytes > model_size - weight_offset) return 0;
-    if (x->bytes < n_tok * in_dim * sizeof(float) || out->bytes < n_tok * out_dim * sizeof(float)) return 0;
+    uint64_t row_bytes = 0, weight_bytes = 0, x_bytes = 0, out_bytes = 0;
+    if (weight_offset > model_size ||
+        !cuda_u64_mul_checked(blocks, 34u, &row_bytes) ||
+        !cuda_u64_mul_checked(out_dim, row_bytes, &weight_bytes) ||
+        weight_bytes > model_size - weight_offset ||
+        !cuda_u64_mul3_checked(n_tok, in_dim, sizeof(float), &x_bytes) ||
+        !cuda_u64_mul3_checked(n_tok, out_dim, sizeof(float), &out_bytes) ||
+        x->bytes < x_bytes || out->bytes < out_bytes) return 0;
     const __half *w_f16 = cuda_q8_f16_ptr(model_map, weight_offset, weight_bytes, in_dim, out_dim, label);
     if (!w_f16) return 0;
     const uint64_t xh_count = n_tok * in_dim;
@@ -173,12 +179,18 @@ static int cuda_matmul_q8_0_tensor_f16_gemm_out_half(
         const ds4_gpu_tensor *x,
         uint64_t n_tok,
         const char *label) {
-    if (!g_cublas_ready || !out_h || !x || !model_map || n_tok == 0) return 0;
+    if (!g_cublas_ready || !out_h || !x || !model_map ||
+        in_dim == 0u || out_dim == 0u || n_tok == 0u ||
+        in_dim > UINT32_MAX || out_dim > UINT32_MAX || n_tok > UINT32_MAX) return 0;
     const uint64_t blocks = (in_dim + 31u) / 32u;
-    if (weight_offset > model_size || out_dim > UINT64_MAX / (blocks * 34u)) return 0;
-    const uint64_t weight_bytes = out_dim * blocks * 34u;
-    if (weight_bytes > model_size - weight_offset) return 0;
-    if (x->bytes < n_tok * in_dim * sizeof(float) || out_h->bytes < n_tok * out_dim * sizeof(__half)) return 0;
+    uint64_t row_bytes = 0, weight_bytes = 0, x_bytes = 0, out_bytes = 0;
+    if (weight_offset > model_size ||
+        !cuda_u64_mul_checked(blocks, 34u, &row_bytes) ||
+        !cuda_u64_mul_checked(out_dim, row_bytes, &weight_bytes) ||
+        weight_bytes > model_size - weight_offset ||
+        !cuda_u64_mul3_checked(n_tok, in_dim, sizeof(float), &x_bytes) ||
+        !cuda_u64_mul3_checked(n_tok, out_dim, sizeof(__half), &out_bytes) ||
+        x->bytes < x_bytes || out_h->bytes < out_bytes) return 0;
     const __half *w_f16 = cuda_q8_f16_ptr(model_map, weight_offset, weight_bytes, in_dim, out_dim, label);
     if (!w_f16) return 0;
     const uint64_t xh_count = n_tok * in_dim;
@@ -229,13 +241,18 @@ extern "C" int ds4_gpu_matmul_q8_0_f16_out_tensor(
 }
 
 static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok, const char *label) {
-    if (!out || !x || !model_map) return 0;
-    uint64_t blocks = (in_dim + 31) / 32;
-    if (weight_offset > model_size || out_dim > UINT64_MAX / (blocks * 34)) return 0;
-    uint64_t weight_bytes = out_dim * blocks * 34;
-    if (weight_bytes > model_size - weight_offset) return 0;
-    if (x->bytes < n_tok * in_dim * sizeof(float) ||
-        out->bytes < n_tok * out_dim * sizeof(float)) return 0;
+    if (!out || !x || !model_map ||
+        in_dim == 0u || out_dim == 0u || n_tok == 0u ||
+        in_dim > UINT32_MAX || out_dim > UINT32_MAX || n_tok > UINT32_MAX) return 0;
+    uint64_t blocks = (in_dim + 31u) / 32u;
+    uint64_t row_bytes = 0, weight_bytes = 0, x_bytes = 0, out_bytes = 0;
+    if (weight_offset > model_size ||
+        !cuda_u64_mul_checked(blocks, 34u, &row_bytes) ||
+        !cuda_u64_mul_checked(out_dim, row_bytes, &weight_bytes) ||
+        weight_bytes > model_size - weight_offset ||
+        !cuda_u64_mul3_checked(n_tok, in_dim, sizeof(float), &x_bytes) ||
+        !cuda_u64_mul3_checked(n_tok, out_dim, sizeof(float), &out_bytes) ||
+        x->bytes < x_bytes || out->bytes < out_bytes) return 0;
     const int attn_q_b_shape = (in_dim == 1024u && out_dim == 32768u);
     if (n_tok > 1 &&
         ((label && strstr(label, "attn_q_b") != NULL) || attn_q_b_shape) &&
@@ -570,7 +587,9 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
         uint64_t out1_dim,
         const ds4_gpu_tensor *x,
         uint64_t n_tok) {
-    if (!out0 || !out1 || !x || !model_map || in_dim == 0 || out0_dim == 0 || out1_dim == 0 || n_tok == 0) {
+    if (!out0 || !out1 || !x || !model_map ||
+        in_dim == 0 || out0_dim == 0 || out1_dim == 0 || n_tok == 0 ||
+        in_dim > UINT32_MAX || out0_dim > UINT32_MAX || out1_dim > UINT32_MAX || n_tok > UINT32_MAX) {
         return 0;
     }
     if (n_tok != 1) {
@@ -579,14 +598,14 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
                cuda_matmul_q8_0_tensor_labeled(out1, model_map, model_size, weight1_offset,
                                                in_dim, out1_dim, x, n_tok, "q8_0_pair1");
     }
-    const uint64_t blocks = (in_dim + 31) / 32;
+    const uint64_t blocks = (in_dim + 31u) / 32u;
+    uint64_t row_bytes = 0, weight0_bytes = 0, weight1_bytes = 0;
     if (weight0_offset > model_size || weight1_offset > model_size ||
-        out0_dim > UINT64_MAX / (blocks * 34) ||
-        out1_dim > UINT64_MAX / (blocks * 34)) {
+        !cuda_u64_mul_checked(blocks, 34u, &row_bytes) ||
+        !cuda_u64_mul_checked(out0_dim, row_bytes, &weight0_bytes) ||
+        !cuda_u64_mul_checked(out1_dim, row_bytes, &weight1_bytes)) {
         return 0;
     }
-    const uint64_t weight0_bytes = out0_dim * blocks * 34;
-    const uint64_t weight1_bytes = out1_dim * blocks * 34;
     if (weight0_bytes > model_size - weight0_offset ||
         weight1_bytes > model_size - weight1_offset ||
         x->bytes < in_dim * sizeof(float) ||
@@ -935,12 +954,16 @@ static int cuda_matmul_q8_0_hc_expand_tensor_labeled(
 }
 
 extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
-    if (!out || !x || !model_map) return 0;
-    if (weight_offset > model_size || out_dim > UINT64_MAX / in_dim) return 0;
-    uint64_t weight_bytes = out_dim * in_dim * sizeof(uint16_t);
-    if (weight_bytes > model_size - weight_offset) return 0;
-    if (x->bytes < n_tok * in_dim * sizeof(float) ||
-        out->bytes < n_tok * out_dim * sizeof(float)) return 0;
+    if (!out || !x || !model_map ||
+        in_dim == 0u || out_dim == 0u || n_tok == 0u ||
+        in_dim > UINT32_MAX || out_dim > UINT32_MAX || n_tok > UINT32_MAX) return 0;
+    uint64_t weight_bytes = 0, x_bytes = 0, out_bytes = 0;
+    if (weight_offset > model_size ||
+        !cuda_u64_mul3_checked(out_dim, in_dim, sizeof(uint16_t), &weight_bytes) ||
+        weight_bytes > model_size - weight_offset ||
+        !cuda_u64_mul3_checked(n_tok, in_dim, sizeof(float), &x_bytes) ||
+        !cuda_u64_mul3_checked(n_tok, out_dim, sizeof(float), &out_bytes) ||
+        x->bytes < x_bytes || out->bytes < out_bytes) return 0;
     const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "f16");
     if (!wptr) return 0;
     const __half *w = (const __half *)wptr;
@@ -1028,7 +1051,8 @@ extern "C" int ds4_gpu_matmul_f16_pair_tensor(
         uint64_t out_dim,
         const ds4_gpu_tensor *x,
         uint64_t n_tok) {
-    if (!out0 || !out1 || !x || !model_map || in_dim == 0 || out_dim == 0 || n_tok == 0) {
+    if (!out0 || !out1 || !x || !model_map || in_dim == 0 || out_dim == 0 || n_tok == 0 ||
+        in_dim > UINT32_MAX || out_dim > UINT32_MAX || n_tok > UINT32_MAX) {
         return 0;
     }
     if (n_tok != 1 ||
@@ -1039,11 +1063,11 @@ extern "C" int ds4_gpu_matmul_f16_pair_tensor(
                ds4_gpu_matmul_f16_tensor(out1, model_map, model_size, weight1_offset,
                                            in_dim, out_dim, x, n_tok);
     }
+    uint64_t weight_bytes = 0;
     if (weight0_offset > model_size || weight1_offset > model_size ||
-        out_dim > UINT64_MAX / in_dim) {
+        !cuda_u64_mul3_checked(out_dim, in_dim, sizeof(uint16_t), &weight_bytes)) {
         return 0;
     }
-    const uint64_t weight_bytes = out_dim * in_dim * sizeof(uint16_t);
     if (weight_bytes > model_size - weight0_offset ||
         weight_bytes > model_size - weight1_offset ||
         x->bytes < in_dim * sizeof(float) ||
@@ -1090,14 +1114,15 @@ extern "C" int ds4_gpu_matmul_f16_pair_tensor(
 }
 
 extern "C" int ds4_gpu_matmul_f32_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
-    if (!out || !x || !model_map || in_dim == 0 || out_dim == 0 || n_tok == 0) return 0;
-    if (weight_offset > model_size || out_dim > UINT64_MAX / in_dim) return 0;
-    uint64_t weight_elems = out_dim * in_dim;
-    if (weight_elems > UINT64_MAX / sizeof(float)) return 0;
-    uint64_t weight_bytes = weight_elems * sizeof(float);
-    if (weight_bytes > model_size - weight_offset) return 0;
-    if (x->bytes < n_tok * in_dim * sizeof(float) ||
-        out->bytes < n_tok * out_dim * sizeof(float)) return 0;
+    if (!out || !x || !model_map || in_dim == 0 || out_dim == 0 || n_tok == 0 ||
+        in_dim > UINT32_MAX || out_dim > UINT32_MAX || n_tok > UINT32_MAX) return 0;
+    uint64_t weight_bytes = 0, x_bytes = 0, out_bytes = 0;
+    if (weight_offset > model_size ||
+        !cuda_u64_mul3_checked(out_dim, in_dim, sizeof(float), &weight_bytes) ||
+        weight_bytes > model_size - weight_offset ||
+        !cuda_u64_mul3_checked(n_tok, in_dim, sizeof(float), &x_bytes) ||
+        !cuda_u64_mul3_checked(n_tok, out_dim, sizeof(float), &out_bytes) ||
+        x->bytes < x_bytes || out->bytes < out_bytes) return 0;
     const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "f32");
     if (!wptr) return 0;
     const float *w = (const float *)wptr;

@@ -344,7 +344,7 @@ static int routed_moe_launch(
         const ds4_gpu_tensor *x,
         uint32_t n_tokens) {
     if (!out || !gate || !up || !mid || !down || !model_map || !selected || !weights || !x ||
-        n_tokens == 0 || n_expert == 0 ||
+        n_tokens == 0 || n_expert != 6u ||
         expert_in_dim % CUDA_QK_K != 0 || expert_mid_dim % CUDA_QK_K != 0 ||
         gate_offset > model_size || up_offset > model_size || down_offset > model_size ||
         x->bytes < (uint64_t)n_tokens * expert_in_dim * sizeof(float) ||
@@ -2136,7 +2136,38 @@ static int routed_moe_launch(
                 (void)cudaEventRecord(prof0, 0);
             }
         }
-        if (rows_per_block == 1u) {
+        const uint64_t xq_gate_bytes = (uint64_t)n_tokens * xq_blocks * sizeof(cuda_block_q8_K);
+        const int q8k_gateup = n_tokens == 1u && n_expert == 6u && down->bytes >= xq_gate_bytes &&
+            cuda_env_flag_any3("DS4_CUDA_MOE_DECODE_Q8K_GATEUP",
+                               "DS4_HIP_MOE_DECODE_Q8K_GATEUP",
+                               "DS4_HIP_MOE_Q8K_GATEUP");
+        int ok_gateup = 1;
+        if (q8k_gateup) {
+            cuda_block_q8_K *xq_gate = (cuda_block_q8_K *)down->ptr;
+            dim3 xq_grid(xq_blocks, n_tokens, 1);
+            q8_K_quantize_kernel<<<xq_grid, 256>>>(xq_gate, (const float *)x->ptr, expert_in_dim, n_tokens);
+            ok_gateup = cuda_ok(cudaGetLastError(), "routed_moe q2 oldhip q8k gate input quantize launch");
+            if (ok_gateup) {
+                dim3 gate_grid((expert_mid_dim + 255u) / 256u, n_tokens * n_expert, 1);
+                moe_gate_up_mid_q2K_decode_q8_qwarp32_kernel<<<gate_grid, 256u>>>(
+                        (float *)gate->ptr,
+                        (float *)up->ptr,
+                        (float *)mid->ptr,
+                        gate_w,
+                        up_w,
+                        xq_gate,
+                        (const int32_t *)selected->ptr,
+                        (const float *)weights->ptr,
+                        gate_expert_bytes,
+                        gate_row_bytes,
+                        xq_blocks,
+                        expert_mid_dim,
+                        n_expert,
+                        (uint32_t)store_gate_up,
+                        clamp);
+                ok_gateup = cuda_ok(cudaGetLastError(), "routed_moe q2 oldhip q8k gate/up launch");
+            }
+        } else if (rows_per_block == 1u) {
             dim3 gate_grid(expert_mid_dim, n_tokens * n_expert, 1);
             moe_gate_up_mid_q2K_rows_rpb1_w32_kernel<<<gate_grid, 32u>>>(
                     (float *)gate->ptr,
@@ -2154,6 +2185,7 @@ static int routed_moe_launch(
                     n_expert,
                     clamp,
                     store_gate_up);
+            ok_gateup = cuda_ok(cudaGetLastError(), "routed_moe q2 oldhip rows gate/up launch");
         } else {
             dim3 gate_grid((expert_mid_dim + rows_per_block - 1u) / rows_per_block, n_tokens * n_expert, 1);
             moe_gate_up_mid_q2K_rows_w32_kernel<<<gate_grid, threads>>>(
@@ -2172,8 +2204,9 @@ static int routed_moe_launch(
                     n_expert,
                     clamp,
                     store_gate_up);
+            ok_gateup = cuda_ok(cudaGetLastError(), "routed_moe q2 oldhip rows gate/up launch");
         }
-        if (!cuda_ok(cudaGetLastError(), "routed_moe q2 oldhip rows gate/up launch")) {
+        if (!ok_gateup) {
             if (prof0) (void)cudaEventDestroy(prof0);
             if (prof1) (void)cudaEventDestroy(prof1);
             if (prof2) (void)cudaEventDestroy(prof2);
@@ -2298,7 +2331,7 @@ static int routed_moe_launch(
 }
 
 extern "C" int ds4_gpu_routed_moe_one_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x) {
-    (void)n_total_expert;
+    if (n_total_expert != 0u && n_total_expert != 256u) return 0;
     return routed_moe_launch(out, gate, up, mid, down, model_map, model_size,
                              gate_offset, up_offset, down_offset,
                              gate_type, down_type,
@@ -2308,9 +2341,9 @@ extern "C" int ds4_gpu_routed_moe_one_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor
                              selected, weights, n_expert, clamp, x, 1);
 }
 extern "C" int ds4_gpu_routed_moe_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x, uint32_t layer_index, uint32_t n_tokens, bool *mid_is_f16) {
-    (void)n_total_expert;
+    if (n_total_expert != 0u && n_total_expert != 256u) return 0;
     (void)layer_index;
-    (void)mid_is_f16;
+    if (mid_is_f16) *mid_is_f16 = false;
     return routed_moe_launch(out, gate, up, mid, down, model_map, model_size,
                              gate_offset, up_offset, down_offset,
                              gate_type, down_type,

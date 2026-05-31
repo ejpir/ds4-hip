@@ -27,18 +27,57 @@ extern "C" int ds4_gpu_hc_split_sinkhorn_tensor(ds4_gpu_tensor *out, const ds4_g
         n_rows, sinkhorn_iters, eps);
     return cuda_ok(cudaGetLastError(), "hc_split_sinkhorn launch");
 }
+static int cuda_hc_flat_token_count(const ds4_gpu_tensor *out, uint32_t n_embd, uint64_t *n_tokens) {
+    if (!out || n_embd == 0u || !n_tokens) return 0;
+    uint64_t row_bytes = 0;
+    if (!cuda_u64_mul3_checked(n_embd, 1u, sizeof(float), &row_bytes) ||
+        row_bytes == 0u || out->bytes < row_bytes || (out->bytes % row_bytes) != 0u) return 0;
+    *n_tokens = out->bytes / row_bytes;
+    return *n_tokens != 0u && *n_tokens <= UINT32_MAX;
+}
+
+static int cuda_hc_hc_token_count(const ds4_gpu_tensor *out_hc, uint32_t n_embd, uint32_t n_hc, uint64_t *n_tokens) {
+    if (!out_hc || n_embd == 0u || n_hc == 0u || !n_tokens) return 0;
+    uint64_t row_elems = 0, row_bytes = 0;
+    if (!cuda_u64_mul_checked(n_hc, n_embd, &row_elems) ||
+        !cuda_u64_mul_checked(row_elems, sizeof(float), &row_bytes) ||
+        row_bytes == 0u || out_hc->bytes < row_bytes || (out_hc->bytes % row_bytes) != 0u) return 0;
+    *n_tokens = out_hc->bytes / row_bytes;
+    return *n_tokens != 0u && *n_tokens <= UINT32_MAX;
+}
+
+static int cuda_hc_mix_width(uint32_t n_hc, uint64_t *mix_hc) {
+    if (n_hc == 0u || !mix_hc) return 0;
+    const uint64_t h = (uint64_t)n_hc;
+    const uint64_t mix = 2ull * h + h * h;
+    if (mix > UINT32_MAX) return 0;
+    *mix_hc = mix;
+    return 1;
+}
+
 extern "C" int ds4_gpu_hc_weighted_sum_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *weights, uint32_t n_embd, uint32_t n_hc) {
-    if (!out || !residual_hc || !weights || n_embd == 0 || n_hc == 0) return 0;
-    uint32_t n_tokens = (uint32_t)(out->bytes / ((uint64_t)n_embd * sizeof(float)));
+    uint64_t n_tokens64 = 0, residual_bytes = 0, weights_bytes = 0;
+    if (!out || !residual_hc || !weights || n_hc == 0u ||
+        !cuda_hc_flat_token_count(out, n_embd, &n_tokens64) ||
+        !cuda_u64_mul3_checked(n_tokens64, (uint64_t)n_hc * n_embd, sizeof(float), &residual_bytes) ||
+        !cuda_u64_mul3_checked(n_tokens64, n_hc, sizeof(float), &weights_bytes) ||
+        residual_hc->bytes < residual_bytes || weights->bytes < weights_bytes) return 0;
+    uint32_t n_tokens = (uint32_t)n_tokens64;
     hc_weighted_sum_kernel<<<((uint64_t)n_embd * n_tokens + 255) / 256, 256>>>(
         (float *)out->ptr, (const float *)residual_hc->ptr, (const float *)weights->ptr,
         n_embd, n_hc, n_tokens, n_hc);
     return cuda_ok(cudaGetLastError(), "hc_weighted_sum launch");
 }
 extern "C" int ds4_gpu_hc_weighted_sum_split_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *split, uint32_t n_embd, uint32_t n_hc) {
-    if (!out || !residual_hc || !split || n_embd == 0 || n_hc == 0) return 0;
-    uint32_t n_tokens = (uint32_t)(out->bytes / ((uint64_t)n_embd * sizeof(float)));
-    uint32_t stride = (uint32_t)(2u * n_hc + n_hc * n_hc);
+    uint64_t n_tokens64 = 0, residual_bytes = 0, split_bytes = 0, mix_hc = 0;
+    if (!out || !residual_hc || !split ||
+        !cuda_hc_flat_token_count(out, n_embd, &n_tokens64) ||
+        !cuda_hc_mix_width(n_hc, &mix_hc) ||
+        !cuda_u64_mul3_checked(n_tokens64, (uint64_t)n_hc * n_embd, sizeof(float), &residual_bytes) ||
+        !cuda_u64_mul3_checked(n_tokens64, mix_hc, sizeof(float), &split_bytes) ||
+        residual_hc->bytes < residual_bytes || split->bytes < split_bytes) return 0;
+    uint32_t n_tokens = (uint32_t)n_tokens64;
+    uint32_t stride = (uint32_t)mix_hc;
     hc_weighted_sum_kernel<<<((uint64_t)n_embd * n_tokens + 255) / 256, 256>>>(
         (float *)out->ptr, (const float *)residual_hc->ptr, (const float *)split->ptr,
         n_embd, n_hc, n_tokens, stride);
@@ -213,8 +252,17 @@ extern "C" int ds4_gpu_output_hc_weights_tensor(
     return cuda_ok(cudaGetLastError(), "output hc weights launch");
 }
 extern "C" int ds4_gpu_hc_expand_tensor(ds4_gpu_tensor *out_hc, const ds4_gpu_tensor *block_out, const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *post, const ds4_gpu_tensor *comb, uint32_t n_embd, uint32_t n_hc) {
-    if (!out_hc || !block_out || !residual_hc || !post || !comb || n_embd == 0 || n_hc == 0) return 0;
-    uint32_t n_tokens = (uint32_t)(out_hc->bytes / ((uint64_t)n_hc * n_embd * sizeof(float)));
+    uint64_t n_tokens64 = 0, flat_bytes = 0, hc_bytes = 0, post_bytes = 0, comb_bytes = 0, comb_stride = 0;
+    if (!out_hc || !block_out || !residual_hc || !post || !comb ||
+        !cuda_hc_hc_token_count(out_hc, n_embd, n_hc, &n_tokens64) ||
+        !cuda_u64_mul3_checked(n_tokens64, n_embd, sizeof(float), &flat_bytes) ||
+        !cuda_u64_mul3_checked(n_tokens64, (uint64_t)n_hc * n_embd, sizeof(float), &hc_bytes) ||
+        !cuda_u64_mul3_checked(n_tokens64, n_hc, sizeof(float), &post_bytes) ||
+        !cuda_u64_mul_checked(n_hc, n_hc, &comb_stride) || comb_stride > UINT32_MAX ||
+        !cuda_u64_mul3_checked(n_tokens64, comb_stride, sizeof(float), &comb_bytes) ||
+        block_out->bytes < flat_bytes || residual_hc->bytes < hc_bytes ||
+        post->bytes < post_bytes || comb->bytes < comb_bytes) return 0;
+    uint32_t n_tokens = (uint32_t)n_tokens64;
     uint64_t n_elem = (uint64_t)n_tokens * n_hc * n_embd;
     hc_expand_kernel<<<(n_elem + 255) / 256, 256>>>((float *)out_hc->ptr,
                                                     (const float *)block_out->ptr,
@@ -223,13 +271,19 @@ extern "C" int ds4_gpu_hc_expand_tensor(ds4_gpu_tensor *out_hc, const ds4_gpu_te
                                                     (const float *)post->ptr,
                                                     (const float *)comb->ptr,
                                                     n_embd, n_hc, n_tokens,
-                                                    n_hc, n_hc * n_hc, 0);
+                                                    n_hc, (uint32_t)comb_stride, 0);
     return cuda_ok(cudaGetLastError(), "hc_expand launch");
 }
 extern "C" int ds4_gpu_hc_expand_split_tensor(ds4_gpu_tensor *out_hc, const ds4_gpu_tensor *block_out, const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *split, uint32_t n_embd, uint32_t n_hc) {
-    if (!out_hc || !block_out || !residual_hc || !split || n_embd == 0 || n_hc == 0) return 0;
-    uint32_t n_tokens = (uint32_t)(out_hc->bytes / ((uint64_t)n_hc * n_embd * sizeof(float)));
-    if (block_out->bytes < (uint64_t)n_tokens * n_embd * sizeof(float)) return 0;
+    uint64_t n_tokens64 = 0, flat_bytes = 0, hc_bytes = 0, split_bytes = 0, mix_hc64 = 0;
+    if (!out_hc || !block_out || !residual_hc || !split ||
+        !cuda_hc_hc_token_count(out_hc, n_embd, n_hc, &n_tokens64) ||
+        !cuda_hc_mix_width(n_hc, &mix_hc64) ||
+        !cuda_u64_mul3_checked(n_tokens64, n_embd, sizeof(float), &flat_bytes) ||
+        !cuda_u64_mul3_checked(n_tokens64, (uint64_t)n_hc * n_embd, sizeof(float), &hc_bytes) ||
+        !cuda_u64_mul3_checked(n_tokens64, mix_hc64, sizeof(float), &split_bytes) ||
+        block_out->bytes < flat_bytes || residual_hc->bytes < hc_bytes || split->bytes < split_bytes) return 0;
+    uint32_t n_tokens = (uint32_t)n_tokens64;
     if (n_hc == 4u) {
         const uint64_t n = (uint64_t)n_tokens * n_embd;
         hc_expand4_kernel<<<(n + 255) / 256, 256>>>((float *)out_hc->ptr,
@@ -240,7 +294,7 @@ extern "C" int ds4_gpu_hc_expand_split_tensor(ds4_gpu_tensor *out_hc, const ds4_
                                                     n_tokens);
         return cuda_ok(cudaGetLastError(), "hc_expand_split4 launch");
     }
-    uint32_t mix_hc = 2u * n_hc + n_hc * n_hc;
+    uint32_t mix_hc = (uint32_t)mix_hc64;
     uint64_t n_elem = (uint64_t)n_tokens * n_hc * n_embd;
     const float *base = (const float *)split->ptr;
     hc_expand_kernel<<<(n_elem + 255) / 256, 256>>>((float *)out_hc->ptr,
@@ -254,9 +308,15 @@ extern "C" int ds4_gpu_hc_expand_split_tensor(ds4_gpu_tensor *out_hc, const ds4_
     return cuda_ok(cudaGetLastError(), "hc_expand_split launch");
 }
 extern "C" int ds4_gpu_hc_expand_split_half_tensor(ds4_gpu_tensor *out_hc, const ds4_gpu_tensor *block_out_h, const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *split, uint32_t n_embd, uint32_t n_hc) {
-    if (!out_hc || !block_out_h || !residual_hc || !split || n_embd == 0 || n_hc == 0) return 0;
-    uint32_t n_tokens = (uint32_t)(out_hc->bytes / ((uint64_t)n_hc * n_embd * sizeof(float)));
-    if (block_out_h->bytes < (uint64_t)n_tokens * n_embd * sizeof(__half)) return 0;
+    uint64_t n_tokens64 = 0, flat_half_bytes = 0, hc_bytes = 0, split_bytes = 0, mix_hc64 = 0;
+    if (!out_hc || !block_out_h || !residual_hc || !split ||
+        !cuda_hc_hc_token_count(out_hc, n_embd, n_hc, &n_tokens64) ||
+        !cuda_hc_mix_width(n_hc, &mix_hc64) ||
+        !cuda_u64_mul3_checked(n_tokens64, n_embd, sizeof(__half), &flat_half_bytes) ||
+        !cuda_u64_mul3_checked(n_tokens64, (uint64_t)n_hc * n_embd, sizeof(float), &hc_bytes) ||
+        !cuda_u64_mul3_checked(n_tokens64, mix_hc64, sizeof(float), &split_bytes) ||
+        block_out_h->bytes < flat_half_bytes || residual_hc->bytes < hc_bytes || split->bytes < split_bytes) return 0;
+    uint32_t n_tokens = (uint32_t)n_tokens64;
     if (n_hc == 4u) {
         const uint64_t n = (uint64_t)n_tokens * n_embd;
         hc_expand4_half_kernel<<<(n + 255) / 256, 256>>>((float *)out_hc->ptr,
@@ -267,7 +327,7 @@ extern "C" int ds4_gpu_hc_expand_split_half_tensor(ds4_gpu_tensor *out_hc, const
                                                          n_tokens);
         return cuda_ok(cudaGetLastError(), "hc_expand_split_half4 launch");
     }
-    uint32_t mix_hc = 2u * n_hc + n_hc * n_hc;
+    uint32_t mix_hc = (uint32_t)mix_hc64;
     uint64_t n_elem = (uint64_t)n_tokens * n_hc * n_embd;
     const float *base = (const float *)split->ptr;
     hc_expand_half_kernel<<<(n_elem + 255) / 256, 256>>>((float *)out_hc->ptr,
@@ -280,10 +340,16 @@ extern "C" int ds4_gpu_hc_expand_split_half_tensor(ds4_gpu_tensor *out_hc, const
     return cuda_ok(cudaGetLastError(), "hc_expand_split_half launch");
 }
 extern "C" int ds4_gpu_hc_expand_add_split_tensor(ds4_gpu_tensor *out_hc, const ds4_gpu_tensor *block_out, const ds4_gpu_tensor *block_add, const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *split, uint32_t n_embd, uint32_t n_hc) {
-    if (!out_hc || !block_out || !block_add || !residual_hc || !split || n_embd == 0 || n_hc == 0) return 0;
-    uint32_t n_tokens = (uint32_t)(out_hc->bytes / ((uint64_t)n_hc * n_embd * sizeof(float)));
-    if (block_out->bytes < (uint64_t)n_tokens * n_embd * sizeof(float) ||
-        block_add->bytes < (uint64_t)n_tokens * n_embd * sizeof(float)) return 0;
+    uint64_t n_tokens64 = 0, flat_bytes = 0, hc_bytes = 0, split_bytes = 0, mix_hc64 = 0;
+    if (!out_hc || !block_out || !block_add || !residual_hc || !split ||
+        !cuda_hc_hc_token_count(out_hc, n_embd, n_hc, &n_tokens64) ||
+        !cuda_hc_mix_width(n_hc, &mix_hc64) ||
+        !cuda_u64_mul3_checked(n_tokens64, n_embd, sizeof(float), &flat_bytes) ||
+        !cuda_u64_mul3_checked(n_tokens64, (uint64_t)n_hc * n_embd, sizeof(float), &hc_bytes) ||
+        !cuda_u64_mul3_checked(n_tokens64, mix_hc64, sizeof(float), &split_bytes) ||
+        block_out->bytes < flat_bytes || block_add->bytes < flat_bytes ||
+        residual_hc->bytes < hc_bytes || split->bytes < split_bytes) return 0;
+    uint32_t n_tokens = (uint32_t)n_tokens64;
     if (n_hc == 4u) {
         const uint64_t n = (uint64_t)n_tokens * n_embd;
         hc_expand4_add_kernel<<<(n + 255) / 256, 256>>>((float *)out_hc->ptr,
@@ -295,7 +361,7 @@ extern "C" int ds4_gpu_hc_expand_add_split_tensor(ds4_gpu_tensor *out_hc, const 
                                                         n_tokens);
         return cuda_ok(cudaGetLastError(), "hc_expand_add_split4 launch");
     }
-    uint32_t mix_hc = 2u * n_hc + n_hc * n_hc;
+    uint32_t mix_hc = (uint32_t)mix_hc64;
     uint64_t n_elem = (uint64_t)n_tokens * n_hc * n_embd;
     const float *base = (const float *)split->ptr;
     hc_expand_kernel<<<(n_elem + 255) / 256, 256>>>((float *)out_hc->ptr,
@@ -309,10 +375,17 @@ extern "C" int ds4_gpu_hc_expand_add_split_tensor(ds4_gpu_tensor *out_hc, const 
     return cuda_ok(cudaGetLastError(), "hc_expand_add_split launch");
 }
 extern "C" int ds4_gpu_hc_expand_add_split_half_add_tensor(ds4_gpu_tensor *out_hc, const ds4_gpu_tensor *block_out, const ds4_gpu_tensor *block_add_h, const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *split, uint32_t n_embd, uint32_t n_hc) {
-    if (!out_hc || !block_out || !block_add_h || !residual_hc || !split || n_embd == 0 || n_hc == 0) return 0;
-    uint32_t n_tokens = (uint32_t)(out_hc->bytes / ((uint64_t)n_hc * n_embd * sizeof(float)));
-    if (block_out->bytes < (uint64_t)n_tokens * n_embd * sizeof(float) ||
-        block_add_h->bytes < (uint64_t)n_tokens * n_embd * sizeof(__half)) return 0;
+    uint64_t n_tokens64 = 0, flat_bytes = 0, flat_half_bytes = 0, hc_bytes = 0, split_bytes = 0, mix_hc64 = 0;
+    if (!out_hc || !block_out || !block_add_h || !residual_hc || !split ||
+        !cuda_hc_hc_token_count(out_hc, n_embd, n_hc, &n_tokens64) ||
+        !cuda_hc_mix_width(n_hc, &mix_hc64) ||
+        !cuda_u64_mul3_checked(n_tokens64, n_embd, sizeof(float), &flat_bytes) ||
+        !cuda_u64_mul3_checked(n_tokens64, n_embd, sizeof(__half), &flat_half_bytes) ||
+        !cuda_u64_mul3_checked(n_tokens64, (uint64_t)n_hc * n_embd, sizeof(float), &hc_bytes) ||
+        !cuda_u64_mul3_checked(n_tokens64, mix_hc64, sizeof(float), &split_bytes) ||
+        block_out->bytes < flat_bytes || block_add_h->bytes < flat_half_bytes ||
+        residual_hc->bytes < hc_bytes || split->bytes < split_bytes) return 0;
+    uint32_t n_tokens = (uint32_t)n_tokens64;
     if (n_hc == 4u) {
         const uint64_t n = (uint64_t)n_tokens * n_embd;
         hc_expand4_add_half_kernel<<<(n + 255) / 256, 256>>>((float *)out_hc->ptr,
@@ -324,7 +397,7 @@ extern "C" int ds4_gpu_hc_expand_add_split_half_add_tensor(ds4_gpu_tensor *out_h
                                                              n_tokens);
         return cuda_ok(cudaGetLastError(), "hc_expand_add_split_half4 launch");
     }
-    uint32_t mix_hc = 2u * n_hc + n_hc * n_hc;
+    uint32_t mix_hc = (uint32_t)mix_hc64;
     uint64_t n_elem = (uint64_t)n_tokens * n_hc * n_embd;
     const float *base = (const float *)split->ptr;
     hc_expand_add_half_kernel<<<(n_elem + 255) / 256, 256>>>((float *)out_hc->ptr,

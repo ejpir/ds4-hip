@@ -214,6 +214,7 @@ extern "C" int ds4_gpu_attention_prefill_raw_heads_tensor(ds4_gpu_tensor *heads,
                                                                         head_dim);
         return cuda_ok(cudaGetLastError(), "attention raw unpack launch");
     }
+    if (window == 0u && n_tokens > 256u) return 0;
     dim3 grid(n_tokens, n_head, 1);
     attention_prefill_raw_kernel<<<grid, 128>>>((float *)heads->ptr,
                                                 sinks,

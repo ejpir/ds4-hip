@@ -15,8 +15,8 @@ __global__ static void attention_prefill_raw_kernel(
     uint32_t t = blockIdx.x;
     uint32_t h = blockIdx.y;
     if (t >= n_tokens || h >= n_head) return;
-    uint32_t raw_count = t + 1 < window ? t + 1 : window;
-    uint32_t raw_start = t + 1 - raw_count;
+    uint32_t raw_count = (window != 0u && t + 1u > window) ? window : t + 1u;
+    uint32_t raw_start = t + 1u - raw_count;
     const float *qh = q + ((uint64_t)t * n_head + h) * head_dim;
     __shared__ float scores[256];
     __shared__ float partial[128];
