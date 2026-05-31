@@ -79,6 +79,47 @@ function baseCommand(word: string | undefined): string | undefined {
 	return word.split("/").pop() ?? word;
 }
 
+function commandCwd(command: string): string | undefined {
+	for (const segment of commandSegments(command)) {
+		const words = stripWrappers(shellWords(segment));
+		if (baseCommand(words[0]) === "cd" && words[1]) return words[1];
+	}
+	return undefined;
+}
+
+function joinCommandPath(cwd: string | undefined, path: string): string {
+	if (!cwd || path.startsWith("/") || path.startsWith("~")) return path;
+	return `${cwd.replace(/\/+$/, "")}/${path.replace(/^\.\//, "")}`;
+}
+
+function looksLikeReadablePath(word: string): boolean {
+	if (!word || word.startsWith("$") || word.includes("*") || word.includes("?") || word.includes("[")) return false;
+	if (word === "/dev/null" || /^[0-9]?>/.test(word) || word.includes("=")) return false;
+	return word.includes("/") || /\.[A-Za-z0-9_+-]+$/.test(word);
+}
+
+function suggestedReadPaths(input: unknown): string[] {
+	const command = asBashArgs(input)?.command;
+	if (typeof command !== "string" || command.trim().length === 0) return [];
+	const cwd = commandCwd(command);
+	const paths: string[] = [];
+	const add = (word: string) => {
+		if (looksLikeReadablePath(word)) paths.push(joinCommandPath(cwd, word));
+	};
+	for (const segment of commandSegments(command)) {
+		const words = stripWrappers(shellWords(segment));
+		const base = baseCommand(words[0]);
+		if (base === "cat" || base === "head" || base === "tail") {
+			for (const arg of nonOptionArgs(words.slice(1))) add(arg);
+		}
+	}
+	const loop = /\bfor\s+[A-Za-z_][A-Za-z0-9_]*\s+in\s+([\s\S]*?)\s*;\s*do\b/.exec(command);
+	if (loop) {
+		for (const word of shellWords(loop[1])) add(word);
+	}
+	return [...new Set(paths)].slice(0, 3);
+}
+
 function hasInputRedirection(words: string[]): boolean {
 	return words.some((word) => word === "<" || /^<[^(<]/.test(word));
 }
@@ -234,8 +275,12 @@ export function checkBashFileReadFallback(input: unknown, afterReadGuardBlock: b
 	const reason = bashFileReadFallbackReason(input);
 	if (!reason) return undefined;
 	const context = afterReadGuardBlock ? " after a read guard block" : "";
+	const paths = suggestedReadPaths(input);
+	const nextAction = paths.length > 0
+		? ` Next action: if this file is not already available from a prior read, call the read tool on ${paths.map((path) => `'${path}'`).join(", ")} with a focused limit. If it was already read, use that result instead. Do not use rg/grep/head to reconstruct file contents. If metadata is also needed, run wc/ls separately without head/tail.`
+		: " Next action: if the file is not already available from a prior read, call the read tool on the file(s) you intended to inspect. If already read, use that result instead. Do not retry another bash file-dump command or reconstruct contents with rg/grep/head.";
 	return {
 		block: true,
-		reason: `Pi bash guard control message (authoritative, not command output): ${reason}${context}. Use Pi's read tool for file contents; do not bypass it with cat/head/tail/sed/awk, find -exec cat, xargs cat, or scripts. Use rg/grep only for precise searches.`,
+		reason: `Pi bash guard control message (authoritative, not command output): ${reason}${context}. Use Pi's read tool for file contents; do not bypass it with cat/head/tail/sed/awk, find -exec cat, xargs cat, or scripts. Use rg/grep only for precise searches.${nextAction}`,
 	};
 }
