@@ -44,6 +44,7 @@ Environment:
   DS4_SERVER_QKV_PAIR_DECODE=1           Opt in shared-quant Q/KV decode projection pair; FAST_FULL default 1
   DS4_SERVER_OVERLAP_SHARED_GATE_UP=0    Disable FAST_FULL async shared-expert gate/up overlap
   DS4_SERVER_MOE_DECODE_RPB=N            Rows/block for exact single-token Q2_K MoE decode; FAST_FULL default 1
+  DS4_SERVER_MOE_DECODE_Q8K_GATEUP=0     Disable FAST_FULL Q8_K activation MoE gate/up decode path
   DS4_SERVER_MOE_DECODE_Q8K_DOWN=1       Opt in Q8_K mid/down MoE decode path; FAST_FULL default 1
   DS4_SERVER_ATTN_OUT_LOW_SPLITK=1       Restore old split-K decode attn_output_a path; FAST_FULL defaults to prequant
   DS4_SERVER_SHARED_GATE_UP_FUSED_W32=1  Restore old fused shared gate/up float-row decode path; FAST_FULL defaults to prequant pair

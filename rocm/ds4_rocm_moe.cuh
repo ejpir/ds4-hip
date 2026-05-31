@@ -313,6 +313,7 @@ __device__ static float dev_dot_q2_K_q8_K_block(const cuda_block_q2_K *x, const 
     return dall * (float)isum - dmin * (float)summs;
 }
 
+
 __device__ static void dev_dot_q2_K_q8_K_block4(
         const cuda_block_q2_K *x,
         const cuda_block_q8_K *y0,
@@ -1502,6 +1503,66 @@ __global__ static void moe_gate_up_mid_decode_q4K_qwarp32_kernel(
     }
 }
 
+__global__ static void moe_gate_up_mid_q2K_decode_q8_qwarp32_kernel(
+        float *gate_out,
+        float *up_out,
+        float *mid_out,
+        const char *gate_base,
+        const char *up_base,
+        const cuda_block_q8_K *xq,
+        const int32_t *selected,
+        const float *weights,
+        uint64_t gate_expert_bytes,
+        uint64_t gate_row_bytes,
+        uint32_t xq_blocks,
+        uint32_t expert_mid_dim,
+        uint32_t n_expert,
+        uint32_t write_aux,
+        float clamp) {
+    const uint32_t lane = threadIdx.x & 15u;
+    const uint32_t row_lane = threadIdx.x >> 4u;
+    const uint32_t pair = blockIdx.y;
+    const uint32_t tok = pair / n_expert;
+    const uint32_t slot = pair - tok * n_expert;
+    int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
+    if (expert_i < 0) expert_i = 0;
+    const uint32_t expert = (uint32_t)expert_i;
+    const cuda_block_q8_K *xqb = xq + (uint64_t)tok * xq_blocks;
+    __shared__ cuda_block_q8_K sxq[16];
+    if (xq_blocks <= 16u) {
+        for (uint32_t i = threadIdx.x; i < xq_blocks; i += blockDim.x) sxq[i] = xqb[i];
+        __syncthreads();
+        xqb = sxq;
+    }
+    for (uint32_t rr = 0; rr < 16u; rr++) {
+        const uint32_t row = blockIdx.x * 256u + row_lane + rr * 16u;
+        if (row >= expert_mid_dim) continue;
+        const cuda_block_q2_K *gr = (const cuda_block_q2_K *)(gate_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
+        const cuda_block_q2_K *ur = (const cuda_block_q2_K *)(up_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
+        float gate = 0.0f;
+        float up = 0.0f;
+        for (uint32_t b = lane; b < xq_blocks; b += 16u) {
+            gate += dev_dot_q2_K_q8_K_block(gr + b, xqb + b);
+            up += dev_dot_q2_K_q8_K_block(ur + b, xqb + b);
+        }
+        gate = half_warp_sum_f32(gate, lane);
+        up = half_warp_sum_f32(up, lane);
+        if (lane == 0u) {
+            if (clamp > 1.0e-6f) {
+                if (gate > clamp) gate = clamp;
+                if (up > clamp) up = clamp;
+                if (up < -clamp) up = -clamp;
+            }
+            const uint64_t off = (uint64_t)pair * expert_mid_dim + row;
+            if (write_aux) {
+                gate_out[off] = gate;
+                up_out[off] = up;
+            }
+            mid_out[off] = (gate / (1.0f + expf(-gate))) * up * weights[(uint64_t)tok * n_expert + slot];
+        }
+    }
+}
+
 __global__ static void moe_down_sum6_qwarp32_kernel(
         float *out,
         const char *down_base,
@@ -2145,6 +2206,7 @@ __device__ __forceinline__ static float q2_K_dequant_256_scaled_w32(
     const float mn = (float)(sc[g] >> 4u);
     return d * scale * q - dmin * mn;
 }
+
 
 __device__ __forceinline__ static float q2_K_dequant_256_direct(const unsigned char *blk, uint32_t i) {
     const uint16_t d_bits = (uint16_t)blk[80] | ((uint16_t)blk[81] << 8);

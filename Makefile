@@ -139,7 +139,7 @@ rocm-api-smoke-build: ds4_rocm.o
 rocm-api-smoke: ds4_rocm.o
 	tools/run_rocm_api_smoke.sh --out $(ROCM_API_SMOKE)
 
-ds4-mtp-oracle-bench-rocm-upstream: tools/mtp_oracle_microbench_gpuapi.o ds4_gpuapi.o ds4_rocm.o
+ds4-mtp-oracle-bench-rocm-upstream: tools/mtp_oracle_microbench_gpuapi.o ds4_distributed.o ds4_gpuapi.o ds4_rocm.o
 	$(ROCM_HIPCC) -o $@ $^ $(ROCM_LDLIBS)
 
 ds4-rocm-upstream: ds4_cli_gpuapi.o ds4_help.o linenoise.o ds4_distributed.o ds4_gpuapi.o ds4_rocm.o

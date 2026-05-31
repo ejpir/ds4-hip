@@ -82,6 +82,7 @@ Environment:
   DS4_SERVER_MOE_DECODE_RPB=N    Rows/block for exact single-token Q2_K MoE decode; FAST_FULL default 1
   DS4_SERVER_MOE_EXPERT_SHARED_X=1    Experimental LDS x tile reuse for gate/up; use with GATE_RPB>1
   DS4_SERVER_MOE_EXPERT_SHARED_MID=1  Experimental LDS mid tile reuse for down; use with DOWN_RPB>1
+  DS4_SERVER_MOE_DECODE_Q8K_GATEUP=0 Disable FAST_FULL Q8_K activation MoE gate/up decode path
   DS4_SERVER_MOE_DECODE_Q8K_DOWN=1 Opt-in Q8_K mid/down MoE decode path; FAST_FULL default 1
   DS4_SERVER_MOE_Q8K_DOWN=1      Legacy alias for Q8_K mid/down MoE decode path
   DS4_SERVER_MOE_Q8K_DOWN_LAYERS=LIST Legacy/no-op decode restriction knob
