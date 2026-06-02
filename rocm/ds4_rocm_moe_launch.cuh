@@ -369,7 +369,6 @@ static int routed_moe_build_plan(
     plan->iq2_path = (gate_type == 16u && down_type == 10u);
     plan->q2k_path = (gate_type == 10u && down_type == 10u);
     if (!plan->q4k_path && !plan->iq2_path && !plan->q2k_path) return 0;
-    if (plan->q4k_path && (n_tokens != 1u || n_expert != DS4_ROCM_N_EXPERT_USED)) return 0;
     if (!cuda_u64_mul_checked(DS4_ROCM_N_EXPERT, gate_expert_bytes, &plan->gate_bytes) ||
         !cuda_u64_mul_checked(DS4_ROCM_N_EXPERT, down_expert_bytes, &plan->down_bytes) ||
         !cuda_model_range_fits(model_size, gate_offset, plan->gate_bytes) ||
@@ -447,7 +446,10 @@ static int routed_moe_launch(
             if (prof_ev[0]) (void)cudaEventRecord(prof_ev[0], 0);
         }
         const uint32_t pair_count = n_tokens * n_expert;
-        const uint32_t use_sorted_pairs = n_tokens > 1u;
+        /* The existing sorted/tiled prefill kernels in this branch are IQ2/Q2
+         * specific.  Keep Q4_K routed experts on the generic per-pair qwarp
+         * path until dedicated sorted Q4 kernels are added. */
+        const uint32_t use_sorted_pairs = n_tokens > 1u && !q4k_path;
         const uint32_t use_expert_tiles = use_sorted_pairs && !cuda_env_present("DS4_CUDA_MOE_NO_EXPERT_TILES");
         const uint32_t expert_tile_m = cuda_env_present("DS4_CUDA_MOE_TILE4") ? 4u : 8u;
         const uint32_t write_gate_up = cuda_env_present("DS4_CUDA_MOE_WRITE_GATE_UP");
@@ -729,7 +731,7 @@ static int routed_moe_launch(
                     clamp);
             } else if (ok) {
                 dim3 qgrid((expert_mid_dim + 127u) / 128u, n_tokens * n_expert, 1);
-                if (use_decode_lut_gate && q4k_path) {
+                if (q4k_path) {
                     moe_gate_up_mid_decode_q4K_qwarp32_kernel<<<qgrid, 256>>>(
                         (float *)gate->ptr,
                         (float *)up->ptr,
@@ -995,16 +997,29 @@ static int routed_moe_launch(
                     out_dim,
                     n_expert);
             } else {
-                moe_down_qwarp32_kernel<<<dgrid, 256>>>(
-                    (float *)down->ptr,
-                    down_w,
-                    midq,
-                    (const int32_t *)selected->ptr,
-                    down_expert_bytes,
-                    down_row_bytes,
-                    midq_blocks,
-                    out_dim,
-                    n_expert);
+                if (q4k_path) {
+                    moe_down_q4K_qwarp32_kernel<<<dgrid, 256>>>(
+                        (float *)down->ptr,
+                        down_w,
+                        midq,
+                        (const int32_t *)selected->ptr,
+                        down_expert_bytes,
+                        down_row_bytes,
+                        midq_blocks,
+                        out_dim,
+                        n_expert);
+                } else {
+                    moe_down_qwarp32_kernel<<<dgrid, 256>>>(
+                        (float *)down->ptr,
+                        down_w,
+                        midq,
+                        (const int32_t *)selected->ptr,
+                        down_expert_bytes,
+                        down_row_bytes,
+                        midq_blocks,
+                        out_dim,
+                        n_expert);
+                }
             }
             ok = cuda_ok(cudaGetLastError(), "routed_moe down launch");
             }
