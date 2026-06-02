@@ -446,18 +446,21 @@ static int routed_moe_launch(
             if (prof_ev[0]) (void)cudaEventRecord(prof_ev[0], 0);
         }
         const uint32_t pair_count = n_tokens * n_expert;
-        /* The existing sorted/tiled prefill kernels in this branch are IQ2/Q2
-         * specific.  Keep Q4_K routed experts on the generic per-pair qwarp
-         * path until dedicated sorted Q4 kernels are added. */
-        const uint32_t use_sorted_pairs = n_tokens > 1u && !q4k_path;
+        const uint32_t q4_sort_min_tokens = cuda_parse_u32_env_alias(
+            "DS4_CUDA_MOE_Q4_SORT_MIN_TOKENS", "DS4_HIP_MOE_Q4_SORT_MIN_TOKENS",
+            32u, 1u, 65535u);
+        const uint32_t use_sorted_pairs = n_tokens > 1u &&
+            (!q4k_path || (!cuda_env_flag_any3("DS4_CUDA_MOE_NO_Q4_SORTED",
+                                               "DS4_HIP_MOE_NO_Q4_SORTED", NULL) &&
+                           n_tokens >= q4_sort_min_tokens));
         const uint32_t use_expert_tiles = use_sorted_pairs && !cuda_env_present("DS4_CUDA_MOE_NO_EXPERT_TILES");
         const uint32_t expert_tile_m = cuda_env_present("DS4_CUDA_MOE_TILE4") ? 4u : 8u;
         const uint32_t write_gate_up = cuda_env_present("DS4_CUDA_MOE_WRITE_GATE_UP");
-        const uint32_t use_p2_sorted = use_sorted_pairs && !cuda_env_present("DS4_CUDA_MOE_NO_P2");
+        const uint32_t use_p2_sorted = use_sorted_pairs && !q4k_path && !cuda_env_present("DS4_CUDA_MOE_NO_P2");
         const uint32_t use_atomic_down = use_expert_tiles &&
             (cuda_env_present("DS4_CUDA_MOE_ATOMIC_DOWN") ||
              (n_tokens >= 128u && !cuda_env_present("DS4_CUDA_MOE_NO_ATOMIC_DOWN")));
-        const uint32_t use_gate_row2048 = use_expert_tiles && expert_tile_m == 8u &&
+        const uint32_t use_gate_row2048 = !q4k_path && use_expert_tiles && expert_tile_m == 8u &&
             (cuda_env_present("DS4_CUDA_MOE_GATE_ROW2048") ||
              cuda_env_present("DS4_CUDA_MOE_GATE_ROW256") ||
              cuda_env_present("DS4_CUDA_MOE_GATE_ROW128") ||
@@ -465,7 +468,7 @@ static int routed_moe_launch(
               !cuda_env_present("DS4_CUDA_MOE_NO_GATE_ROW2048") &&
               !cuda_env_present("DS4_CUDA_MOE_NO_GATE_ROW256") &&
               !cuda_env_present("DS4_CUDA_MOE_NO_GATE_ROW128")));
-        const uint32_t use_down_tile16 = use_atomic_down && expert_tile_m == 8u &&
+        const uint32_t use_down_tile16 = !q4k_path && use_atomic_down && expert_tile_m == 8u &&
             n_tokens >= 128u && !cuda_env_present("DS4_CUDA_MOE_NO_DOWN_TILE16");
         const uint32_t use_decode_lut_gate =
             n_tokens == 1u && xq_blocks <= 16u &&
@@ -476,7 +479,7 @@ static int routed_moe_launch(
         const uint32_t down_row_span =
             cuda_env_present("DS4_CUDA_MOE_DOWN_ROW512") ? 512u :
             cuda_env_present("DS4_CUDA_MOE_DOWN_ROW1024") ? 1024u : 2048u;
-        const uint32_t use_down_row2048 = use_atomic_down && expert_tile_m == 8u &&
+        const uint32_t use_down_row2048 = !q4k_path && use_atomic_down && expert_tile_m == 8u &&
             (cuda_env_present("DS4_CUDA_MOE_DOWN_ROW2048") ||
              cuda_env_present("DS4_CUDA_MOE_DOWN_ROW256") ||
              cuda_env_present("DS4_CUDA_MOE_DOWN_ROW128") ||
@@ -650,7 +653,24 @@ static int routed_moe_launch(
         if (ok) {
             dim3 mgrid((expert_mid_dim + 31u) / 32u, n_tokens * n_expert, 1);
             if (ok && sorted_pairs && use_expert_tiles && sorted_offsets && sorted_counts && tile_total && tile_experts && tile_starts) {
-                if (use_gate_row2048) {
+                if (q4k_path) {
+                    dim3 tgrid((expert_mid_dim + 31u) / 32u, tile_capacity, 1);
+                    if (expert_tile_m == 8u) {
+                        moe_gate_up_mid_q4K_expert_tile8_row32_kernel<<<tgrid, 256>>>(
+                            (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
+                            gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts,
+                            tile_total, tile_experts, tile_starts, (const float *)weights->ptr,
+                            gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
+                            0u, write_gate_up, clamp);
+                    } else {
+                        moe_gate_up_mid_q4K_expert_tile4_row32_kernel<<<tgrid, 256>>>(
+                            (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
+                            gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts,
+                            tile_total, tile_experts, tile_starts, (const float *)weights->ptr,
+                            gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
+                            0u, write_gate_up, clamp);
+                    }
+                } else if (use_gate_row2048) {
                     if (gate_row_span == 512u) {
                         dim3 tgrid((expert_mid_dim + 511u) / 512u, tile_capacity, 1);
                         moe_gate_up_mid_expert_tile8_rowspan_kernel<512><<<tgrid, 256>>>(
@@ -713,22 +733,41 @@ static int routed_moe_launch(
                     pair_count,
                     clamp);
             } else if (ok && sorted_pairs) {
-                moe_gate_up_mid_sorted_qwarp32_kernel<<<mgrid, 256>>>(
-                    (float *)gate->ptr,
-                    (float *)up->ptr,
-                    (float *)mid->ptr,
-                    gate_w,
-                    up_w,
-                    xq,
-                    sorted_pairs,
-                    (const int32_t *)selected->ptr,
-                    (const float *)weights->ptr,
-                    gate_expert_bytes,
-                    gate_row_bytes,
-                    xq_blocks,
-                    expert_mid_dim,
-                    n_expert,
-                    clamp);
+                if (q4k_path) {
+                    moe_gate_up_mid_q4K_sorted_qwarp32_kernel<<<mgrid, 256>>>(
+                        (float *)gate->ptr,
+                        (float *)up->ptr,
+                        (float *)mid->ptr,
+                        gate_w,
+                        up_w,
+                        xq,
+                        sorted_pairs,
+                        (const int32_t *)selected->ptr,
+                        (const float *)weights->ptr,
+                        gate_expert_bytes,
+                        gate_row_bytes,
+                        xq_blocks,
+                        expert_mid_dim,
+                        n_expert,
+                        clamp);
+                } else {
+                    moe_gate_up_mid_sorted_qwarp32_kernel<<<mgrid, 256>>>(
+                        (float *)gate->ptr,
+                        (float *)up->ptr,
+                        (float *)mid->ptr,
+                        gate_w,
+                        up_w,
+                        xq,
+                        sorted_pairs,
+                        (const int32_t *)selected->ptr,
+                        (const float *)weights->ptr,
+                        gate_expert_bytes,
+                        gate_row_bytes,
+                        xq_blocks,
+                        expert_mid_dim,
+                        n_expert,
+                        clamp);
+                }
             } else if (ok) {
                 dim3 qgrid((expert_mid_dim + 127u) / 128u, n_tokens * n_expert, 1);
                 if (q4k_path) {
@@ -925,7 +964,22 @@ static int routed_moe_launch(
                 /* The direct decode kernel writes the final token row. */
             } else if (sorted_pairs && use_expert_tiles && sorted_offsets && sorted_counts &&
                 down_tile_total && down_tile_experts && down_tile_starts) {
-                if (use_down_row2048) {
+                if (q4k_path) {
+                    dim3 tgrid((out_dim + 31u) / 32u, down_tile_capacity, 1);
+                    if (expert_tile_m == 8u) {
+                        moe_down_q4K_expert_tile8_row32_kernel<<<tgrid, 256>>>(
+                            use_atomic_down ? (float *)out->ptr : (float *)down->ptr,
+                            down_w, midq, sorted_pairs, sorted_offsets, sorted_counts,
+                            down_tile_total, down_tile_experts, down_tile_starts, down_expert_bytes, down_row_bytes,
+                            midq_blocks, out_dim, n_expert, use_atomic_down);
+                    } else {
+                        moe_down_q4K_expert_tile4_row32_kernel<<<tgrid, 256>>>(
+                            use_atomic_down ? (float *)out->ptr : (float *)down->ptr,
+                            down_w, midq, sorted_pairs, sorted_offsets, sorted_counts,
+                            down_tile_total, down_tile_experts, down_tile_starts, down_expert_bytes, down_row_bytes,
+                            midq_blocks, out_dim, n_expert, use_atomic_down);
+                    }
+                } else if (use_down_row2048) {
                     if (down_row_span == 512u) {
                         dim3 tgrid((out_dim + 511u) / 512u, down_tile_capacity, 1);
                         moe_down_expert_tile16_rowspan_kernel<512><<<tgrid, 256>>>(
@@ -985,17 +1039,31 @@ static int routed_moe_launch(
                     n_expert,
                     pair_count);
             } else if (sorted_pairs) {
-                moe_down_sorted_qwarp32_kernel<<<dgrid, 256>>>(
-                    (float *)down->ptr,
-                    down_w,
-                    midq,
-                    sorted_pairs,
-                    (const int32_t *)selected->ptr,
-                    down_expert_bytes,
-                    down_row_bytes,
-                    midq_blocks,
-                    out_dim,
-                    n_expert);
+                if (q4k_path) {
+                    moe_down_q4K_sorted_qwarp32_kernel<<<dgrid, 256>>>(
+                        (float *)down->ptr,
+                        down_w,
+                        midq,
+                        sorted_pairs,
+                        (const int32_t *)selected->ptr,
+                        down_expert_bytes,
+                        down_row_bytes,
+                        midq_blocks,
+                        out_dim,
+                        n_expert);
+                } else {
+                    moe_down_sorted_qwarp32_kernel<<<dgrid, 256>>>(
+                        (float *)down->ptr,
+                        down_w,
+                        midq,
+                        sorted_pairs,
+                        (const int32_t *)selected->ptr,
+                        down_expert_bytes,
+                        down_row_bytes,
+                        midq_blocks,
+                        out_dim,
+                        n_expert);
+                }
             } else {
                 if (q4k_path) {
                     moe_down_q4K_qwarp32_kernel<<<dgrid, 256>>>(
