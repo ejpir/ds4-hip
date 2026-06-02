@@ -2430,9 +2430,10 @@ static void append_tool_result_focus_text(buf *out) {
              "If the result is sufficient, answer now.]\n");
 }
 
-static char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_schemas,
-                                     const tool_schema_orders *tool_orders,
-                                     ds4_think_mode think_mode) {
+static char *render_chat_prompt_text_ex(const chat_msgs *msgs, const char *tool_schemas,
+                                        const tool_schema_orders *tool_orders,
+                                        ds4_think_mode think_mode,
+                                        bool include_tool_result_focus) {
     (void)tool_orders;
     const bool think = ds4_think_mode_enabled(think_mode);
     int last_user_idx = -1;
@@ -2482,7 +2483,7 @@ static char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_sch
             pending_tool_result = true;
         } else if (!strcmp(m->role, "assistant")) {
             if (pending_assistant) {
-                if (pending_tool_result) append_tool_result_focus_text(&out);
+                if (include_tool_result_focus && pending_tool_result) append_tool_result_focus_text(&out);
                 buf_puts(&out, "<｜Assistant｜>");
                 if (think) {
                     const bool preserve_reasoning = i > last_user_idx;
@@ -2506,13 +2507,20 @@ static char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_sch
     }
 
     if (pending_assistant) {
-        if (pending_tool_result) append_tool_result_focus_text(&out);
+        if (include_tool_result_focus && pending_tool_result) append_tool_result_focus_text(&out);
         buf_puts(&out, "<｜Assistant｜>");
         buf_puts(&out, think ? "<think>" : "</think>");
     }
 
     buf_free(&system);
     return buf_take(&out);
+}
+
+static char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_schemas,
+                                     const tool_schema_orders *tool_orders,
+                                     ds4_think_mode think_mode) {
+    return render_chat_prompt_text_ex(msgs, tool_schemas, tool_orders,
+                                      think_mode, false);
 }
 
 /* Render only the semantic tail that must be appended to the live KV for a
@@ -2531,8 +2539,9 @@ static char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_sch
  * suffix tokenization happens later after the cache decision, using the live
  * token prefix as the boundary.  That avoids BPE merges across the visible
  * replay/live-KV boundary. */
-static char *render_live_tool_tail(const chat_msgs *msgs, int start,
-                                   ds4_think_mode think_mode) {
+static char *render_live_tool_tail_ex(const chat_msgs *msgs, int start,
+                                      ds4_think_mode think_mode,
+                                      bool include_tool_result_focus) {
     const bool think = ds4_think_mode_enabled(think_mode);
     buf out = {0};
     buf_puts(&out, "<｜end▁of▁sentence｜>");
@@ -2557,7 +2566,7 @@ static char *render_live_tool_tail(const chat_msgs *msgs, int start,
             pending_tool_result = true;
         } else if (!strcmp(m->role, "assistant")) {
             if (pending_assistant) {
-                if (pending_tool_result) append_tool_result_focus_text(&out);
+                if (include_tool_result_focus && pending_tool_result) append_tool_result_focus_text(&out);
                 buf_puts(&out, "<｜Assistant｜>");
                 if (think) {
                     buf_puts(&out, "<think>");
@@ -2576,11 +2585,16 @@ static char *render_live_tool_tail(const chat_msgs *msgs, int start,
     }
 
     if (pending_assistant) {
-        if (pending_tool_result) append_tool_result_focus_text(&out);
+        if (include_tool_result_focus && pending_tool_result) append_tool_result_focus_text(&out);
         buf_puts(&out, "<｜Assistant｜>");
         buf_puts(&out, think ? "<think>" : "</think>");
     }
     return buf_take(&out);
+}
+
+static char *render_live_tool_tail(const chat_msgs *msgs, int start,
+                                   ds4_think_mode think_mode) {
+    return render_live_tool_tail_ex(msgs, start, think_mode, false);
 }
 
 static bool chat_msg_has_call_id(const chat_msg *m, const char *id) {
@@ -3232,11 +3246,12 @@ static bool parse_stateful_delta_request(ds4_engine *e, server *s,
 
     bool state_has_tools = false;
     ds4_think_mode state_think = DS4_THINK_HIGH;
-    (void)stateful_live_copy_config(s, r->stateful_session_id,
-                                    r->stateful_parent_revision,
-                                    &state_has_tools,
-                                    &state_think,
-                                    &r->tool_orders);
+    const bool has_stateful_live_config =
+        stateful_live_copy_config(s, r->stateful_session_id,
+                                  r->stateful_parent_revision,
+                                  &state_has_tools,
+                                  &state_think,
+                                  &r->tool_orders);
     r->has_tools = state_has_tools;
     r->think_mode = state_think;
 
@@ -3407,7 +3422,11 @@ static bool parse_stateful_delta_request(ds4_engine *e, server *s,
     r->think_mode = ds4_think_mode_for_context(
         think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
     r->prompt_preserves_reasoning = true;
-    r->stateful_suffix_text = render_live_tool_tail(&msgs, 0, r->think_mode);
+    const bool include_tool_result_focus = has_stateful_live_config &&
+        r->stateful_parent_revision > 0 &&
+        r->stateful_session_id && r->stateful_session_id[0];
+    r->stateful_suffix_text = render_live_tool_tail_ex(&msgs, 0, r->think_mode,
+                                                       include_tool_result_focus);
     r->prompt_text = xstrdup(r->stateful_suffix_text ? r->stateful_suffix_text : "");
     ds4_tokenize_rendered_chat(e, r->stateful_suffix_text ? r->stateful_suffix_text : "",
                                &r->prompt);
@@ -14413,7 +14432,7 @@ static void test_stateful_tool_delta_tail_matches_full_replay_two_tool_rounds(vo
     t1.role = xstrdup("tool");
     t1.content = xstrdup("ds4_rocm.cu\nds4_rocm.h\n");
     chat_msgs_push(&delta1, t1);
-    char *tail1 = render_live_tool_tail(&delta1, 0, think_mode);
+    char *tail1 = render_live_tool_tail_ex(&delta1, 0, think_mode, true);
     TEST_ASSERT(tail1 != NULL);
     buf_puts(&stateful, tail1 ? tail1 : "");
     free(tail1);
@@ -14428,7 +14447,7 @@ static void test_stateful_tool_delta_tail_matches_full_replay_two_tool_rounds(vo
     t2.role = xstrdup("tool");
     t2.content = xstrdup("Makefile: CFLAGS += -D_GNU_SOURCE -DDS4_USE_HIP\n");
     chat_msgs_push(&delta2, t2);
-    char *tail2 = render_live_tool_tail(&delta2, 0, think_mode);
+    char *tail2 = render_live_tool_tail_ex(&delta2, 0, think_mode, true);
     TEST_ASSERT(tail2 != NULL);
     buf_puts(&stateful, tail2 ? tail2 : "");
     free(tail2);
@@ -14470,8 +14489,8 @@ static void test_stateful_tool_delta_tail_matches_full_replay_two_tool_rounds(vo
     ft2.content = xstrdup("Makefile: CFLAGS += -D_GNU_SOURCE -DDS4_USE_HIP\n");
     chat_msgs_push(&full, ft2);
 
-    char *full_prompt = render_chat_prompt_text(&full, tool_schemas,
-                                                &orders, think_mode);
+    char *full_prompt = render_chat_prompt_text_ex(&full, tool_schemas,
+                                                   &orders, think_mode, true);
     TEST_ASSERT(full_prompt != NULL);
     TEST_ASSERT(stateful.ptr && strstr(stateful.ptr, "DS4 tool-result focus") != NULL);
     TEST_ASSERT(full_prompt && strstr(full_prompt, "DS4 tool-result focus") != NULL);
