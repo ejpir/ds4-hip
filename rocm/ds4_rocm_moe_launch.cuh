@@ -350,9 +350,43 @@ static int routed_moe_launch(
     const int q2k_path = plan.q2k_path;
     const uint64_t gate_bytes = plan.gate_bytes;
     const uint64_t down_bytes = plan.down_bytes;
-    const char *gate_w = cuda_model_range_ptr(model_map, gate_offset, gate_bytes, "moe_gate");
-    const char *up_w = cuda_model_range_ptr(model_map, up_offset, gate_bytes, "moe_up");
-    const char *down_w = cuda_model_range_ptr(model_map, down_offset, down_bytes, "moe_down");
+    const char *gate_w = NULL;
+    const char *up_w = NULL;
+    const char *down_w = NULL;
+    ds4_gpu_tensor remapped_selected;
+    const ds4_gpu_tensor *moe_selected = selected;
+    int have_moe_weights = 0;
+    if (q4k_path && cuda_model_resident_moe_layer_ptrs(model_map, model_size,
+                                                       gate_offset, up_offset, down_offset,
+                                                       gate_bytes, down_bytes,
+                                                       &gate_w, &up_w, &down_w)) {
+        have_moe_weights = 1;
+    } else if (q4k_path && cuda_model_cached_moe_expert_layer_ptrs(model_map, model_size,
+                                                                   gate_offset, up_offset, down_offset,
+                                                                   gate_bytes, down_bytes,
+                                                                   gate_expert_bytes, down_expert_bytes,
+                                                                   selected, n_tokens, n_expert,
+                                                                   &gate_w, &up_w, &down_w,
+                                                                   &remapped_selected)) {
+        moe_selected = &remapped_selected;
+        have_moe_weights = 1;
+    } else if (q4k_path && cuda_model_sparse_moe_layer_ptrs(model_map, model_size,
+                                                           gate_offset, up_offset, down_offset,
+                                                           gate_bytes, down_bytes,
+                                                           gate_expert_bytes, down_expert_bytes,
+                                                           selected, n_tokens, n_expert,
+                                                           &gate_w, &up_w, &down_w)) {
+        have_moe_weights = 1;
+    }
+    if (!have_moe_weights) {
+        uint64_t moe_weight_group_bytes = gate_bytes;
+        if (moe_weight_group_bytes <= UINT64_MAX - gate_bytes) moe_weight_group_bytes += gate_bytes;
+        if (moe_weight_group_bytes <= UINT64_MAX - down_bytes) moe_weight_group_bytes += down_bytes;
+        cuda_model_range_evict_for_bytes(moe_weight_group_bytes, "routed_moe");
+        gate_w = cuda_model_range_ptr(model_map, gate_offset, gate_bytes, "moe_gate");
+        up_w = cuda_model_range_ptr(model_map, up_offset, gate_bytes, "moe_up");
+        down_w = cuda_model_range_ptr(model_map, down_offset, down_bytes, "moe_down");
+    }
     if (!gate_w || !up_w || !down_w) return 0;
 
     int ok = 1;
@@ -447,7 +481,7 @@ static int routed_moe_launch(
                 if (ok) {
                     moe_count_sorted_pairs_kernel<<<(pair_count + 255u) / 256u, 256>>>(
                         counts,
-                        (const int32_t *)selected->ptr,
+                        (const int32_t *)moe_selected->ptr,
                         pair_count);
                     ok = cuda_ok(cudaGetLastError(), "routed_moe sorted count launch");
                 }
@@ -459,7 +493,7 @@ static int routed_moe_launch(
                     moe_scatter_sorted_pairs_deterministic_kernel<<<256u, 1u>>>(
                         sorted_pairs,
                         offsets,
-                        (const int32_t *)selected->ptr,
+                        (const int32_t *)moe_selected->ptr,
                         pair_count);
                     ok = cuda_ok(cudaGetLastError(), "routed_moe sorted scatter launch");
                 }
@@ -598,7 +632,7 @@ static int routed_moe_launch(
                     up_w,
                     xq,
                     sorted_pairs,
-                    (const int32_t *)selected->ptr,
+                    (const int32_t *)moe_selected->ptr,
                     (const float *)weights->ptr,
                     gate_expert_bytes,
                     gate_row_bytes,
@@ -617,7 +651,7 @@ static int routed_moe_launch(
                         up_w,
                         xq,
                         sorted_pairs,
-                        (const int32_t *)selected->ptr,
+                        (const int32_t *)moe_selected->ptr,
                         (const float *)weights->ptr,
                         gate_expert_bytes,
                         gate_row_bytes,
@@ -634,7 +668,7 @@ static int routed_moe_launch(
                         up_w,
                         xq,
                         sorted_pairs,
-                        (const int32_t *)selected->ptr,
+                        (const int32_t *)moe_selected->ptr,
                         (const float *)weights->ptr,
                         gate_expert_bytes,
                         gate_row_bytes,
@@ -653,7 +687,7 @@ static int routed_moe_launch(
                         gate_w,
                         up_w,
                         xq,
-                        (const int32_t *)selected->ptr,
+                        (const int32_t *)moe_selected->ptr,
                         (const float *)weights->ptr,
                         gate_expert_bytes,
                         gate_row_bytes,
@@ -670,7 +704,7 @@ static int routed_moe_launch(
                         gate_w,
                         up_w,
                         xq,
-                        (const int32_t *)selected->ptr,
+                        (const int32_t *)moe_selected->ptr,
                         (const float *)weights->ptr,
                         gate_expert_bytes,
                         gate_row_bytes,
@@ -687,7 +721,7 @@ static int routed_moe_launch(
                         gate_w,
                         up_w,
                         xq,
-                        (const int32_t *)selected->ptr,
+                        (const int32_t *)moe_selected->ptr,
                         (const float *)weights->ptr,
                         gate_expert_bytes,
                         gate_row_bytes,
@@ -807,7 +841,7 @@ static int routed_moe_launch(
                         (float *)out->ptr,
                         down_w,
                         midq,
-                        (const int32_t *)selected->ptr,
+                        (const int32_t *)moe_selected->ptr,
                         down_expert_bytes,
                         down_row_bytes,
                         midq_blocks,
@@ -817,7 +851,7 @@ static int routed_moe_launch(
                         (float *)out->ptr,
                         down_w,
                         midq,
-                        (const int32_t *)selected->ptr,
+                        (const int32_t *)moe_selected->ptr,
                         down_expert_bytes,
                         down_row_bytes,
                         midq_blocks,
@@ -899,7 +933,7 @@ static int routed_moe_launch(
                     down_w,
                     midq,
                     sorted_pairs,
-                    (const int32_t *)selected->ptr,
+                    (const int32_t *)moe_selected->ptr,
                     down_expert_bytes,
                     down_row_bytes,
                     midq_blocks,
@@ -913,7 +947,7 @@ static int routed_moe_launch(
                         down_w,
                         midq,
                         sorted_pairs,
-                        (const int32_t *)selected->ptr,
+                        (const int32_t *)moe_selected->ptr,
                         down_expert_bytes,
                         down_row_bytes,
                         midq_blocks,
@@ -925,7 +959,7 @@ static int routed_moe_launch(
                         down_w,
                         midq,
                         sorted_pairs,
-                        (const int32_t *)selected->ptr,
+                        (const int32_t *)moe_selected->ptr,
                         down_expert_bytes,
                         down_row_bytes,
                         midq_blocks,
@@ -938,7 +972,7 @@ static int routed_moe_launch(
                         (float *)down->ptr,
                         down_w,
                         midq,
-                        (const int32_t *)selected->ptr,
+                        (const int32_t *)moe_selected->ptr,
                         down_expert_bytes,
                         down_row_bytes,
                         midq_blocks,
@@ -949,7 +983,7 @@ static int routed_moe_launch(
                         (float *)down->ptr,
                         down_w,
                         midq,
-                        (const int32_t *)selected->ptr,
+                        (const int32_t *)moe_selected->ptr,
                         down_expert_bytes,
                         down_row_bytes,
                         midq_blocks,
@@ -1015,7 +1049,7 @@ static int routed_moe_launch(
         if (ok) {
             moe_count_sorted_pairs_kernel<<<(pair_count + 255u) / 256u, 256>>>(
                     counts,
-                    (const int32_t *)selected->ptr,
+                    (const int32_t *)moe_selected->ptr,
                     pair_count);
             ok = cuda_ok(cudaGetLastError(), "routed_moe q2 expert count launch");
         }
@@ -1027,7 +1061,7 @@ static int routed_moe_launch(
             moe_scatter_sorted_pairs_deterministic_kernel<<<256u, 1u>>>(
                     sorted_pairs,
                     offsets,
-                    (const int32_t *)selected->ptr,
+                    (const int32_t *)moe_selected->ptr,
                     pair_count);
             ok = cuda_ok(cudaGetLastError(), "routed_moe q2 expert scatter launch");
         }
@@ -1201,7 +1235,7 @@ static int routed_moe_launch(
                         gate_w,
                         up_w,
                         xq_gate,
-                        (const int32_t *)selected->ptr,
+                        (const int32_t *)moe_selected->ptr,
                         (const float *)weights->ptr,
                         gate_expert_bytes,
                         gate_row_bytes,
@@ -1221,7 +1255,7 @@ static int routed_moe_launch(
                     gate_w,
                     up_w,
                     (const float *)x->ptr,
-                    (const int32_t *)selected->ptr,
+                    (const int32_t *)moe_selected->ptr,
                     (const float *)weights->ptr,
                     gate_expert_bytes,
                     gate_row_bytes,
@@ -1240,7 +1274,7 @@ static int routed_moe_launch(
                     gate_w,
                     up_w,
                     (const float *)x->ptr,
-                    (const int32_t *)selected->ptr,
+                    (const int32_t *)moe_selected->ptr,
                     (const float *)weights->ptr,
                     gate_expert_bytes,
                     gate_row_bytes,
@@ -1266,7 +1300,7 @@ static int routed_moe_launch(
                         (float *)out->ptr,
                         down_w,
                         midq,
-                        (const int32_t *)selected->ptr,
+                        (const int32_t *)moe_selected->ptr,
                         down_expert_bytes,
                         down_row_bytes,
                         midq_blocks,
@@ -1279,7 +1313,7 @@ static int routed_moe_launch(
                     (float *)out->ptr,
                     down_w,
                     (const float *)mid->ptr,
-                    (const int32_t *)selected->ptr,
+                    (const int32_t *)moe_selected->ptr,
                     n_tokens,
                     expert_mid_dim,
                     out_dim,
@@ -1300,7 +1334,7 @@ static int routed_moe_launch(
                 gate_w,
                 up_w,
                 (const float *)x->ptr,
-                (const int32_t *)selected->ptr,
+                (const int32_t *)moe_selected->ptr,
                 (const float *)weights->ptr,
                 gate_expert_bytes,
                 gate_row_bytes,
@@ -1316,7 +1350,7 @@ static int routed_moe_launch(
                 gate_w,
                 up_w,
                 (const float *)x->ptr,
-                (const int32_t *)selected->ptr,
+                (const int32_t *)moe_selected->ptr,
                 (const float *)weights->ptr,
                 gate_expert_bytes,
                 gate_row_bytes,
@@ -1333,7 +1367,7 @@ static int routed_moe_launch(
             (float *)down->ptr,
             down_w,
             (const float *)mid->ptr,
-            (const int32_t *)selected->ptr,
+            (const int32_t *)moe_selected->ptr,
             down_expert_bytes,
             down_row_bytes,
             expert_mid_dim,

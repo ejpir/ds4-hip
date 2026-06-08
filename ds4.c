@@ -2266,6 +2266,12 @@ static bool accelerator_cache_model_tensors(ds4_backend backend,
         return true;
     }
 #endif
+    if (getenv("DS4_CUDA_SKIP_STARTUP_MODEL_CACHE") != NULL ||
+        getenv("DS4_HIP_SKIP_STARTUP_MODEL_CACHE") != NULL) {
+        fprintf(stderr,
+                "ds4: CUDA startup model tensor cache skipped by DS4_CUDA_SKIP_STARTUP_MODEL_CACHE\n");
+        return true;
+    }
 
     const double t0 = now_sec();
     uint64_t prepared = 0;
@@ -18648,11 +18654,13 @@ static bool metal_graph_prefill_decode_streaming_range(
         bool                   show_progress,
         ds4_session_progress_fn progress,
         void                  *progress_ud,
+        uint32_t               progress_chunk_tokens,
         ds4_session_progress_fn display_progress,
         void                  *display_progress_ud,
         ds4_session_cancel_fn  cancel,
         void                  *cancel_ud,
         bool                  *cancelled) {
+    (void)progress_chunk_tokens;
     if (!metal_graph_use_streaming_decode_prefill(g, weights, n_tokens)) return false;
     if (!prompt || start > (uint32_t)prompt->len ||
         n_tokens > (uint32_t)prompt->len - start) return false;
@@ -19902,6 +19910,7 @@ static bool metal_graph_prefill_raw_swa(
                                                           show_progress,
                                                           NULL,
                                                           NULL,
+                                                          0,
                                                           display_progress,
                                                           display_progress_ud,
                                                           cancel,
@@ -19937,6 +19946,8 @@ static bool metal_graph_prefill_raw_swa(
  * compression windows and row finalization follow the same schedule after the
  * cached prefix.
  */
+static uint32_t ds4_session_env_progress_chunk_tokens(void);
+
 static bool metal_graph_prefill_chunked_range(
         ds4_gpu_graph *g,
         const ds4_model       *model,
@@ -19948,6 +19959,7 @@ static bool metal_graph_prefill_chunked_range(
         bool                   show_progress,
         ds4_session_progress_fn progress,
         void                  *progress_ud,
+        uint32_t               progress_chunk_tokens,
         ds4_session_progress_fn display_progress,
         void                  *display_progress_ud,
         ds4_imatrix_collector *imatrix,
@@ -19973,6 +19985,7 @@ static bool metal_graph_prefill_chunked_range(
                                                           show_progress,
                                                           progress,
                                                           progress_ud,
+                                                          progress_chunk_tokens,
                                                           display_progress,
                                                           display_progress_ud,
                                                           cancel,
@@ -19982,6 +19995,12 @@ static bool metal_graph_prefill_chunked_range(
 
     uint32_t chunk_cap = g->prefill_cap;
     if (start != 0 && chunk_cap > g->raw_cap) chunk_cap = g->raw_cap;
+    if (progress) {
+        const uint32_t progress_cap = progress_chunk_tokens ?
+                                      progress_chunk_tokens :
+                                      ds4_session_env_progress_chunk_tokens();
+        if (progress_cap > 0 && progress_cap < chunk_cap) chunk_cap = progress_cap;
+    }
     if (chunk_cap == 0) return false;
 
     const bool profile = getenv("DS4_METAL_GRAPH_PREFILL_PROFILE") != NULL;
@@ -20066,6 +20085,7 @@ static bool metal_graph_prefill_chunked(
         bool                   show_progress,
         ds4_session_progress_fn progress,
         void                  *progress_ud,
+        uint32_t               progress_chunk_tokens,
         ds4_session_progress_fn display_progress,
         void                  *display_progress_ud,
         ds4_session_cancel_fn  cancel,
@@ -20082,6 +20102,7 @@ static bool metal_graph_prefill_chunked(
                                              show_progress,
                                              progress,
                                              progress_ud,
+                                             progress_chunk_tokens,
                                              display_progress,
                                              display_progress_ud,
                                              NULL,
@@ -21969,6 +21990,7 @@ static int generate_metal_graph_raw_swa(
         ok = metal_graph_prefill_chunked(&g, model, weights, prompt,
                                          prompt->len, logits, false,
                                          progress, progress_ud,
+                                         0,
                                          progress, progress_ud,
                                          NULL, NULL, NULL);
     } else {
@@ -22218,6 +22240,7 @@ struct ds4_session {
     ds4_session_cancel_fn cancel;
     void *cancel_ud;
     uint32_t prefill_cap;
+    uint32_t progress_chunk_tokens;
     int ctx_size;
     bool checkpoint_valid;
     bool mtp_draft_valid;
@@ -24024,6 +24047,7 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
                                                            (uint32_t)prompt.len,
                                                            NULL, false,
                                                            NULL, NULL,
+                                                           0,
                                                            NULL, NULL,
                                                            &collector,
                                                            NULL, NULL, NULL);
@@ -25090,6 +25114,21 @@ static bool ds4_session_cancelled_cb(void *ud) {
     return ds4_session_cancelled(ud);
 }
 
+void ds4_session_set_prefill_chunk_tokens(ds4_session *s, uint32_t tokens) {
+    if (!s) return;
+    s->progress_chunk_tokens = tokens;
+}
+
+static uint32_t ds4_session_env_progress_chunk_tokens(void) {
+    const char *env = getenv("DS4_SESSION_PROGRESS_CHUNK_TOKENS");
+    if (!env || !env[0]) return 0;
+    char *end = NULL;
+    unsigned long v = strtoul(env, &end, 10);
+    if (end == env || v == 0) return 0;
+    if (v > UINT32_MAX) return UINT32_MAX;
+    return (uint32_t)v;
+}
+
 void ds4_session_report_progress(ds4_session *s, const char *event, int current, int total) {
     if (!s || !s->progress || !event) return;
     s->progress(s->progress_ud, event, current, total);
@@ -25624,6 +25663,7 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
                                                         false,
                                                         ds4_session_note_prefill_progress,
                                                         &progress,
+                                                        s->progress_chunk_tokens,
                                                         s->display_progress,
                                                         s->display_progress_ud,
                                                         NULL,
@@ -25686,6 +25726,7 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
         ok = metal_graph_prefill_chunked(&s->graph, &e->model, &e->weights,
                                          prompt, prompt->len, s->logits, false,
                                          ds4_session_note_prefill_progress, &progress,
+                                         s->progress_chunk_tokens,
                                          s->display_progress,
                                          s->display_progress_ud,
                                          ds4_session_cancelled_cb,

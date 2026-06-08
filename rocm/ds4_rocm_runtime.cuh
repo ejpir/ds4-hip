@@ -43,6 +43,48 @@ struct cuda_model_arena {
     uint64_t used;
 };
 
+struct cuda_moe_resident_layer {
+    uint64_t gate_offset;
+    uint64_t up_offset;
+    uint64_t down_offset;
+    uint64_t gate_bytes;
+    uint64_t down_bytes;
+    char *gate_ptr;
+    char *up_ptr;
+    char *down_ptr;
+    uint64_t resident_bytes;
+};
+
+struct cuda_moe_expert_cache_entry {
+    uint64_t gate_offset;
+    uint64_t up_offset;
+    uint64_t down_offset;
+    uint64_t gate_expert_bytes;
+    uint64_t down_expert_bytes;
+    uint32_t expert;
+    char *gate_ptr;
+    char *up_ptr;
+    char *down_ptr;
+    uint64_t bytes;
+    uint64_t last_use;
+};
+
+struct cuda_moe_layer_expert_cache {
+    uint64_t gate_offset;
+    uint64_t up_offset;
+    uint64_t down_offset;
+    uint64_t gate_expert_bytes;
+    uint64_t down_expert_bytes;
+    uint32_t capacity;
+    char *gate_ptr;
+    char *up_ptr;
+    char *down_ptr;
+    uint64_t bytes;
+    uint64_t last_use;
+    std::vector<uint32_t> expert_for_slot;
+    std::vector<uint64_t> last_use_for_slot;
+};
+
 struct cuda_model_image {
     const void *host_base;
     uint64_t size;
@@ -70,12 +112,19 @@ struct cuda_q8_f16_transpose_range {
 static std::vector<cuda_model_range> g_model_ranges;
 static std::vector<cuda_model_arena> g_model_arenas;
 static std::vector<cuda_model_image> g_model_images;
+static std::vector<cuda_moe_resident_layer> g_moe_resident_layers;
+static std::vector<cuda_moe_expert_cache_entry> g_moe_expert_cache;
+static std::vector<cuda_moe_layer_expert_cache> g_moe_layer_expert_cache;
 static std::unordered_map<uint64_t, size_t> g_model_range_by_offset;
 static std::vector<cuda_q8_f16_range> g_q8_f16_ranges;
 static std::unordered_map<uint64_t, size_t> g_q8_f16_by_offset;
 static std::vector<cuda_q8_f16_transpose_range> g_q8_f16_transpose_ranges;
 static std::unordered_map<uint64_t, size_t> g_q8_f16_transpose_by_offset;
 static uint64_t g_model_range_bytes;
+static uint64_t g_moe_resident_bytes;
+static uint64_t g_moe_expert_cache_bytes;
+static uint64_t g_moe_layer_expert_cache_bytes;
+static uint64_t g_moe_expert_cache_tick;
 static uint64_t g_q8_f16_bytes;
 static int g_q8_f16_disabled_after_oom;
 static int g_q8_f16_budget_notice_printed;
@@ -85,6 +134,20 @@ static int g_model_load_progress_started;
 static int g_model_load_progress_tty;
 static void *g_cuda_tmp;
 static uint64_t g_cuda_tmp_bytes;
+static char *g_moe_sparse_gate;
+static char *g_moe_sparse_up;
+static char *g_moe_sparse_down;
+static uint64_t g_moe_sparse_gate_bytes;
+static uint64_t g_moe_sparse_up_bytes;
+static uint64_t g_moe_sparse_down_bytes;
+static char *g_moe_compact_gate;
+static char *g_moe_compact_up;
+static char *g_moe_compact_down;
+static uint64_t g_moe_compact_gate_bytes;
+static uint64_t g_moe_compact_up_bytes;
+static uint64_t g_moe_compact_down_bytes;
+static int32_t *g_moe_compact_selected;
+static uint64_t g_moe_compact_selected_bytes;
 static void *g_model_stage_raw[4];
 static void *g_model_stage[4];
 static cudaEvent_t g_model_stage_event[4];
@@ -151,6 +214,8 @@ static const char *cuda_model_range_ptr_from_fd(
         uint64_t offset,
         uint64_t bytes,
         const char *what);
+static void cuda_model_range_release_all(void);
+static void cuda_moe_layer_expert_cache_release(void);
 __global__ static void dequant_q8_0_to_f16_kernel(
         __half *out,
         const unsigned char *w,
@@ -398,6 +463,51 @@ static void cuda_q8_f16_cache_release_all(void) {
 static int cuda_env_present(const char *env) {
     if (env != NULL) return env[0] != '\0' && strcmp(env, "0") != 0;
     return 0;
+}
+
+static uint64_t cuda_parse_mib_env(const char *name, int *present) {
+    const char *env = getenv(name);
+    if (present) *present = 0;
+    if (!env || !env[0]) return 0;
+    char *end = NULL;
+    unsigned long long v = strtoull(env, &end, 10);
+    if (end == env || *end != '\0') return 0;
+    if (present) *present = 1;
+    if (v > UINT64_MAX / 1048576ull) return UINT64_MAX;
+    return (uint64_t)v * 1048576ull;
+}
+
+static uint64_t cuda_parse_u64_env(const char *name, int *present) {
+    const char *env = getenv(name);
+    if (present) *present = 0;
+    if (!env || !env[0]) return 0;
+    char *end = NULL;
+    unsigned long long v = strtoull(env, &end, 10);
+    if (end == env || *end != '\0') return 0;
+    if (present) *present = 1;
+    return (uint64_t)v;
+}
+
+static int cuda_env_flag(const char *name) {
+    const char *env = name ? getenv(name) : NULL;
+    return env != NULL && env[0] != '\0' && strcmp(env, "0") != 0;
+}
+
+static int cuda_env_flag_any3(const char *a, const char *b, const char *c) {
+    return (a && cuda_env_flag(a)) ||
+           (b && cuda_env_flag(b)) ||
+           (c && cuda_env_flag(c));
+}
+
+static uint32_t cuda_parse_u32_env_alias(const char *primary, const char *alias,
+                                         uint32_t def, uint32_t min_v, uint32_t max_v) {
+    int have = 0;
+    uint64_t v = cuda_parse_u64_env(primary, &have);
+    if (!have && alias) v = cuda_parse_u64_env(alias, &have);
+    if (!have) return def;
+    if (v < min_v) v = min_v;
+    if (v > max_v) v = max_v;
+    return (uint32_t)v;
 }
 
 static uint32_t cuda_rows_per_block_or_default(uint32_t v, uint32_t def) {
@@ -1015,6 +1125,1008 @@ static uint64_t cuda_model_cache_limit_bytes(void) {
     return UINT64_MAX;
 }
 
+static void cuda_model_range_evict_for_bytes(uint64_t bytes, const char *what) {
+    if (!cuda_env_flag("DS4_CUDA_WEIGHT_CACHE_EVICT") || bytes == 0) return;
+    const uint64_t limit = cuda_model_cache_limit_bytes();
+    if (limit == UINT64_MAX || bytes > limit) return;
+    if (g_model_range_bytes <= limit - bytes) return;
+    if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
+        fprintf(stderr,
+                DS4_GPU_LOG_PREFIX "evicting %.2f GiB model range cache for %s group %.2f MiB (limit %.2f GiB)\n",
+                (double)g_model_range_bytes / 1073741824.0,
+                what ? what : "weights",
+                (double)bytes / 1048576.0,
+                (double)limit / 1073741824.0);
+    }
+    (void)cudaDeviceSynchronize();
+    cuda_model_range_release_all();
+}
+
+static int cuda_moe_sparse_alloc_one(char **ptr, uint64_t *have, uint64_t need, const char *what) {
+    if (need == 0) return 0;
+    if (*ptr && *have >= need) return 1;
+    (void)cudaDeviceSynchronize();
+    if (*ptr) {
+        (void)cudaFree(*ptr);
+        *ptr = NULL;
+        *have = 0;
+    }
+    void *dev = NULL;
+    cudaError_t err = cudaMalloc(&dev, (size_t)need);
+    if (err != cudaSuccess) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "sparse MoE alloc failed for %s (%.2f GiB): %s\n",
+                what ? what : "weights",
+                (double)need / 1073741824.0,
+                cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        return 0;
+    }
+    *ptr = (char *)dev;
+    *have = need;
+    return 1;
+}
+
+static int cuda_moe_sparse_buffers_prepare(uint64_t gate_bytes, uint64_t down_bytes) {
+    return cuda_moe_sparse_alloc_one(&g_moe_sparse_gate, &g_moe_sparse_gate_bytes, gate_bytes, "gate") &&
+           cuda_moe_sparse_alloc_one(&g_moe_sparse_up, &g_moe_sparse_up_bytes, gate_bytes, "up") &&
+           cuda_moe_sparse_alloc_one(&g_moe_sparse_down, &g_moe_sparse_down_bytes, down_bytes, "down");
+}
+
+static void cuda_moe_sparse_buffers_release(void) {
+    if (g_moe_sparse_gate) (void)cudaFree(g_moe_sparse_gate);
+    if (g_moe_sparse_up) (void)cudaFree(g_moe_sparse_up);
+    if (g_moe_sparse_down) (void)cudaFree(g_moe_sparse_down);
+    g_moe_sparse_gate = NULL;
+    g_moe_sparse_up = NULL;
+    g_moe_sparse_down = NULL;
+    g_moe_sparse_gate_bytes = 0;
+    g_moe_sparse_up_bytes = 0;
+    g_moe_sparse_down_bytes = 0;
+}
+
+static int cuda_moe_compact_buffers_prepare(uint64_t gate_bytes, uint64_t down_bytes) {
+    return cuda_moe_sparse_alloc_one(&g_moe_compact_gate, &g_moe_compact_gate_bytes, gate_bytes, "compact_gate") &&
+           cuda_moe_sparse_alloc_one(&g_moe_compact_up, &g_moe_compact_up_bytes, gate_bytes, "compact_up") &&
+           cuda_moe_sparse_alloc_one(&g_moe_compact_down, &g_moe_compact_down_bytes, down_bytes, "compact_down");
+}
+
+static int cuda_moe_compact_selected_prepare(uint64_t bytes) {
+    if (bytes == 0) return 0;
+    if (g_moe_compact_selected && g_moe_compact_selected_bytes >= bytes) return 1;
+    (void)cudaDeviceSynchronize();
+    if (g_moe_compact_selected) {
+        (void)cudaFree(g_moe_compact_selected);
+        g_moe_compact_selected = NULL;
+        g_moe_compact_selected_bytes = 0;
+    }
+    void *dev = NULL;
+    cudaError_t err = cudaMalloc(&dev, (size_t)bytes);
+    if (err != cudaSuccess) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "compact MoE selected alloc failed (%.2f MiB): %s\n",
+                (double)bytes / 1048576.0,
+                cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        return 0;
+    }
+    g_moe_compact_selected = (int32_t *)dev;
+    g_moe_compact_selected_bytes = bytes;
+    return 1;
+}
+
+static void cuda_moe_compact_buffers_release(void) {
+    if (g_moe_compact_gate) (void)cudaFree(g_moe_compact_gate);
+    if (g_moe_compact_up) (void)cudaFree(g_moe_compact_up);
+    if (g_moe_compact_down) (void)cudaFree(g_moe_compact_down);
+    if (g_moe_compact_selected) (void)cudaFree(g_moe_compact_selected);
+    g_moe_compact_gate = NULL;
+    g_moe_compact_up = NULL;
+    g_moe_compact_down = NULL;
+    g_moe_compact_selected = NULL;
+    g_moe_compact_gate_bytes = 0;
+    g_moe_compact_up_bytes = 0;
+    g_moe_compact_down_bytes = 0;
+    g_moe_compact_selected_bytes = 0;
+}
+
+static int cuda_model_copy_range_to_device_buffer(
+        const void *model_map,
+        uint64_t model_size,
+        char *dst,
+        uint64_t src_offset,
+        uint64_t bytes,
+        const char *what) {
+    if (!dst || bytes == 0) return bytes == 0;
+    if (src_offset > model_size || bytes > model_size - src_offset) return 0;
+
+    if (g_model_fd < 0) {
+        cudaError_t err = cudaMemcpy(dst, (const char *)model_map + src_offset,
+                                     (size_t)bytes, cudaMemcpyHostToDevice);
+        if (err != cudaSuccess) {
+            fprintf(stderr, DS4_GPU_LOG_PREFIX "sparse MoE copy failed for %s %.2f MiB: %s\n",
+                    what ? what : "weights",
+                    (double)bytes / 1048576.0,
+                    cudaGetErrorString(err));
+            (void)cudaGetLastError();
+            return 0;
+        }
+        cuda_model_discard_source_pages(model_map, model_size, src_offset, bytes);
+        return 1;
+    }
+
+    const uint64_t chunk = cuda_model_copy_chunk_bytes();
+    const uint64_t stage_bytes = chunk + (g_model_direct_align > 1 ? g_model_direct_align : 1);
+    if (!cuda_model_stage_pool_alloc(stage_bytes)) return 0;
+
+    uint64_t copied = 0;
+    while (copied < bytes) {
+        const uint64_t n = (bytes - copied < chunk) ? (bytes - copied) : chunk;
+        const char *payload = NULL;
+        if (!cuda_model_stage_read(g_model_stage[0], g_model_stage_bytes,
+                                   src_offset + copied, n, &payload)) {
+            fprintf(stderr, DS4_GPU_LOG_PREFIX "sparse MoE read failed for %s at %.2f/%.2f MiB: %s\n",
+                    what ? what : "weights",
+                    (double)copied / 1048576.0,
+                    (double)bytes / 1048576.0,
+                    strerror(errno));
+            return 0;
+        }
+        cudaError_t err = cudaMemcpy(dst + copied, payload, (size_t)n, cudaMemcpyHostToDevice);
+        if (err != cudaSuccess) {
+            fprintf(stderr, DS4_GPU_LOG_PREFIX "sparse MoE upload failed for %s at %.2f/%.2f MiB: %s\n",
+                    what ? what : "weights",
+                    (double)copied / 1048576.0,
+                    (double)bytes / 1048576.0,
+                    cudaGetErrorString(err));
+            (void)cudaGetLastError();
+            return 0;
+        }
+        cuda_model_drop_file_pages(src_offset + copied, n);
+        cuda_model_discard_source_pages(model_map, model_size, src_offset + copied, n);
+        copied += n;
+    }
+    return 1;
+}
+
+static uint64_t cuda_moe_expert_cache_budget_bytes(void) {
+    int have = 0;
+    uint64_t gb = cuda_parse_u64_env("DS4_CUDA_MOE_EXPERT_CACHE_GB", &have);
+    if (!have) gb = cuda_parse_u64_env("DS4_HIP_MOE_EXPERT_CACHE_GB", &have);
+    if (have) {
+        if (gb > UINT64_MAX / 1073741824ull) return UINT64_MAX;
+        return gb * 1073741824ull;
+    }
+    uint64_t bytes = cuda_parse_mib_env("DS4_CUDA_MOE_EXPERT_CACHE_MB", &have);
+    if (!have) bytes = cuda_parse_mib_env("DS4_HIP_MOE_EXPERT_CACHE_MB", &have);
+    return have ? bytes : 0;
+}
+
+static void cuda_moe_expert_cache_release(void) {
+    cuda_moe_layer_expert_cache_release();
+    for (const cuda_moe_expert_cache_entry &e : g_moe_expert_cache) {
+        if (e.gate_ptr) (void)cudaFree(e.gate_ptr);
+        if (e.up_ptr) (void)cudaFree(e.up_ptr);
+        if (e.down_ptr) (void)cudaFree(e.down_ptr);
+    }
+    g_moe_expert_cache.clear();
+    g_moe_expert_cache_bytes = 0;
+    g_moe_expert_cache_tick = 0;
+    cuda_moe_compact_buffers_release();
+}
+
+static int cuda_moe_expert_cache_find_index(
+        uint64_t gate_offset,
+        uint64_t up_offset,
+        uint64_t down_offset,
+        uint64_t gate_expert_bytes,
+        uint64_t down_expert_bytes,
+        uint32_t expert,
+        size_t *idx_out) {
+    for (size_t i = 0; i < g_moe_expert_cache.size(); i++) {
+        const cuda_moe_expert_cache_entry &e = g_moe_expert_cache[i];
+        if (e.gate_offset == gate_offset && e.up_offset == up_offset && e.down_offset == down_offset &&
+            e.gate_expert_bytes == gate_expert_bytes && e.down_expert_bytes == down_expert_bytes &&
+            e.expert == expert && e.gate_ptr && e.up_ptr && e.down_ptr) {
+            if (idx_out) *idx_out = i;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void cuda_moe_expert_cache_evict_index(size_t idx) {
+    if (idx >= g_moe_expert_cache.size()) return;
+    cuda_moe_expert_cache_entry &e = g_moe_expert_cache[idx];
+    if (e.gate_ptr) (void)cudaFree(e.gate_ptr);
+    if (e.up_ptr) (void)cudaFree(e.up_ptr);
+    if (e.down_ptr) (void)cudaFree(e.down_ptr);
+    if (g_moe_expert_cache_bytes >= e.bytes) g_moe_expert_cache_bytes -= e.bytes;
+    else g_moe_expert_cache_bytes = 0;
+    g_moe_expert_cache.erase(g_moe_expert_cache.begin() + (ptrdiff_t)idx);
+}
+
+static int cuda_moe_expert_cache_evict_for(uint64_t bytes, uint64_t budget) {
+    if (bytes > budget) return 0;
+    if (g_moe_expert_cache_bytes <= budget - bytes) return 1;
+    (void)cudaDeviceSynchronize();
+    while (!g_moe_expert_cache.empty() && g_moe_expert_cache_bytes > budget - bytes) {
+        size_t victim = 0;
+        uint64_t best_use = g_moe_expert_cache[0].last_use;
+        for (size_t i = 1; i < g_moe_expert_cache.size(); i++) {
+            if (g_moe_expert_cache[i].last_use < best_use) {
+                best_use = g_moe_expert_cache[i].last_use;
+                victim = i;
+            }
+        }
+        cuda_moe_expert_cache_evict_index(victim);
+    }
+    return g_moe_expert_cache_bytes <= budget - bytes;
+}
+
+static int cuda_moe_expert_cache_add(
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t gate_offset,
+        uint64_t up_offset,
+        uint64_t down_offset,
+        uint64_t gate_expert_bytes,
+        uint64_t down_expert_bytes,
+        uint32_t expert,
+        size_t *idx_out) {
+    const uint64_t budget = cuda_moe_expert_cache_budget_bytes();
+    if (budget == 0 || gate_expert_bytes == 0 || down_expert_bytes == 0) return 0;
+    uint64_t entry_bytes = gate_expert_bytes;
+    if (entry_bytes > UINT64_MAX - gate_expert_bytes) return 0;
+    entry_bytes += gate_expert_bytes;
+    if (entry_bytes > UINT64_MAX - down_expert_bytes) return 0;
+    entry_bytes += down_expert_bytes;
+    if (!cuda_moe_expert_cache_evict_for(entry_bytes, budget)) return 0;
+
+    char *gate_ptr = NULL;
+    char *up_ptr = NULL;
+    char *down_ptr = NULL;
+    cudaError_t err = cudaMalloc((void **)&gate_ptr, (size_t)gate_expert_bytes);
+    if (err == cudaSuccess) err = cudaMalloc((void **)&up_ptr, (size_t)gate_expert_bytes);
+    if (err == cudaSuccess) err = cudaMalloc((void **)&down_ptr, (size_t)down_expert_bytes);
+    if (err != cudaSuccess) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "MoE expert cache alloc skipped (expert %.2f MiB): %s\n",
+                (double)entry_bytes / 1048576.0,
+                cudaGetErrorString(err));
+        if (gate_ptr) (void)cudaFree(gate_ptr);
+        if (up_ptr) (void)cudaFree(up_ptr);
+        if (down_ptr) (void)cudaFree(down_ptr);
+        (void)cudaGetLastError();
+        return 0;
+    }
+
+    const uint64_t gate_src = gate_offset + (uint64_t)expert * gate_expert_bytes;
+    const uint64_t up_src = up_offset + (uint64_t)expert * gate_expert_bytes;
+    const uint64_t down_src = down_offset + (uint64_t)expert * down_expert_bytes;
+    if (!cuda_model_copy_range_to_device_buffer(model_map, model_size, gate_ptr, gate_src, gate_expert_bytes, "expert_cache_gate") ||
+        !cuda_model_copy_range_to_device_buffer(model_map, model_size, up_ptr, up_src, gate_expert_bytes, "expert_cache_up") ||
+        !cuda_model_copy_range_to_device_buffer(model_map, model_size, down_ptr, down_src, down_expert_bytes, "expert_cache_down")) {
+        (void)cudaFree(gate_ptr);
+        (void)cudaFree(up_ptr);
+        (void)cudaFree(down_ptr);
+        return 0;
+    }
+
+    cuda_moe_expert_cache_entry ce;
+    ce.gate_offset = gate_offset;
+    ce.up_offset = up_offset;
+    ce.down_offset = down_offset;
+    ce.gate_expert_bytes = gate_expert_bytes;
+    ce.down_expert_bytes = down_expert_bytes;
+    ce.expert = expert;
+    ce.gate_ptr = gate_ptr;
+    ce.up_ptr = up_ptr;
+    ce.down_ptr = down_ptr;
+    ce.bytes = entry_bytes;
+    ce.last_use = ++g_moe_expert_cache_tick;
+    g_moe_expert_cache.push_back(ce);
+    g_moe_expert_cache_bytes += entry_bytes;
+    if (idx_out) *idx_out = g_moe_expert_cache.size() - 1u;
+    if (cuda_env_flag_any3("DS4_CUDA_MOE_EXPERT_CACHE_VERBOSE", "DS4_HIP_MOE_EXPERT_CACHE_VERBOSE", NULL)) {
+        fprintf(stderr,
+                DS4_GPU_LOG_PREFIX "MoE expert cached expert=%u entry=%.2f MiB total=%.2f/%.2f GiB\n",
+                expert,
+                (double)entry_bytes / 1048576.0,
+                (double)g_moe_expert_cache_bytes / 1073741824.0,
+                (double)budget / 1073741824.0);
+    }
+    return 1;
+}
+
+static void cuda_moe_layer_expert_cache_release(void) {
+    for (const cuda_moe_layer_expert_cache &c : g_moe_layer_expert_cache) {
+        if (c.gate_ptr) (void)cudaFree(c.gate_ptr);
+        if (c.up_ptr) (void)cudaFree(c.up_ptr);
+        if (c.down_ptr) (void)cudaFree(c.down_ptr);
+    }
+    g_moe_layer_expert_cache.clear();
+    g_moe_layer_expert_cache_bytes = 0;
+}
+
+static int cuda_moe_layer_expert_cache_find(
+        uint64_t gate_offset,
+        uint64_t up_offset,
+        uint64_t down_offset,
+        uint64_t gate_expert_bytes,
+        uint64_t down_expert_bytes,
+        size_t *idx_out) {
+    for (size_t i = 0; i < g_moe_layer_expert_cache.size(); i++) {
+        const cuda_moe_layer_expert_cache &c = g_moe_layer_expert_cache[i];
+        if (c.gate_offset == gate_offset && c.up_offset == up_offset && c.down_offset == down_offset &&
+            c.gate_expert_bytes == gate_expert_bytes && c.down_expert_bytes == down_expert_bytes &&
+            c.gate_ptr && c.up_ptr && c.down_ptr) {
+            if (idx_out) *idx_out = i;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void cuda_moe_layer_expert_cache_evict_index(size_t idx) {
+    if (idx >= g_moe_layer_expert_cache.size()) return;
+    cuda_moe_layer_expert_cache &c = g_moe_layer_expert_cache[idx];
+    if (c.gate_ptr) (void)cudaFree(c.gate_ptr);
+    if (c.up_ptr) (void)cudaFree(c.up_ptr);
+    if (c.down_ptr) (void)cudaFree(c.down_ptr);
+    if (g_moe_layer_expert_cache_bytes >= c.bytes) g_moe_layer_expert_cache_bytes -= c.bytes;
+    else g_moe_layer_expert_cache_bytes = 0;
+    g_moe_layer_expert_cache.erase(g_moe_layer_expert_cache.begin() + (ptrdiff_t)idx);
+}
+
+static int cuda_moe_layer_expert_cache_evict_for(uint64_t bytes, uint64_t budget) {
+    if (bytes > budget) return 0;
+    if (g_moe_layer_expert_cache_bytes <= budget - bytes) return 1;
+
+    /*
+     * Decode visits MoE layers in a fixed cyclic order.  Plain LRU is a worst
+     * case when the layer-cache budget cannot hold every non-resident layer:
+     * layer 10 evicts layer 9, layer 11 evicts layer 10, ..., and the next
+     * token starts by missing layer 9 again.  Keep the already-admitted layer
+     * caches stable by default and let uncached layers fall through to the
+     * one-shot sparse path.  This turns partial budgets into useful pinned
+     * layer coverage instead of a full-cache zero-hit scan.
+     *
+     * Set DS4_CUDA_MOE_LAYER_CACHE_EVICT=1 or DS4_HIP_MOE_LAYER_CACHE_EVICT=1
+     * to restore the old LRU eviction behaviour for experiments.
+     */
+    if (!cuda_env_flag_any3("DS4_CUDA_MOE_LAYER_CACHE_EVICT",
+                            "DS4_HIP_MOE_LAYER_CACHE_EVICT", NULL)) {
+        if (cuda_env_flag_any3("DS4_CUDA_MOE_EXPERT_CACHE_VERBOSE",
+                               "DS4_HIP_MOE_EXPERT_CACHE_VERBOSE", NULL)) {
+            fprintf(stderr,
+                    DS4_GPU_LOG_PREFIX "MoE layer expert cache full: preserving %.2f/%.2f GiB, bypassing %.2f MiB new layer cache\n",
+                    (double)g_moe_layer_expert_cache_bytes / 1073741824.0,
+                    (double)budget / 1073741824.0,
+                    (double)bytes / 1048576.0);
+        }
+        return 0;
+    }
+
+    (void)cudaDeviceSynchronize();
+    while (!g_moe_layer_expert_cache.empty() && g_moe_layer_expert_cache_bytes > budget - bytes) {
+        size_t victim = 0;
+        uint64_t best_use = g_moe_layer_expert_cache[0].last_use;
+        for (size_t i = 1; i < g_moe_layer_expert_cache.size(); i++) {
+            if (g_moe_layer_expert_cache[i].last_use < best_use) {
+                best_use = g_moe_layer_expert_cache[i].last_use;
+                victim = i;
+            }
+        }
+        cuda_moe_layer_expert_cache_evict_index(victim);
+    }
+    return g_moe_layer_expert_cache_bytes <= budget - bytes;
+}
+
+static int cuda_moe_layer_expert_cache_get(
+        uint64_t gate_offset,
+        uint64_t up_offset,
+        uint64_t down_offset,
+        uint64_t gate_expert_bytes,
+        uint64_t down_expert_bytes,
+        uint32_t min_capacity,
+        size_t *idx_out) {
+    if (!idx_out) return 0;
+    if (cuda_moe_layer_expert_cache_find(gate_offset, up_offset, down_offset,
+                                         gate_expert_bytes, down_expert_bytes,
+                                         idx_out)) return 1;
+    const uint64_t budget = cuda_moe_expert_cache_budget_bytes();
+    if (budget == 0 || gate_expert_bytes == 0 || down_expert_bytes == 0) return 0;
+    uint32_t capacity = cuda_parse_u32_env_alias(
+            "DS4_CUDA_MOE_EXPERT_CACHE_SLOTS", "DS4_HIP_MOE_EXPERT_CACHE_SLOTS",
+            16u, 1u, DS4_ROCM_N_EXPERT);
+    const uint32_t target_layers = cuda_parse_u32_env_alias(
+            "DS4_CUDA_MOE_EXPERT_CACHE_TARGET_LAYERS", "DS4_HIP_MOE_EXPERT_CACHE_TARGET_LAYERS",
+            0u, 0u, 4096u);
+    if (target_layers != 0u) {
+        uint64_t per_slot_bytes = gate_expert_bytes;
+        if (per_slot_bytes <= UINT64_MAX - gate_expert_bytes) per_slot_bytes += gate_expert_bytes;
+        else per_slot_bytes = 0;
+        if (per_slot_bytes != 0 && per_slot_bytes <= UINT64_MAX - down_expert_bytes) per_slot_bytes += down_expert_bytes;
+        else per_slot_bytes = 0;
+        if (per_slot_bytes != 0) {
+            uint64_t target_layer_bytes = budget / (uint64_t)target_layers;
+            uint32_t target_capacity = (uint32_t)(target_layer_bytes / per_slot_bytes);
+            if (target_capacity > DS4_ROCM_N_EXPERT) target_capacity = DS4_ROCM_N_EXPERT;
+            if (target_capacity != 0u && capacity > target_capacity) {
+                if (cuda_env_flag_any3("DS4_CUDA_MOE_EXPERT_CACHE_VERBOSE",
+                                       "DS4_HIP_MOE_EXPERT_CACHE_VERBOSE", NULL)) {
+                    fprintf(stderr,
+                            DS4_GPU_LOG_PREFIX "MoE layer expert cache auto-slots: requested=%u target_layers=%u budget=%.2f GiB -> slots=%u\n",
+                            capacity,
+                            target_layers,
+                            (double)budget / 1073741824.0,
+                            target_capacity);
+                }
+                capacity = target_capacity;
+            }
+        }
+    }
+    if (capacity < min_capacity) capacity = min_capacity;
+    if (capacity > DS4_ROCM_N_EXPERT) capacity = DS4_ROCM_N_EXPERT;
+
+    uint64_t gate_bytes = 0;
+    uint64_t down_bytes = 0;
+    if (!cuda_u64_mul_checked((uint64_t)capacity, gate_expert_bytes, &gate_bytes) ||
+        !cuda_u64_mul_checked((uint64_t)capacity, down_expert_bytes, &down_bytes)) return 0;
+    uint64_t cache_bytes = gate_bytes;
+    if (cache_bytes > UINT64_MAX - gate_bytes) return 0;
+    cache_bytes += gate_bytes;
+    if (cache_bytes > UINT64_MAX - down_bytes) return 0;
+    cache_bytes += down_bytes;
+    if (!cuda_moe_layer_expert_cache_evict_for(cache_bytes, budget)) return 0;
+
+    char *gate_ptr = NULL;
+    char *up_ptr = NULL;
+    char *down_ptr = NULL;
+    cudaError_t err = cudaMalloc((void **)&gate_ptr, (size_t)gate_bytes);
+    if (err == cudaSuccess) err = cudaMalloc((void **)&up_ptr, (size_t)gate_bytes);
+    if (err == cudaSuccess) err = cudaMalloc((void **)&down_ptr, (size_t)down_bytes);
+    if (err != cudaSuccess) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "MoE layer expert cache alloc skipped (slots=%u %.2f MiB): %s\n",
+                capacity,
+                (double)cache_bytes / 1048576.0,
+                cudaGetErrorString(err));
+        if (gate_ptr) (void)cudaFree(gate_ptr);
+        if (up_ptr) (void)cudaFree(up_ptr);
+        if (down_ptr) (void)cudaFree(down_ptr);
+        (void)cudaGetLastError();
+        return 0;
+    }
+
+    cuda_moe_layer_expert_cache c;
+    c.gate_offset = gate_offset;
+    c.up_offset = up_offset;
+    c.down_offset = down_offset;
+    c.gate_expert_bytes = gate_expert_bytes;
+    c.down_expert_bytes = down_expert_bytes;
+    c.capacity = capacity;
+    c.gate_ptr = gate_ptr;
+    c.up_ptr = up_ptr;
+    c.down_ptr = down_ptr;
+    c.bytes = cache_bytes;
+    c.last_use = ++g_moe_expert_cache_tick;
+    c.expert_for_slot.assign(capacity, UINT32_MAX);
+    c.last_use_for_slot.assign(capacity, 0u);
+    g_moe_layer_expert_cache.push_back(c);
+    g_moe_layer_expert_cache_bytes += cache_bytes;
+    *idx_out = g_moe_layer_expert_cache.size() - 1u;
+    if (cuda_env_flag_any3("DS4_CUDA_MOE_EXPERT_CACHE_VERBOSE", "DS4_HIP_MOE_EXPERT_CACHE_VERBOSE", NULL)) {
+        fprintf(stderr,
+                DS4_GPU_LOG_PREFIX "MoE layer expert cache allocated slots=%u %.2f MiB total=%.2f/%.2f GiB\n",
+                capacity,
+                (double)cache_bytes / 1048576.0,
+                (double)g_moe_layer_expert_cache_bytes / 1073741824.0,
+                (double)budget / 1073741824.0);
+    }
+    return 1;
+}
+
+static int cuda_model_layer_moe_expert_cache_ptrs(
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t gate_offset,
+        uint64_t up_offset,
+        uint64_t down_offset,
+        uint64_t gate_bytes,
+        uint64_t down_bytes,
+        uint64_t gate_expert_bytes,
+        uint64_t down_expert_bytes,
+        const ds4_gpu_tensor *selected,
+        uint32_t n_tokens,
+        uint32_t n_expert,
+        const char **gate_w,
+        const char **up_w,
+        const char **down_w,
+        ds4_gpu_tensor *remapped_selected) {
+    if (cuda_moe_expert_cache_budget_bytes() == 0) return 0;
+    if (!model_map || !gate_w || !up_w || !down_w || !selected || !selected->ptr || !remapped_selected) return 0;
+    if (g_model_device_owned) return 0;
+    if (n_tokens != 1u || n_expert == 0u || n_expert > DS4_ROCM_N_EXPERT) return 0;
+    if (!cuda_tensor_has_elems2(selected, n_tokens, n_expert, sizeof(int32_t))) return 0;
+    if (gate_expert_bytes == 0 || down_expert_bytes == 0) return 0;
+    if (!cuda_model_range_fits(model_size, gate_offset, gate_bytes) ||
+        !cuda_model_range_fits(model_size, up_offset, gate_bytes) ||
+        !cuda_model_range_fits(model_size, down_offset, down_bytes)) return 0;
+    if (gate_expert_bytes > gate_bytes / DS4_ROCM_N_EXPERT ||
+        down_expert_bytes > down_bytes / DS4_ROCM_N_EXPERT) return 0;
+
+    const uint64_t pair_count = (uint64_t)n_tokens * n_expert;
+    if (pair_count == 0 || pair_count > (uint64_t)UINT32_MAX) return 0;
+    std::vector<int32_t> h_selected((size_t)pair_count);
+    cudaError_t err = cudaMemcpy(h_selected.data(), selected->ptr,
+                                 (size_t)(pair_count * sizeof(int32_t)),
+                                 cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+
+    uint8_t used[DS4_ROCM_N_EXPERT] = {0};
+    uint8_t slot_for_expert[DS4_ROCM_N_EXPERT];
+    memset(slot_for_expert, 0xff, sizeof(slot_for_expert));
+    uint32_t experts[DS4_ROCM_N_EXPERT];
+    uint32_t unique = 0;
+    for (uint64_t i = 0; i < pair_count; i++) {
+        const int32_t e = h_selected[(size_t)i];
+        if (e < 0 || e >= (int32_t)DS4_ROCM_N_EXPERT) return 0;
+        if (!used[e]) {
+            used[e] = 1;
+            experts[unique++] = (uint32_t)e;
+        }
+    }
+    if (unique == 0) return 0;
+    const uint32_t max_unique = cuda_parse_u32_env_alias(
+            "DS4_CUDA_MOE_EXPERT_CACHE_MAX_EXPERTS", "DS4_HIP_MOE_EXPERT_CACHE_MAX_EXPERTS",
+            16u, 1u, DS4_ROCM_N_EXPERT);
+    if (unique > max_unique) return 0;
+
+    size_t cache_idx = 0;
+    if (!cuda_moe_layer_expert_cache_get(gate_offset, up_offset, down_offset,
+                                         gate_expert_bytes, down_expert_bytes,
+                                         unique, &cache_idx)) return 0;
+    cuda_moe_layer_expert_cache &cache = g_moe_layer_expert_cache[cache_idx];
+    cache.last_use = ++g_moe_expert_cache_tick;
+
+    uint32_t hits = 0;
+    uint32_t misses = 0;
+    uint64_t uploaded = 0;
+    for (uint32_t i = 0; i < unique; i++) {
+        const uint32_t expert = experts[i];
+        uint32_t slot = UINT32_MAX;
+        for (uint32_t s = 0; s < cache.capacity; s++) {
+            if (cache.expert_for_slot[s] == expert) {
+                slot = s;
+                break;
+            }
+        }
+        if (slot != UINT32_MAX) {
+            hits++;
+        } else {
+            for (uint32_t s = 0; s < cache.capacity; s++) {
+                if (cache.expert_for_slot[s] == UINT32_MAX) {
+                    slot = s;
+                    break;
+                }
+            }
+            if (slot == UINT32_MAX) {
+                uint64_t best_use = UINT64_MAX;
+                for (uint32_t s = 0; s < cache.capacity; s++) {
+                    const uint32_t old_expert = cache.expert_for_slot[s];
+                    if (old_expert < DS4_ROCM_N_EXPERT && used[old_expert]) continue;
+                    if (cache.last_use_for_slot[s] < best_use) {
+                        best_use = cache.last_use_for_slot[s];
+                        slot = s;
+                    }
+                }
+            }
+            if (slot == UINT32_MAX) return 0;
+
+            const uint64_t gate_src = gate_offset + (uint64_t)expert * gate_expert_bytes;
+            const uint64_t up_src = up_offset + (uint64_t)expert * gate_expert_bytes;
+            const uint64_t down_src = down_offset + (uint64_t)expert * down_expert_bytes;
+            char *dst_gate = cache.gate_ptr + (uint64_t)slot * gate_expert_bytes;
+            char *dst_up = cache.up_ptr + (uint64_t)slot * gate_expert_bytes;
+            char *dst_down = cache.down_ptr + (uint64_t)slot * down_expert_bytes;
+            if (!cuda_model_copy_range_to_device_buffer(model_map, model_size, dst_gate, gate_src, gate_expert_bytes, "layer_expert_cache_gate") ||
+                !cuda_model_copy_range_to_device_buffer(model_map, model_size, dst_up, up_src, gate_expert_bytes, "layer_expert_cache_up") ||
+                !cuda_model_copy_range_to_device_buffer(model_map, model_size, dst_down, down_src, down_expert_bytes, "layer_expert_cache_down")) {
+                return 0;
+            }
+            cache.expert_for_slot[slot] = expert;
+            misses++;
+            uploaded += gate_expert_bytes + gate_expert_bytes + down_expert_bytes;
+        }
+        cache.last_use_for_slot[slot] = ++g_moe_expert_cache_tick;
+        slot_for_expert[expert] = (uint8_t)slot;
+    }
+
+    std::vector<int32_t> h_remap((size_t)pair_count);
+    for (uint64_t i = 0; i < pair_count; i++) h_remap[(size_t)i] = (int32_t)slot_for_expert[h_selected[(size_t)i]];
+    const uint64_t selected_bytes = pair_count * sizeof(int32_t);
+    if (!cuda_moe_compact_selected_prepare(selected_bytes)) return 0;
+    err = cudaMemcpy(g_moe_compact_selected, h_remap.data(), (size_t)selected_bytes, cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+
+    if (cuda_env_flag_any3("DS4_CUDA_MOE_EXPERT_CACHE_VERBOSE", "DS4_HIP_MOE_EXPERT_CACHE_VERBOSE", NULL)) {
+        fprintf(stderr,
+                DS4_GPU_LOG_PREFIX "MoE layer expert cache decode unique=%u hits=%u misses=%u upload=%.2f MiB layer_cache=%.2f GiB\n",
+                unique, hits, misses,
+                (double)uploaded / 1048576.0,
+                (double)g_moe_layer_expert_cache_bytes / 1073741824.0);
+    }
+
+    *remapped_selected = *selected;
+    remapped_selected->ptr = g_moe_compact_selected;
+    remapped_selected->bytes = selected_bytes;
+    *gate_w = cache.gate_ptr;
+    *up_w = cache.up_ptr;
+    *down_w = cache.down_ptr;
+    return 1;
+}
+
+static int cuda_model_cached_moe_expert_layer_ptrs(
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t gate_offset,
+        uint64_t up_offset,
+        uint64_t down_offset,
+        uint64_t gate_bytes,
+        uint64_t down_bytes,
+        uint64_t gate_expert_bytes,
+        uint64_t down_expert_bytes,
+        const ds4_gpu_tensor *selected,
+        uint32_t n_tokens,
+        uint32_t n_expert,
+        const char **gate_w,
+        const char **up_w,
+        const char **down_w,
+        ds4_gpu_tensor *remapped_selected) {
+    if (!cuda_env_flag_any3("DS4_CUDA_MOE_EXPERT_CACHE_LEGACY", "DS4_HIP_MOE_EXPERT_CACHE_LEGACY", NULL)) {
+        return cuda_model_layer_moe_expert_cache_ptrs(model_map, model_size,
+                                                      gate_offset, up_offset, down_offset,
+                                                      gate_bytes, down_bytes,
+                                                      gate_expert_bytes, down_expert_bytes,
+                                                      selected, n_tokens, n_expert,
+                                                      gate_w, up_w, down_w,
+                                                      remapped_selected);
+    }
+    if (cuda_moe_expert_cache_budget_bytes() == 0) return 0;
+    if (!model_map || !gate_w || !up_w || !down_w || !selected || !selected->ptr || !remapped_selected) return 0;
+    if (g_model_device_owned) return 0;
+    if (n_tokens != 1u || n_expert == 0u || n_expert > DS4_ROCM_N_EXPERT) return 0;
+    if (!cuda_tensor_has_elems2(selected, n_tokens, n_expert, sizeof(int32_t))) return 0;
+    if (gate_expert_bytes == 0 || down_expert_bytes == 0) return 0;
+    if (!cuda_model_range_fits(model_size, gate_offset, gate_bytes) ||
+        !cuda_model_range_fits(model_size, up_offset, gate_bytes) ||
+        !cuda_model_range_fits(model_size, down_offset, down_bytes)) return 0;
+    if (gate_expert_bytes > gate_bytes / DS4_ROCM_N_EXPERT ||
+        down_expert_bytes > down_bytes / DS4_ROCM_N_EXPERT) return 0;
+
+    const uint64_t pair_count = (uint64_t)n_tokens * n_expert;
+    if (pair_count == 0 || pair_count > (uint64_t)UINT32_MAX) return 0;
+    std::vector<int32_t> h_selected((size_t)pair_count);
+    cudaError_t err = cudaMemcpy(h_selected.data(), selected->ptr,
+                                 (size_t)(pair_count * sizeof(int32_t)),
+                                 cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+
+    uint8_t used[DS4_ROCM_N_EXPERT] = {0};
+    uint8_t slot_for[DS4_ROCM_N_EXPERT];
+    memset(slot_for, 0xff, sizeof(slot_for));
+    uint32_t experts[DS4_ROCM_N_EXPERT];
+    uint32_t unique = 0;
+    for (uint64_t i = 0; i < pair_count; i++) {
+        const int32_t e = h_selected[(size_t)i];
+        if (e < 0 || e >= (int32_t)DS4_ROCM_N_EXPERT) return 0;
+        if (!used[e]) {
+            used[e] = 1;
+            slot_for[e] = (uint8_t)unique;
+            experts[unique++] = (uint32_t)e;
+        }
+    }
+    if (unique == 0) return 0;
+    const uint32_t max_unique = cuda_parse_u32_env_alias(
+            "DS4_CUDA_MOE_EXPERT_CACHE_MAX_EXPERTS", "DS4_HIP_MOE_EXPERT_CACHE_MAX_EXPERTS",
+            16u, 1u, DS4_ROCM_N_EXPERT);
+    if (unique > max_unique) return 0;
+
+    std::vector<int32_t> h_remap((size_t)pair_count);
+    for (uint64_t i = 0; i < pair_count; i++) h_remap[(size_t)i] = (int32_t)slot_for[h_selected[(size_t)i]];
+
+    uint64_t compact_gate_bytes = 0;
+    uint64_t compact_down_bytes = 0;
+    if (!cuda_u64_mul_checked((uint64_t)unique, gate_expert_bytes, &compact_gate_bytes) ||
+        !cuda_u64_mul_checked((uint64_t)unique, down_expert_bytes, &compact_down_bytes)) return 0;
+    if (!cuda_moe_compact_buffers_prepare(compact_gate_bytes, compact_down_bytes)) return 0;
+    const uint64_t selected_bytes = pair_count * sizeof(int32_t);
+    if (!cuda_moe_compact_selected_prepare(selected_bytes)) return 0;
+    err = cudaMemcpy(g_moe_compact_selected, h_remap.data(), (size_t)selected_bytes, cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+
+    uint32_t hits = 0;
+    uint32_t misses = 0;
+    uint32_t bypass = 0;
+    uint64_t uploaded = 0;
+    for (uint32_t slot = 0; slot < unique; slot++) {
+        const uint32_t expert = experts[slot];
+        const char *cache_gate = NULL;
+        const char *cache_up = NULL;
+        const char *cache_down = NULL;
+        size_t idx = 0;
+        if (cuda_moe_expert_cache_find_index(gate_offset, up_offset, down_offset,
+                                             gate_expert_bytes, down_expert_bytes,
+                                             expert, &idx)) {
+            cuda_moe_expert_cache_entry &ce = g_moe_expert_cache[idx];
+            ce.last_use = ++g_moe_expert_cache_tick;
+            cache_gate = ce.gate_ptr;
+            cache_up = ce.up_ptr;
+            cache_down = ce.down_ptr;
+            hits++;
+        } else if (cuda_moe_expert_cache_add(model_map, model_size,
+                                             gate_offset, up_offset, down_offset,
+                                             gate_expert_bytes, down_expert_bytes,
+                                             expert, &idx)) {
+            cuda_moe_expert_cache_entry &ce = g_moe_expert_cache[idx];
+            cache_gate = ce.gate_ptr;
+            cache_up = ce.up_ptr;
+            cache_down = ce.down_ptr;
+            misses++;
+            uploaded += gate_expert_bytes + gate_expert_bytes + down_expert_bytes;
+        }
+
+        char *dst_gate = g_moe_compact_gate + (uint64_t)slot * gate_expert_bytes;
+        char *dst_up = g_moe_compact_up + (uint64_t)slot * gate_expert_bytes;
+        char *dst_down = g_moe_compact_down + (uint64_t)slot * down_expert_bytes;
+        if (cache_gate && cache_up && cache_down) {
+            err = cudaMemcpy(dst_gate, cache_gate, (size_t)gate_expert_bytes, cudaMemcpyDeviceToDevice);
+            if (err == cudaSuccess) err = cudaMemcpy(dst_up, cache_up, (size_t)gate_expert_bytes, cudaMemcpyDeviceToDevice);
+            if (err == cudaSuccess) err = cudaMemcpy(dst_down, cache_down, (size_t)down_expert_bytes, cudaMemcpyDeviceToDevice);
+            if (err != cudaSuccess) {
+                fprintf(stderr, DS4_GPU_LOG_PREFIX "MoE expert cache device copy failed: %s\n", cudaGetErrorString(err));
+                (void)cudaGetLastError();
+                return 0;
+            }
+        } else {
+            const uint64_t gate_src = gate_offset + (uint64_t)expert * gate_expert_bytes;
+            const uint64_t up_src = up_offset + (uint64_t)expert * gate_expert_bytes;
+            const uint64_t down_src = down_offset + (uint64_t)expert * down_expert_bytes;
+            if (!cuda_model_copy_range_to_device_buffer(model_map, model_size, dst_gate, gate_src, gate_expert_bytes, "compact_moe_gate") ||
+                !cuda_model_copy_range_to_device_buffer(model_map, model_size, dst_up, up_src, gate_expert_bytes, "compact_moe_up") ||
+                !cuda_model_copy_range_to_device_buffer(model_map, model_size, dst_down, down_src, down_expert_bytes, "compact_moe_down")) {
+                return 0;
+            }
+            bypass++;
+            uploaded += gate_expert_bytes + gate_expert_bytes + down_expert_bytes;
+        }
+    }
+
+    if (cuda_env_flag_any3("DS4_CUDA_MOE_EXPERT_CACHE_VERBOSE", "DS4_HIP_MOE_EXPERT_CACHE_VERBOSE", NULL)) {
+        fprintf(stderr,
+                DS4_GPU_LOG_PREFIX "MoE expert cache decode unique=%u hits=%u misses=%u bypass=%u upload=%.2f MiB cache=%.2f GiB\n",
+                unique, hits, misses, bypass,
+                (double)uploaded / 1048576.0,
+                (double)g_moe_expert_cache_bytes / 1073741824.0);
+    }
+
+    *remapped_selected = *selected;
+    remapped_selected->ptr = g_moe_compact_selected;
+    remapped_selected->bytes = selected_bytes;
+    *gate_w = g_moe_compact_gate;
+    *up_w = g_moe_compact_up;
+    *down_w = g_moe_compact_down;
+    return 1;
+}
+
+static uint64_t cuda_moe_resident_cache_budget_bytes(void) {
+    int have = 0;
+    uint64_t gb = cuda_parse_u64_env("DS4_CUDA_MOE_RESIDENT_CACHE_GB", &have);
+    if (!have) gb = cuda_parse_u64_env("DS4_HIP_MOE_RESIDENT_CACHE_GB", &have);
+    if (have) {
+        if (gb > UINT64_MAX / 1073741824ull) return UINT64_MAX;
+        return gb * 1073741824ull;
+    }
+    uint64_t bytes = cuda_parse_mib_env("DS4_CUDA_MOE_RESIDENT_CACHE_MB", &have);
+    if (!have) bytes = cuda_parse_mib_env("DS4_HIP_MOE_RESIDENT_CACHE_MB", &have);
+    return have ? bytes : 0;
+}
+
+static void cuda_moe_resident_layers_release(void) {
+    for (const cuda_moe_resident_layer &r : g_moe_resident_layers) {
+        if (r.gate_ptr) (void)cudaFree(r.gate_ptr);
+        if (r.up_ptr) (void)cudaFree(r.up_ptr);
+        if (r.down_ptr) (void)cudaFree(r.down_ptr);
+    }
+    g_moe_resident_layers.clear();
+    g_moe_resident_bytes = 0;
+}
+
+static int cuda_model_resident_moe_layer_ptrs(
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t gate_offset,
+        uint64_t up_offset,
+        uint64_t down_offset,
+        uint64_t gate_bytes,
+        uint64_t down_bytes,
+        const char **gate_w,
+        const char **up_w,
+        const char **down_w) {
+    if (!gate_w || !up_w || !down_w) return 0;
+    for (const cuda_moe_resident_layer &r : g_moe_resident_layers) {
+        if (r.gate_offset == gate_offset && r.up_offset == up_offset && r.down_offset == down_offset &&
+            r.gate_bytes == gate_bytes && r.down_bytes == down_bytes &&
+            r.gate_ptr && r.up_ptr && r.down_ptr) {
+            *gate_w = r.gate_ptr;
+            *up_w = r.up_ptr;
+            *down_w = r.down_ptr;
+            return 1;
+        }
+    }
+
+    const uint64_t budget = cuda_moe_resident_cache_budget_bytes();
+    if (budget == 0) return 0;
+    if (!model_map || gate_bytes == 0 || down_bytes == 0) return 0;
+    if (!cuda_model_range_fits(model_size, gate_offset, gate_bytes) ||
+        !cuda_model_range_fits(model_size, up_offset, gate_bytes) ||
+        !cuda_model_range_fits(model_size, down_offset, down_bytes)) return 0;
+    uint64_t layer_bytes = gate_bytes;
+    if (layer_bytes > UINT64_MAX - gate_bytes) return 0;
+    layer_bytes += gate_bytes;
+    if (layer_bytes > UINT64_MAX - down_bytes) return 0;
+    layer_bytes += down_bytes;
+    if (layer_bytes > budget || g_moe_resident_bytes > budget - layer_bytes) return 0;
+
+    char *gate_ptr = NULL;
+    char *up_ptr = NULL;
+    char *down_ptr = NULL;
+    cudaError_t err = cudaMalloc((void **)&gate_ptr, (size_t)gate_bytes);
+    if (err == cudaSuccess) err = cudaMalloc((void **)&up_ptr, (size_t)gate_bytes);
+    if (err == cudaSuccess) err = cudaMalloc((void **)&down_ptr, (size_t)down_bytes);
+    if (err != cudaSuccess) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "resident MoE allocation skipped (%.2f GiB layer): %s\n",
+                (double)layer_bytes / 1073741824.0,
+                cudaGetErrorString(err));
+        if (gate_ptr) (void)cudaFree(gate_ptr);
+        if (up_ptr) (void)cudaFree(up_ptr);
+        if (down_ptr) (void)cudaFree(down_ptr);
+        (void)cudaGetLastError();
+        return 0;
+    }
+
+    if (!cuda_model_copy_range_to_device_buffer(model_map, model_size, gate_ptr, gate_offset, gate_bytes, "resident_moe_gate") ||
+        !cuda_model_copy_range_to_device_buffer(model_map, model_size, up_ptr, up_offset, gate_bytes, "resident_moe_up") ||
+        !cuda_model_copy_range_to_device_buffer(model_map, model_size, down_ptr, down_offset, down_bytes, "resident_moe_down")) {
+        (void)cudaFree(gate_ptr);
+        (void)cudaFree(up_ptr);
+        (void)cudaFree(down_ptr);
+        return 0;
+    }
+
+    g_moe_resident_layers.push_back({gate_offset, up_offset, down_offset,
+                                     gate_bytes, down_bytes,
+                                     gate_ptr, up_ptr, down_ptr, layer_bytes});
+    g_moe_resident_bytes += layer_bytes;
+    fprintf(stderr,
+            DS4_GPU_LOG_PREFIX "resident MoE cached layer %.2f GiB (total %.2f/%.2f GiB)\n",
+            (double)layer_bytes / 1073741824.0,
+            (double)g_moe_resident_bytes / 1073741824.0,
+            (double)budget / 1073741824.0);
+    *gate_w = gate_ptr;
+    *up_w = up_ptr;
+    *down_w = down_ptr;
+    return 1;
+}
+
+static int cuda_model_sparse_moe_layer_ptrs(
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t gate_offset,
+        uint64_t up_offset,
+        uint64_t down_offset,
+        uint64_t gate_bytes,
+        uint64_t down_bytes,
+        uint64_t gate_expert_bytes,
+        uint64_t down_expert_bytes,
+        const ds4_gpu_tensor *selected,
+        uint32_t n_tokens,
+        uint32_t n_expert,
+        const char **gate_w,
+        const char **up_w,
+        const char **down_w) {
+    if (!cuda_env_flag_any3("DS4_CUDA_MOE_SPARSE_CACHE", "DS4_HIP_MOE_SPARSE_CACHE", NULL)) return 0;
+    if (!model_map || !gate_w || !up_w || !down_w || !selected || !selected->ptr) return 0;
+    if (g_model_device_owned) return 0;
+    if (n_tokens == 0 || n_expert == 0 || n_expert > DS4_ROCM_N_EXPERT) return 0;
+    if (!cuda_tensor_has_elems2(selected, n_tokens, n_expert, sizeof(int32_t))) return 0;
+    if (gate_expert_bytes == 0 || down_expert_bytes == 0) return 0;
+    if (!cuda_model_range_fits(model_size, gate_offset, gate_bytes) ||
+        !cuda_model_range_fits(model_size, up_offset, gate_bytes) ||
+        !cuda_model_range_fits(model_size, down_offset, down_bytes)) return 0;
+    if (gate_expert_bytes > gate_bytes / DS4_ROCM_N_EXPERT ||
+        down_expert_bytes > down_bytes / DS4_ROCM_N_EXPERT) return 0;
+
+    const uint64_t pair_count = (uint64_t)n_tokens * n_expert;
+    if (pair_count > (uint64_t)UINT32_MAX) return 0;
+    std::vector<int32_t> h_selected((size_t)pair_count);
+    cudaError_t err = cudaMemcpy(h_selected.data(), selected->ptr,
+                                 (size_t)(pair_count * sizeof(int32_t)),
+                                 cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+
+    uint8_t used[DS4_ROCM_N_EXPERT] = {0};
+    uint32_t experts[DS4_ROCM_N_EXPERT];
+    uint32_t unique = 0;
+    for (uint64_t i = 0; i < pair_count; i++) {
+        const int32_t e = h_selected[(size_t)i];
+        if (e < 0 || e >= (int32_t)DS4_ROCM_N_EXPERT) return 0;
+        if (!used[e]) {
+            used[e] = 1;
+            experts[unique++] = (uint32_t)e;
+        }
+    }
+    if (unique == 0) return 0;
+    const uint32_t max_unique = cuda_parse_u32_env_alias(
+            "DS4_CUDA_MOE_SPARSE_MAX_EXPERTS", "DS4_HIP_MOE_SPARSE_MAX_EXPERTS",
+            64u, 1u, DS4_ROCM_N_EXPERT);
+    if (unique > max_unique) return 0;
+
+    if (!cuda_moe_sparse_buffers_prepare(gate_bytes, down_bytes)) return 0;
+
+    uint64_t copied_bytes = 0;
+    for (uint32_t i = 0; i < unique; i++) {
+        const uint32_t e = experts[i];
+        const uint64_t gate_delta = (uint64_t)e * gate_expert_bytes;
+        const uint64_t down_delta = (uint64_t)e * down_expert_bytes;
+        if (gate_delta > gate_bytes || gate_expert_bytes > gate_bytes - gate_delta ||
+            down_delta > down_bytes || down_expert_bytes > down_bytes - down_delta) return 0;
+        if (!cuda_model_copy_range_to_device_buffer(model_map, model_size,
+                                                    g_moe_sparse_gate + gate_delta,
+                                                    gate_offset + gate_delta,
+                                                    gate_expert_bytes,
+                                                    "sparse_moe_gate") ||
+            !cuda_model_copy_range_to_device_buffer(model_map, model_size,
+                                                    g_moe_sparse_up + gate_delta,
+                                                    up_offset + gate_delta,
+                                                    gate_expert_bytes,
+                                                    "sparse_moe_up") ||
+            !cuda_model_copy_range_to_device_buffer(model_map, model_size,
+                                                    g_moe_sparse_down + down_delta,
+                                                    down_offset + down_delta,
+                                                    down_expert_bytes,
+                                                    "sparse_moe_down")) {
+            return 0;
+        }
+        copied_bytes += gate_expert_bytes + gate_expert_bytes + down_expert_bytes;
+    }
+
+    if (cuda_env_flag_any3("DS4_CUDA_MOE_SPARSE_VERBOSE", "DS4_HIP_MOE_SPARSE_VERBOSE", NULL)) {
+        fprintf(stderr,
+                DS4_GPU_LOG_PREFIX "sparse MoE cache tokens=%u unique=%u copied=%.2f MiB layer=%.2f GiB\n",
+                n_tokens, unique,
+                (double)copied_bytes / 1048576.0,
+                (double)(gate_bytes + gate_bytes + down_bytes) / 1073741824.0);
+    }
+    *gate_w = g_moe_sparse_gate;
+    *up_w = g_moe_sparse_up;
+    *down_w = g_moe_sparse_down;
+    return 1;
+}
+
 static uint64_t cuda_model_arena_chunk_bytes(uint64_t need) {
     uint64_t bytes = 1792ull * 1048576ull;
     if (bytes < need) {
@@ -1301,6 +2413,9 @@ extern "C" void ds4_gpu_cleanup(void) {
         g_hipblaslt = NULL;
     }
 #endif
+    cuda_moe_resident_layers_release();
+    cuda_moe_expert_cache_release();
+    cuda_moe_sparse_buffers_release();
     cuda_model_range_release_all();
     cuda_q8_f16_cache_release_all();
     g_q8_f16_disabled_after_oom = 0;
@@ -1474,6 +2589,9 @@ extern "C" int ds4_gpu_synchronize(void) { return cuda_ok(cudaDeviceSynchronize(
 extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size) {
     if (!model_map || model_size == 0) return 0;
     if (g_model_host_base == model_map && g_model_registered_size == model_size) return 1;
+    cuda_moe_resident_layers_release();
+    cuda_moe_expert_cache_release();
+    cuda_moe_sparse_buffers_release();
     cuda_model_range_release_all();
     cuda_q8_f16_cache_release_all();
     g_q8_f16_disabled_after_oom = 0;
@@ -1496,9 +2614,16 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
     return 1;
 }
 
+static int cuda_model_full_copy_requested(void) {
+    return cuda_env_flag_any3("DS4_CUDA_COPY_MODEL", "DS4_HIP_COPY_MODEL", NULL) ||
+           cuda_env_flag_any3("DS4_CUDA_COPY_MODEL_CHUNKED", "DS4_HIP_COPY_MODEL_CHUNKED", NULL) ||
+           cuda_env_flag_any3("DS4_CUDA_COPY_MODEL_STAGED", "DS4_HIP_COPY_MODEL_STAGED", NULL);
+}
+
 extern "C" int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size, uint64_t max_tensor_bytes) {
     (void)max_tensor_bytes;
     if (!ds4_gpu_set_model_map(model_map, model_size)) return 0;
+    if (!cuda_model_full_copy_requested()) return 1;
     return cuda_model_copy_chunked(model_map, model_size, map_offset, map_size);
 }
 
@@ -1526,6 +2651,7 @@ extern "C" int ds4_gpu_set_model_map_spans(
         if (end > max_end) max_end = end;
     }
     if (!ds4_gpu_set_model_map(model_map, model_size)) return 0;
+    if (!cuda_model_full_copy_requested()) return 1;
     return cuda_model_copy_chunked(model_map, model_size, min_offset, max_end - min_offset);
 }
 

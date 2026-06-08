@@ -234,6 +234,9 @@ void ds4_session_report_progress(ds4_session *s, const char *event, int current,
 /* Distributed coordinator sessions return 1 when the full layer route is
  * available, 0 when it is still incomplete, and -1 for a local API error. */
 int ds4_session_distributed_route_ready(ds4_session *s, char *err, size_t errlen);
+/* Per-session cap for cancellable/chunked prefill. A value of 0 uses the
+ * process-wide DS4_SESSION_PROGRESS_CHUNK_TOKENS environment setting. */
+void ds4_session_set_prefill_chunk_tokens(ds4_session *s, uint32_t tokens);
 
 typedef enum {
     DS4_SESSION_REWRITE_ERROR = -1,
